@@ -91,10 +91,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let aa = 1.0;
     let fill = 1.0 - smoothstep(-aa, aa, d);
 
-    var rgb = mix(in.color.rgb, tex.rgb, use_tex);
+    var ring = 0.0;
     if (in.border_width > 0.0) {
-        let ring = 1.0 - smoothstep(-aa, aa, abs(d + in.border_width * 0.5) - in.border_width * 0.5);
-        rgb = mix(rgb, in.border.rgb, ring * in.border.a);
+        ring = (1.0 - smoothstep(-aa, aa, abs(d + in.border_width * 0.5) - in.border_width * 0.5))
+            * in.border.a;
     }
-    return vec4<f32>(rgb, in.color.a * fill);
+    let rgb = mix(mix(in.color.rgb, tex.rgb, use_tex), in.border.rgb, ring);
+    // Border alpha is independent of fill alpha, so a transparent tile can
+    // still draw just its outline.
+    return vec4<f32>(rgb, max(in.color.a, ring) * fill);
 }

@@ -72,6 +72,12 @@ pub struct Switchblade {
     scroll_vel: f32,
     zoom: f32,
     zoom_target: f32,
+    /// Active camera chase strength: keyboard moves glide gentler than pans.
+    chase: f32,
+    /// Previous frame's tiles + column count, for the reflow crossfade.
+    last_cols: usize,
+    last_tiles: Vec<Tile>,
+    transition: Option<(Vec<Tile>, Instant)>,
     last_scroll_event: Instant,
     viewport: Viewport,
     cmds: Vec<WindowCommand>,
@@ -105,6 +111,10 @@ impl Switchblade {
             scroll_vel: 0.0,
             zoom: 1.0,
             zoom_target: 1.0,
+            chase: 0.22,
+            last_cols: 0,
+            last_tiles: Vec::new(),
+            transition: None,
             last_scroll_event: Instant::now(),
             viewport: Viewport { width: 1280.0, height: 800.0 },
             cmds: Vec::new(),
@@ -208,7 +218,8 @@ impl Switchblade {
         self.scroll_to_selected();
     }
 
-    /// Smoothly bring the selected row toward the vertical center.
+    /// Smoothly bring the selected row toward the vertical center. Uses the
+    /// gentler key-move chase curve so whole-screen jumps glide, not jolt.
     fn scroll_to_selected(&mut self) {
         let lay = self.layout();
         let row = self.selected / lay.cols;
@@ -216,6 +227,7 @@ impl Switchblade {
         self.scroll_target =
             (row_center - self.viewport.height * 0.5).clamp(0.0, self.max_scroll(&lay));
         self.scroll_vel = 0.0;
+        self.chase = self.tuning.key_snap_strength;
     }
 
     // --- input ---
@@ -320,16 +332,22 @@ impl Switchblade {
             self.scroll_vel = 0.0;
         }
 
-        // Camera chases its target.
-        self.scroll += (self.scroll_target - self.scroll) * alpha(t.snap_strength, dt);
+        // Camera chases its target (key moves use a gentler chase).
+        self.scroll += (self.scroll_target - self.scroll) * alpha(self.chase, dt);
 
         self.hovered = self.tile_at(&lay, self.cursor.0, self.cursor.1);
+
+        // Selection stands out more the further you zoom out.
+        let boost = (1.0 / self.zoom.max(0.05))
+            .powf(t.selection_zoom_boost)
+            .clamp(1.0, 2.2);
+        let sel_scale = t.selection_scale * boost;
 
         // Tile scale springs (selected > hover > rest).
         let a = alpha(t.scale_smoothing, dt);
         for (i, clip) in self.clips.iter_mut().enumerate() {
             let target = if i == self.selected {
-                t.selection_scale
+                sel_scale
             } else if Some(i) == self.hovered {
                 t.hover_scale
             } else {
@@ -424,8 +442,8 @@ impl Switchblade {
         }
     }
 
-    fn build_frame(&self) -> Frame {
-        let t = &self.tuning;
+    fn build_frame(&mut self) -> Frame {
+        let t = self.tuning.clone();
         let lay = self.layout();
         let (first_row, last_row) = self.visible_rows(&lay, 0);
 
@@ -461,15 +479,6 @@ impl Switchblade {
                 let cx = ox + lay.tile_w * 0.5;
                 let cy = oy + lay.tile_h * 0.5;
 
-                let base = placeholder_color(i, clip.readable, clip.cloud);
-                let (border_color, border_width) = if selected {
-                    ([t.accent[0], t.accent[1], t.accent[2], ease], t.border_width)
-                } else if hovered {
-                    ([t.accent[0], t.accent[1], t.accent[2], 0.35 * ease], 1.5)
-                } else {
-                    ([0.0; 4], 0.0)
-                };
-
                 let (tex_slot, tex_mix) = match clip.thumb {
                     Thumb::Ready { slot, at } => {
                         let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
@@ -479,14 +488,36 @@ impl Switchblade {
                     _ => (-1, 0.0),
                 };
 
+                // No random placeholder colors: empty tiles are transparent
+                // (thin grey outline below) and the thumbnail fades in from
+                // nothing. Cloud/unreadable keep their status tints.
+                let (fill_rgb, fill_a) = if clip.cloud {
+                    ([0.05, 0.08, 0.13], ease)
+                } else if !clip.readable {
+                    ([0.16, 0.05, 0.06], ease)
+                } else {
+                    ([0.0, 0.0, 0.0], ease * tex_mix)
+                };
+
+                let (sb, hb, eb) = (t.selection_border, t.hover_border, t.empty_border);
+                let (border_color, border_width, radius) = if selected {
+                    ([sb[0], sb[1], sb[2], ease], t.border_width, t.selection_corner_radius)
+                } else if hovered {
+                    ([hb[0], hb[1], hb[2], 0.35 * ease], 1.5, t.corner_radius)
+                } else if tex_slot < 0 && clip.readable && !clip.cloud {
+                    ([eb[0], eb[1], eb[2], ease], 1.0, t.corner_radius)
+                } else {
+                    ([0.0; 4], 0.0, t.corner_radius)
+                };
+
                 let tile = Tile {
                     x: cx - w * 0.5,
                     y: cy - h * 0.5,
                     w,
                     h,
-                    color: [base[0], base[1], base[2], ease],
+                    color: [fill_rgb[0], fill_rgb[1], fill_rgb[2], fill_a],
                     border_color,
-                    corner_radius: t.corner_radius * s,
+                    corner_radius: radius * s,
                     border_width,
                     tex_slot,
                     tex_mix,
@@ -499,6 +530,34 @@ impl Switchblade {
             }
         }
         tiles.extend(selected_group);
+
+        // Photos-style reflow: when the column count changes (zoom/resize),
+        // the previous layout fades out on top of the new one.
+        if lay.cols != self.last_cols && !self.last_tiles.is_empty() {
+            self.transition = Some((std::mem::take(&mut self.last_tiles), now));
+        }
+        self.last_cols = lay.cols;
+        self.last_tiles = tiles.clone();
+
+        let mut done = false;
+        if let Some((old, start)) = &self.transition {
+            let f = now.saturating_duration_since(*start).as_secs_f32() * 1000.0
+                / t.zoom_fade_ms.max(1.0);
+            if f >= 1.0 {
+                done = true;
+            } else {
+                let fade = (1.0 - f) * (1.0 - f); // ease-out
+                tiles.extend(old.iter().map(|tl| {
+                    let mut tl = *tl;
+                    tl.color[3] *= fade;
+                    tl.border_color[3] *= fade;
+                    tl
+                }));
+            }
+        }
+        if done {
+            self.transition = None;
+        }
 
         Frame { clear: t.background, tiles, uploads: Vec::new() }
     }
@@ -513,6 +572,7 @@ impl App for Switchblade {
                 self.scroll_target += d;
                 self.scroll_vel = self.scroll_vel * 0.7 + d * 60.0 * 0.3;
                 self.last_scroll_event = Instant::now();
+                self.chase = self.tuning.snap_strength;
             }
             InputEvent::Pinch { delta } => {
                 let factor = 1.0 + delta * self.tuning.pinch_sensitivity;
@@ -551,21 +611,6 @@ impl App for Switchblade {
     }
 }
 
-/// Deterministic placeholder tint per tile (M1 fake grid). Golden-ratio hue
-/// stepping keeps neighbors visually distinct. Cloud placeholders get a
-/// dimmed blue; unreadable files a dimmed red.
-fn placeholder_color(i: usize, readable: bool, cloud: bool) -> [f32; 3] {
-    if cloud {
-        return [0.05, 0.08, 0.13];
-    }
-    if !readable {
-        return [0.16, 0.05, 0.06];
-    }
-    let hue = (i as f32 * 0.618_034).fract() * 360.0;
-    let light = 0.14 + ((i * 7919) % 5) as f32 * 0.012;
-    hsl_to_rgb(hue, 0.42, light)
-}
-
 /// A little cloud in the tile's bottom-right corner, built from two circles
 /// and a rounded bar — no icon assets, no text stack, just tiles.
 fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
@@ -587,20 +632,4 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
     out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
     out.push(part(bx, by + 7.0, 28.0, 10.0)); // base bar
-}
-
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
-    let (r, g, b) = match hp as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c * 0.5;
-    [r + m, g + m, b + m]
 }

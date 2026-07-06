@@ -8,7 +8,7 @@
 # Width:height sets the aspect ratio (240:135 = 16:9).
 tile_width = 240.0
 tile_height = 135.0
-gap = 6.0
+gap = 2.0
 
 # Scroll delta multiplier; negative flips direction if pan feels inverted.
 pan_sensitivity = 1.0
@@ -17,24 +17,32 @@ pan_sensitivity = 1.0
 pan_inertia = 0.0
 
 # 0..1 fractions covered per frame at 60fps (higher = snappier).
-snap_strength = 0.22
+snap_strength = 0.22       # trackpad pan chase
+key_snap_strength = 0.12   # keyboard move chase — lower = gentler glide
 rubber_band = 0.25
 scale_smoothing = 0.35
 zoom_smoothing = 0.35
 
 # Pinch-to-zoom (also -/=/0 keys). Zoom scales the ideal tile width,
-# so columns reflow as you zoom.
+# so columns reflow; the reflow crossfades over zoom_fade_ms.
 pinch_sensitivity = 1.0
 zoom_min = 0.35
 zoom_max = 3.0
+zoom_fade_ms = 180.0
 
-# Selected tile scales up and overlaps its neighbors (drawn on top).
+# Selected tile scales up and overlaps neighbors; the boost exponent makes
+# it stand out even more as you zoom out (0 = off).
 selection_scale = 1.15
+selection_zoom_boost = 0.35
 hover_scale = 1.03
-corner_radius = 2.0
-# Thick white selection line.
+
+corner_radius = 5.0
+selection_corner_radius = 10.0
 border_width = 6.0
 fade_in_ms = 220.0
 
-accent = [1.0, 1.0, 1.0]
+selection_border = [0.0, 0.0, 0.0]
+hover_border = [1.0, 1.0, 1.0]
+# Thin outline for tiles that have no thumbnail yet (fill is transparent).
+empty_border = [0.16, 0.16, 0.19]
 background = [0.004, 0.004, 0.006]
