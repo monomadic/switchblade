@@ -64,11 +64,29 @@ pub const ATLAS_COLS: u32 = 8;
 pub const ATLAS_ROWS: u32 = 15;
 pub const ATLAS_SLOTS: usize = (ATLAS_COLS * ATLAS_ROWS) as usize;
 
-/// Pixels to copy into one atlas slot this frame.
+/// Pixels to copy into one atlas slot this frame. Thumbs keep their source
+/// aspect ratio, so `w × h` may be smaller than the slot; they land at the
+/// slot's top-left.
 pub struct ThumbUpload {
     pub slot: usize,
-    /// Exactly `ATLAS_SLOT_W × ATLAS_SLOT_H × 4` RGBA bytes.
+    pub w: u32,
+    pub h: u32,
+    /// Exactly `w × h × 4` RGBA bytes.
     pub rgba: Vec<u8>,
+}
+
+/// Normalized atlas UV rect `[x, y, w, h]` for a `tw × th` region within
+/// `slot`, offset by `(ox, oy)` pixels and inset half a texel against
+/// bleeding. This is how tiles say which part of which thumb they show.
+pub fn atlas_uv(slot: usize, ox: f32, oy: f32, tw: f32, th: f32) -> [f32; 4] {
+    let (col, row) = ((slot % ATLAS_COLS as usize) as f32, (slot / ATLAS_COLS as usize) as f32);
+    let (aw, ah) = (
+        (ATLAS_COLS * ATLAS_SLOT_W) as f32,
+        (ATLAS_ROWS * ATLAS_SLOT_H) as f32,
+    );
+    let x = col * ATLAS_SLOT_W as f32 + ox + 0.5;
+    let y = row * ATLAS_SLOT_H as f32 + oy + 0.5;
+    [x / aw, y / ah, (tw - 1.0).max(0.0) / aw, (th - 1.0).max(0.0) / ah]
 }
 
 /// One tile to draw. Position/size in logical pixels, origin top-left.
@@ -83,10 +101,12 @@ pub struct Tile {
     pub border_color: [f32; 4],
     pub corner_radius: f32,
     pub border_width: f32,
-    /// Atlas slot to sample, or -1 for flat placeholder color.
-    pub tex_slot: i32,
+    /// Normalized atlas UV rect (see [`atlas_uv`]); zero size = no texture.
+    pub uv: [f32; 4],
     /// 0..1 crossfade from placeholder color to texture.
     pub tex_mix: f32,
+    /// Strength of the inner rim light inside the border (0 = off).
+    pub shine: f32,
 }
 
 /// Everything the renderer needs for one frame.

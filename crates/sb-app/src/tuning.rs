@@ -43,6 +43,8 @@ pub struct Tuning {
     pub zoom_smoothing: f32,
     /// Crossfade duration when the column count reflows (Photos-style).
     pub zoom_fade_ms: f32,
+    /// Strength of the rim light inside the selection border (0 = off).
+    pub selection_shine: f32,
     pub selection_border: [f32; 3],
     pub hover_border: [f32; 3],
     /// Thin outline for tiles that have no thumbnail yet.
@@ -74,6 +76,7 @@ impl Default for Tuning {
             zoom_max: 3.0,
             zoom_smoothing: 0.35,
             zoom_fade_ms: 180.0,
+            selection_shine: 0.5,
             selection_border: [0.0, 0.0, 0.0],
             hover_border: [1.0, 1.0, 1.0],
             empty_border: [0.16, 0.16, 0.19],

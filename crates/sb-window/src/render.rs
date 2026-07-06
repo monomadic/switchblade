@@ -20,8 +20,9 @@ struct Instance {
     border: [f32; 4],
     radius: f32,
     border_width: f32,
-    tex_slot: f32,
     tex_mix: f32,
+    shine: f32,
+    uv: [f32; 4],
 }
 
 pub struct Gpu {
@@ -177,6 +178,7 @@ impl Gpu {
                 5 => Float32,
                 6 => Float32,
                 7 => Float32,
+                8 => Float32x4,
             ],
         };
 
@@ -232,13 +234,24 @@ impl Gpu {
         })
     }
 
-    fn upload_thumb(&self, slot: usize, rgba: &[u8]) {
-        let expected = (ATLAS_SLOT_W * ATLAS_SLOT_H * 4) as usize;
-        if slot >= ATLAS_SLOTS || rgba.len() != expected {
-            log::warn!("bad thumb upload: slot {slot}, {} bytes", rgba.len());
+    fn upload_thumb(&self, up: &crate::ThumbUpload) {
+        let ok = up.slot < ATLAS_SLOTS
+            && up.w >= 1
+            && up.w <= ATLAS_SLOT_W
+            && up.h >= 1
+            && up.h <= ATLAS_SLOT_H
+            && up.rgba.len() == (up.w * up.h * 4) as usize;
+        if !ok {
+            log::warn!(
+                "bad thumb upload: slot {}, {}x{}, {} bytes",
+                up.slot,
+                up.w,
+                up.h,
+                up.rgba.len()
+            );
             return;
         }
-        let (col, row) = (slot as u32 % ATLAS_COLS, slot as u32 / ATLAS_COLS);
+        let (col, row) = (up.slot as u32 % ATLAS_COLS, up.slot as u32 / ATLAS_COLS);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.atlas,
@@ -250,15 +263,15 @@ impl Gpu {
                 },
                 aspect: wgpu::TextureAspect::All,
             },
-            rgba,
+            &up.rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(ATLAS_SLOT_W * 4),
-                rows_per_image: Some(ATLAS_SLOT_H),
+                bytes_per_row: Some(up.w * 4),
+                rows_per_image: Some(up.h),
             },
             wgpu::Extent3d {
-                width: ATLAS_SLOT_W,
-                height: ATLAS_SLOT_H,
+                width: up.w,
+                height: up.h,
                 depth_or_array_layers: 1,
             },
         );
@@ -275,7 +288,7 @@ impl Gpu {
 
     pub fn render(&mut self, frame: &Frame, viewport: Viewport) {
         for up in &frame.uploads {
-            self.upload_thumb(up.slot, &up.rgba);
+            self.upload_thumb(up);
         }
 
         let data: Vec<Instance> = frame
@@ -288,8 +301,9 @@ impl Gpu {
                 border: t.border_color,
                 radius: t.corner_radius,
                 border_width: t.border_width,
-                tex_slot: t.tex_slot as f32,
                 tex_mix: t.tex_mix,
+                shine: t.shine,
+                uv: t.uv,
             })
             .collect();
 

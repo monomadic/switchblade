@@ -14,17 +14,24 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
-/// Thumbnails are generated at exactly this size (16:9, crop-fill).
+/// Thumbnails fit within this box with their aspect ratio preserved; the
+/// grid crops to tile shape at sampling time, so the selected tile can show
+/// the whole frame.
 pub const THUMB_W: u32 = 480;
 pub const THUMB_H: u32 = 270;
+
+/// Cache artifact name. Bumped when the recipe changes (was `thumb.jpg`,
+/// crop-filled): stale artifacts are simply ignored and regenerated.
+const THUMB_FILE: &str = "thumb_fit.jpg";
 
 const WORKERS: usize = 3;
 /// Extract the frame this far into the clip (PLAN.md §6 initial policy).
 const SEEK_FRACTION: f64 = 0.10;
 
 pub enum ThumbResult {
-    /// `rgba` is exactly `THUMB_W × THUMB_H × 4` bytes.
-    Ready { path: PathBuf, rgba: Vec<u8> },
+    /// `rgba` is `w × h × 4` bytes, with `w ≤ THUMB_W`, `h ≤ THUMB_H` and
+    /// the clip's original aspect ratio.
+    Ready { path: PathBuf, w: u32, h: u32, rgba: Vec<u8> },
     Failed { path: PathBuf },
 }
 
@@ -88,7 +95,7 @@ fn worker(
             Err(_) => return,
         };
         let result = match make_thumb(&path, &root, have_ffmpeg) {
-            Some(rgba) => ThumbResult::Ready { path, rgba },
+            Some((w, h, rgba)) => ThumbResult::Ready { path, w, h, rgba },
             None => ThumbResult::Failed { path },
         };
         if tx.send(result).is_err() {
@@ -98,14 +105,14 @@ fn worker(
 }
 
 /// Serve from the sidecar cache, generating on miss. See PLAN.md §7/§8.
-fn make_thumb(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<Vec<u8>> {
+fn make_thumb(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, Vec<u8>)> {
     let meta = std::fs::metadata(src).ok()?;
     if !meta.is_file() {
         return None;
     }
     let fp = fingerprint(src, meta.len(), mtime_secs(&meta));
     let dir = root.join(&fp[..2]).join(&fp);
-    let jpg = dir.join("thumb.jpg");
+    let jpg = dir.join(THUMB_FILE);
 
     if !jpg.exists() {
         if !have_ffmpeg {
@@ -177,9 +184,8 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
     // Write to a temp name and rename, so a half-written jpg never
     // looks like a cache hit to another worker or a later run.
     let tmp = dst.with_extension("jpg.tmp");
-    let vf = format!(
-        "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=increase,crop={THUMB_W}:{THUMB_H}"
-    );
+    let vf =
+        format!("scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease");
     // stderr is captured, not inherited: decode noise from damaged files
     // must never spam the console (it becomes one debug line below).
     // `-strict unofficial` lets mjpeg accept full-range YUV sources
@@ -210,15 +216,20 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
     std::fs::rename(&tmp, dst).ok()
 }
 
-fn decode_jpeg(path: &Path) -> Option<Vec<u8>> {
+fn decode_jpeg(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     let img = image::open(path).ok()?.to_rgba8();
-    if img.dimensions() == (THUMB_W, THUMB_H) {
-        return Some(img.into_raw());
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
     }
-    // Stale cache entry from an older recipe: rescale rather than fail.
-    let resized =
-        image::imageops::resize(&img, THUMB_W, THUMB_H, image::imageops::FilterType::Triangle);
-    Some(resized.into_raw())
+    if w <= THUMB_W && h <= THUMB_H {
+        return Some((w, h, img.into_raw()));
+    }
+    // Oversized (foreign/stale artifact): scale down, keep aspect.
+    let s = (THUMB_W as f32 / w as f32).min(THUMB_H as f32 / h as f32);
+    let (nw, nh) = (((w as f32 * s) as u32).max(1), ((h as f32 * s) as u32).max(1));
+    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    Some((nw, nh, resized.into_raw()))
 }
 
 /// Pragmatic MVP fingerprint: absolute path + size + mtime (PLAN.md §8).

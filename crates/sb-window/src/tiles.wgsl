@@ -1,11 +1,6 @@
-// Instanced rounded-rect tiles: SDF corners, border ring, and thumbnail
-// sampling from a fixed-slot atlas (slot -1 = flat placeholder color).
-
-// Must match ATLAS_* consts in lib.rs.
-const ATLAS_COLS: f32 = 8.0;
-const ATLAS_ROWS: f32 = 15.0;
-const SLOT_W: f32 = 480.0;
-const SLOT_H: f32 = 270.0;
+// Instanced rounded-rect tiles: SDF corners, border ring, top-weighted rim
+// light, and thumbnail sampling via per-instance atlas UV rects
+// (zero-size uv = flat placeholder color).
 
 struct Uniforms {
     viewport: vec2<f32>,
@@ -23,8 +18,9 @@ struct Inst {
     @location(3) border: vec4<f32>,
     @location(4) radius: f32,
     @location(5) border_width: f32,
-    @location(6) tex_slot: f32,
-    @location(7) tex_mix: f32,
+    @location(6) tex_mix: f32,
+    @location(7) shine: f32,
+    @location(8) uv: vec4<f32>,
 };
 
 struct VsOut {
@@ -35,8 +31,9 @@ struct VsOut {
     @location(3) border: vec4<f32>,
     @location(4) radius: f32,
     @location(5) border_width: f32,
-    @location(6) tex_slot: f32,
-    @location(7) tex_mix: f32,
+    @location(6) tex_mix: f32,
+    @location(7) shine: f32,
+    @location(8) uv: vec4<f32>,
 };
 
 @vertex
@@ -60,8 +57,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     out.border = inst.border;
     out.radius = inst.radius;
     out.border_width = inst.border_width;
-    out.tex_slot = inst.tex_slot;
     out.tex_mix = inst.tex_mix;
+    out.shine = inst.shine;
+    out.uv = inst.uv;
     return out;
 }
 
@@ -72,18 +70,10 @@ fn sd_round_rect(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Atlas UV for this fragment: slot origin + fraction across the tile,
-    // inset half a texel so linear filtering never bleeds a neighbor slot.
-    let slot = max(in.tex_slot, 0.0);
-    let scol = slot % ATLAS_COLS;
-    let srow = floor(slot / ATLAS_COLS);
     let frac = clamp(in.local / in.size, vec2<f32>(0.0), vec2<f32>(1.0));
-    let atlas_px = vec2<f32>(ATLAS_COLS * SLOT_W, ATLAS_ROWS * SLOT_H);
-    let uv0 = vec2<f32>(scol * SLOT_W, srow * SLOT_H) + vec2<f32>(0.5);
-    let uv1 = vec2<f32>((scol + 1.0) * SLOT_W, (srow + 1.0) * SLOT_H) - vec2<f32>(0.5);
     // Sampled unconditionally: textureSample requires uniform control flow.
-    let tex = textureSample(atlas, samp, mix(uv0, uv1, frac) / atlas_px);
-    let use_tex = select(0.0, clamp(in.tex_mix, 0.0, 1.0), in.tex_slot >= 0.0);
+    let tex = textureSample(atlas, samp, in.uv.xy + frac * in.uv.zw);
+    let use_tex = select(0.0, clamp(in.tex_mix, 0.0, 1.0), in.uv.z > 0.0);
 
     let p = in.local - in.size * 0.5;
     let r = min(in.radius, min(in.size.x, in.size.y) * 0.5);
@@ -96,7 +86,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ring = (1.0 - smoothstep(-aa, aa, abs(d + in.border_width * 0.5) - in.border_width * 0.5))
             * in.border.a;
     }
-    let rgb = mix(mix(in.color.rgb, tex.rgb, use_tex), in.border.rgb, ring);
+    var rgb = mix(mix(in.color.rgb, tex.rgb, use_tex), in.border.rgb, ring);
+
+    // Rim light: a thin bright line just inside the border, stronger toward
+    // the top edge — reads as a subtle shine on the selected tile.
+    if (in.shine > 0.0 && in.border_width > 0.0) {
+        let rim_d = abs(d + in.border_width + 1.2) - 1.2;
+        let rim = 1.0 - smoothstep(-1.2, 1.2, rim_d);
+        let top_weight = 0.45 + 0.55 * (1.0 - frac.y);
+        rgb += vec3<f32>(rim * in.shine * top_weight);
+    }
+
     // Border alpha is independent of fill alpha, so a transparent tile can
     // still draw just its outline.
     return vec4<f32>(rgb, max(in.color.a, ring) * fill);

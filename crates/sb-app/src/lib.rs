@@ -38,7 +38,8 @@ enum Thumb {
     /// Not yet requested (or evicted from the atlas; re-requests when visible).
     None,
     Pending,
-    Ready { slot: usize, at: Instant },
+    /// `tw × th` = thumb pixels within the slot (original aspect ratio).
+    Ready { slot: usize, at: Instant, tw: u32, th: u32 },
     Failed,
 }
 
@@ -389,12 +390,13 @@ impl Switchblade {
         let mut uploads = Vec::new();
         while let Some(result) = self.media.try_recv() {
             match result {
-                ThumbResult::Ready { path, rgba } => {
+                ThumbResult::Ready { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else { continue };
                     let slot = self.alloc_slot(lay);
                     self.slots[slot] = Some(i);
-                    self.clips[i].thumb = Thumb::Ready { slot, at: Instant::now() };
-                    uploads.push(ThumbUpload { slot, rgba });
+                    self.clips[i].thumb =
+                        Thumb::Ready { slot, at: Instant::now(), tw: w, th: h };
+                    uploads.push(ThumbUpload { slot, w, h, rgba });
                 }
                 ThumbResult::Failed { path } => {
                     log::debug!("thumbnail failed: {}", path.display());
@@ -472,20 +474,53 @@ impl Switchblade {
 
                 let selected = i == self.selected;
                 let hovered = Some(i) == self.hovered;
+                let emphasized = selected || hovered;
+
+                let (thumb, tex_mix) = match clip.thumb {
+                    Thumb::Ready { slot, at, tw, th } => {
+                        let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
+                            .min(1.0);
+                        (Some((slot, tw as f32, th as f32)), 1.0 - (1.0 - m) * (1.0 - m))
+                    }
+                    _ => (None, 0.0),
+                };
+
                 let s = clip.scale * (0.92 + 0.08 * ease);
-                let w = lay.tile_w * s;
-                let h = lay.tile_h * s;
+                let mut w = lay.tile_w * s;
+                let mut h = lay.tile_h * s;
+                // Emphasized tiles show the whole frame: reshape the quad to
+                // the clip's true aspect, contained in the scaled cell box.
+                if emphasized {
+                    if let Some((_, tw, th)) = thumb {
+                        let a = tw / th;
+                        if a > w / h {
+                            h = w / a;
+                        } else {
+                            w = h * a;
+                        }
+                    }
+                }
                 let (ox, oy) = self.cell_origin(&lay, col, row);
                 let cx = ox + lay.tile_w * 0.5;
                 let cy = oy + lay.tile_h * 0.5;
 
-                let (tex_slot, tex_mix) = match clip.thumb {
-                    Thumb::Ready { slot, at } => {
-                        let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
-                            .min(1.0);
-                        (slot as i32, 1.0 - (1.0 - m) * (1.0 - m))
+                // Grid tiles crop-fill the thumb (centered sub-rect matching
+                // the tile aspect); emphasized tiles sample the whole thumb.
+                let uv = match thumb {
+                    Some((slot, tw, th)) if emphasized => {
+                        sb_window::atlas_uv(slot, 0.0, 0.0, tw, th)
                     }
-                    _ => (-1, 0.0),
+                    Some((slot, tw, th)) => {
+                        let tile_a = w / h.max(1.0);
+                        let (mut cw, mut ch) = (tw, th);
+                        if tw / th > tile_a {
+                            cw = th * tile_a;
+                        } else {
+                            ch = tw / tile_a;
+                        }
+                        sb_window::atlas_uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
+                    }
+                    None => [0.0; 4],
                 };
 
                 // No random placeholder colors: empty tiles are transparent
@@ -504,7 +539,7 @@ impl Switchblade {
                     ([sb[0], sb[1], sb[2], ease], t.border_width, t.selection_corner_radius)
                 } else if hovered {
                     ([hb[0], hb[1], hb[2], 0.35 * ease], 1.5, t.corner_radius)
-                } else if tex_slot < 0 && clip.readable && !clip.cloud {
+                } else if thumb.is_none() && clip.readable && !clip.cloud {
                     ([eb[0], eb[1], eb[2], ease], 1.0, t.corner_radius)
                 } else {
                     ([0.0; 4], 0.0, t.corner_radius)
@@ -519,8 +554,9 @@ impl Switchblade {
                     border_color,
                     corner_radius: radius * s,
                     border_width,
-                    tex_slot,
+                    uv,
                     tex_mix,
+                    shine: if selected { t.selection_shine } else { 0.0 },
                 };
                 let out = if selected { &mut selected_group } else { &mut tiles };
                 out.push(tile);
@@ -626,8 +662,9 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
         border_color: [0.0; 4],
         corner_radius: h * 0.5,
         border_width: 0.0,
-        tex_slot: -1,
+        uv: [0.0; 4],
         tex_mix: 0.0,
+        shine: 0.0,
     };
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
     out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
