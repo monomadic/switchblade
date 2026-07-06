@@ -180,21 +180,31 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
     let vf = format!(
         "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=increase,crop={THUMB_W}:{THUMB_H}"
     );
-    let status = Command::new("ffmpeg")
+    // stderr is captured, not inherited: decode noise from damaged files
+    // must never spam the console (it becomes one debug line below).
+    // `-strict unofficial` lets mjpeg accept full-range YUV sources
+    // (common in phone and AI-generated footage; hard error in ffmpeg 8+).
+    let out = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-ss", &format!("{seek:.3}")])
         .arg("-i")
         .arg(src)
-        .args(["-frames:v", "1", "-vf", &vf, "-f", "mjpeg"])
+        .args(["-frames:v", "1", "-vf", &vf, "-strict", "unofficial", "-f", "mjpeg"])
         .arg(&tmp)
         .stdin(Stdio::null())
-        .status()
+        .output()
         .ok()?;
     // A seek past EOF exits 0 without producing a file: retry from the start.
-    if !status.success() || !tmp.exists() {
+    if !out.status.success() || !tmp.exists() {
         let _ = std::fs::remove_file(&tmp);
         if seek > 0.0 {
             return extract_frame(src, dst, 0.0);
         }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        log::debug!(
+            "ffmpeg could not extract {}: {}",
+            src.display(),
+            stderr.lines().last().unwrap_or("(no output)")
+        );
         return None;
     }
     std::fs::rename(&tmp, dst).ok()
