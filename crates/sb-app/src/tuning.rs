@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Deserialize;
+
+use crate::commands::{CommandSpec, KeyMap};
 
 /// Every feel-related constant lives here and hot-reloads from
 /// `switchblade.toml` (PLAN.md §10). Don't hardcode feel values elsewhere.
@@ -90,6 +93,16 @@ impl Default for Tuning {
 struct ConfigFile {
     #[serde(default)]
     tuning: Tuning,
+    #[serde(default)]
+    keys: HashMap<String, String>,
+    #[serde(default)]
+    commands: HashMap<String, CommandSpec>,
+}
+
+/// Everything the config file provides, hot-reloadable as one unit.
+pub struct Config {
+    pub tuning: Tuning,
+    pub keymap: KeyMap,
 }
 
 /// Watches the tuning file by polling its mtime (at most every 250ms).
@@ -109,8 +122,8 @@ impl TuningFile {
         }
     }
 
-    /// Returns Some(tuning) when the file (re)loaded successfully.
-    pub fn poll(&mut self) -> Option<Tuning> {
+    /// Returns Some(config) when the file (re)loaded successfully.
+    pub fn poll(&mut self) -> Option<Config> {
         if self.last_check.elapsed() < Duration::from_millis(250) {
             return None;
         }
@@ -123,11 +136,14 @@ impl TuningFile {
         let text = std::fs::read_to_string(&self.path).ok()?;
         match toml::from_str::<ConfigFile>(&text) {
             Ok(cfg) => {
-                log::info!("tuning loaded from {}", self.path.display());
-                Some(cfg.tuning)
+                log::info!("config loaded from {}", self.path.display());
+                Some(Config {
+                    tuning: cfg.tuning,
+                    keymap: KeyMap::merged(cfg.keys, cfg.commands),
+                })
             }
             Err(e) => {
-                log::warn!("tuning parse error in {}: {e}", self.path.display());
+                log::warn!("config parse error in {}: {e}", self.path.display());
                 None
             }
         }

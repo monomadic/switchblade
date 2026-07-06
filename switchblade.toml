@@ -50,3 +50,33 @@ hover_border = [1.0, 1.0, 1.0]
 # Thin outline for tiles that have no thumbnail yet (fill is transparent).
 empty_border = [0.10, 0.10, 0.13]
 background = [0.004, 0.004, 0.006]
+
+# ── Keys & commands (PLAN.md §11) ────────────────────────────────────────
+# Built-in defaults: enter/o = open (mpv) · space = preview (looping mpv)
+# · c = copy_path · q = quit · f = fullscreen · -/=/0 = zoom.
+# hjkl/arrows are reserved for movement. Entries here override defaults.
+# {path}, {dir}, {name} expand against the selected clip.
+# Built-in internal actions: quit, fullscreen, copy_path,
+# zoom_in, zoom_out, zoom_reset.
+
+[keys]
+enter = "open"
+o = "open"
+space = "preview"
+c = "copy_path"
+# r = "rename_script"
+
+[commands.open]
+type = "external"
+program = "mpv"
+args = ["{path}"]
+
+[commands.preview]
+type = "external"
+program = "mpv"
+args = ["--loop-file=inf", "{path}"]
+
+# [commands.rename_script]
+# type = "external"
+# program = "~/bin/rename-media"
+# args = ["{path}"]

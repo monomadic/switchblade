@@ -1,6 +1,7 @@
 //! sb-app: application state and grid logic, headless of any OS/GPU types.
 //! Implements the `sb_window::App` trait (PLAN.md §12).
 
+mod commands;
 mod ingest;
 mod tuning;
 
@@ -16,6 +17,7 @@ use sb_window::{
     App, Frame, InputEvent, Key, ThumbUpload, Tile, Viewport, WindowCommand, ATLAS_SLOTS,
 };
 
+use commands::{Action, KeyMap};
 use tuning::{alpha, TuningFile};
 
 /// Rows beyond the viewport to prefetch thumbnails for.
@@ -64,6 +66,7 @@ pub struct Switchblade {
     slots: Vec<Option<usize>>,
     demo: bool,
     tuning: Tuning,
+    keymap: KeyMap,
     tuning_file: TuningFile,
     selected: usize,
     hovered: Option<usize>,
@@ -105,6 +108,7 @@ impl Switchblade {
             slots: vec![None; ATLAS_SLOTS],
             demo,
             tuning: Tuning::default(),
+            keymap: KeyMap::default(),
             tuning_file: TuningFile::new(PathBuf::from("switchblade.toml")),
             selected: 0,
             hovered: None,
@@ -237,32 +241,45 @@ impl Switchblade {
     // --- input ---
 
     fn key(&mut self, key: Key) {
+        // Movement keys are reserved; everything else goes through the keymap.
         match key {
-            Key::Char('q') => self.cmds.push(WindowCommand::Quit),
-            Key::Char('f') => self.cmds.push(WindowCommand::ToggleFullscreen),
-            Key::Char('h') | Key::Left => self.move_selection(-1, 0),
-            Key::Char('l') | Key::Right => self.move_selection(1, 0),
-            Key::Char('k') | Key::Up => self.move_selection(0, -1),
-            Key::Char('j') | Key::Down => self.move_selection(0, 1),
-            Key::Enter | Key::Char('o') => self.action("open"),
-            Key::Space => self.action("preview"),
-            Key::Char('-') => self.set_zoom(self.zoom_target / 1.15),
-            Key::Char('=') | Key::Char('+') => self.set_zoom(self.zoom_target * 1.15),
-            Key::Char('0') => self.set_zoom(1.0),
+            Key::Char('h') | Key::Left => return self.move_selection(-1, 0),
+            Key::Char('l') | Key::Right => return self.move_selection(1, 0),
+            Key::Char('k') | Key::Up => return self.move_selection(0, -1),
+            Key::Char('j') | Key::Down => return self.move_selection(0, 1),
             _ => {}
+        }
+        let Some(action) = self.keymap.action_for(&key) else {
+            return;
+        };
+        match action {
+            Action::Quit => self.cmds.push(WindowCommand::Quit),
+            Action::ToggleFullscreen => self.cmds.push(WindowCommand::ToggleFullscreen),
+            Action::ZoomIn => self.set_zoom(self.zoom_target * 1.15),
+            Action::ZoomOut => self.set_zoom(self.zoom_target / 1.15),
+            Action::ZoomReset => self.set_zoom(1.0),
+            Action::CopyPath => {
+                if let Some(clip) = self.clips.get(self.selected) {
+                    commands::copy_path(&clip.path);
+                }
+            }
+            Action::Spawn { program, args } => {
+                if let Some(clip) = self.clips.get(self.selected) {
+                    if clip.cloud {
+                        log::info!(
+                            "{} is an iCloud placeholder — opening it will trigger a download",
+                            clip.path.display()
+                        );
+                    }
+                    commands::spawn_external(&program, &args, &clip.path);
+                }
+            }
         }
     }
 
     fn set_zoom(&mut self, target: f32) {
         let t = &self.tuning;
         self.zoom_target = target.clamp(t.zoom_min, t.zoom_max);
-    }
-
-    fn action(&mut self, name: &str) {
-        // M0/M1: log only. Real command dispatch lands at M4 (PLAN.md §11).
-        if let Some(clip) = self.clips.get(self.selected) {
-            log::info!("{name}: {}", clip.path.display());
-        }
     }
 
     // --- per-frame ---
@@ -651,8 +668,9 @@ impl App for Switchblade {
 
     fn frame(&mut self, dt: f32, viewport: Viewport) -> Frame {
         self.viewport = viewport;
-        if let Some(new) = self.tuning_file.poll() {
-            self.tuning = new;
+        if let Some(cfg) = self.tuning_file.poll() {
+            self.tuning = cfg.tuning;
+            self.keymap = cfg.keymap;
         }
         self.drain_ingest();
         self.step(dt);
