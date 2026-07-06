@@ -1,0 +1,10 @@
+[package]
+name = "sb-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sb-window = { path = "../sb-window" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+log = { workspace = true }

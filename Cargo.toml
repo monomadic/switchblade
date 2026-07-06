@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/sb-app", "crates/sb-window", "crates/sb-media"]
+
+[workspace.dependencies]
+anyhow = "1"
+log = "0.4"
+
+[package]
+name = "switchblade"
+version = "0.1.0"
+edition = "2021"
+description = "A GPU-rendered video clip picker. fzf for videos."
+
+[dependencies]
+sb-app = { path = "crates/sb-app" }
+sb-window = { path = "crates/sb-window" }
+anyhow = { workspace = true }
+env_logger = "0.11"
+
+[profile.dev]
+# wgpu + shader-heavy code is unusably slow at opt-level 0
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
