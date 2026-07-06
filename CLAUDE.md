@@ -5,8 +5,9 @@ GPU-rendered video clip picker: "fzf for videos". Pipe paths in on stdin, fly a 
 **[PLAN.md](PLAN.md) is the source of truth** for scope, milestones, and every design decision. Read the relevant section before structural changes; don't re-litigate settled decisions (torus deferral, filesystem cache over SQLite, animated thumbs as MVP v2, etc.) without the user.
 
 ## Status
-- **Done:** M0 (skeleton: window, fullscreen, streaming stdin) and M1 (fake grid: placeholder tiles, hjkl/arrow selection, trackpad pan with rubber-band edges, hot tuning config). Parts of M2 rode along (streamed real paths become tiles in stdin order; window-title label; unreadable files tinted).
-- **Next:** M2 polish, then M3 (static thumbnail cache via `sb-media`). See PLAN.md §14.
+- **Done:** M0 (skeleton), M1 (fake grid + hot tuning), M2 (real file tiles, stdin order, unreadable handling, title label), M3 (static thumbnail cache: ffmpeg/ffprobe workers → sidecar cache under `~/Library/Caches/switchblade/v1/objects/` → RGBA into a fixed-slot GPU atlas with distance-based eviction; placeholder→thumb crossfade).
+- **Next:** M4 (external open/actions: configurable `keys.toml`-style commands, mpv open, copy path). See PLAN.md §11, §14.
+- Thumbs: 480×270 crop-fill JPEG, frame at 10% duration, fingerprint = FNV-1a(path+size+mtime). Atlas is 8×15 slots of 480×270 (`ATLAS_*` consts in sb-window; WGSL consts in `tiles.wgsl` must match).
 
 ## Build & run
 ```sh

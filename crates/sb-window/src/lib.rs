@@ -53,6 +53,22 @@ pub struct Viewport {
     pub height: f32,
 }
 
+/// Thumbnail atlas geometry. The renderer owns one fixed-slot RGBA atlas;
+/// the app allocates and evicts slot indices (GPU residency, PLAN.md M6
+/// note — simplified LRU arrives with animated thumbs).
+pub const ATLAS_SLOT_W: u32 = 480;
+pub const ATLAS_SLOT_H: u32 = 270;
+pub const ATLAS_COLS: u32 = 8;
+pub const ATLAS_ROWS: u32 = 15;
+pub const ATLAS_SLOTS: usize = (ATLAS_COLS * ATLAS_ROWS) as usize;
+
+/// Pixels to copy into one atlas slot this frame.
+pub struct ThumbUpload {
+    pub slot: usize,
+    /// Exactly `ATLAS_SLOT_W × ATLAS_SLOT_H × 4` RGBA bytes.
+    pub rgba: Vec<u8>,
+}
+
 /// One tile to draw. Position/size in logical pixels, origin top-left.
 /// Later tiles draw on top of earlier ones.
 #[derive(Debug, Clone, Copy)]
@@ -65,12 +81,17 @@ pub struct Tile {
     pub border_color: [f32; 4],
     pub corner_radius: f32,
     pub border_width: f32,
+    /// Atlas slot to sample, or -1 for flat placeholder color.
+    pub tex_slot: i32,
+    /// 0..1 crossfade from placeholder color to texture.
+    pub tex_mix: f32,
 }
 
 /// Everything the renderer needs for one frame.
 pub struct Frame {
     pub clear: [f32; 3],
     pub tiles: Vec<Tile>,
+    pub uploads: Vec<ThumbUpload>,
 }
 
 pub trait App {

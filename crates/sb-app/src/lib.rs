@@ -6,13 +6,22 @@ mod tuning;
 
 pub use tuning::Tuning;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use sb_window::{App, Frame, InputEvent, Key, Tile, Viewport, WindowCommand};
+use sb_media::{MediaService, ThumbResult};
+use sb_window::{
+    App, Frame, InputEvent, Key, ThumbUpload, Tile, Viewport, WindowCommand, ATLAS_SLOTS,
+};
 
 use tuning::{alpha, TuningFile};
+
+/// Rows beyond the viewport to prefetch thumbnails for.
+const PREFETCH_ROWS: usize = 2;
+/// Thumbnail crossfade duration once pixels arrive.
+const THUMB_FADE_S: f32 = 0.3;
 
 const DEMO_TILES: usize = 480;
 
@@ -25,16 +34,31 @@ struct Layout {
     cell_h: f32,
 }
 
+enum Thumb {
+    /// Not yet requested (or evicted from the atlas; re-requests when visible).
+    None,
+    Pending,
+    Ready { slot: usize, at: Instant },
+    Failed,
+}
+
 struct Clip {
     path: PathBuf,
     readable: bool,
     spawned: Instant,
     scale: f32,
+    thumb: Thumb,
 }
 
 pub struct Switchblade {
     clips: Vec<Clip>,
+    /// Path → clip index, for routing async thumbnail results.
+    index: HashMap<PathBuf, usize>,
     rx: Option<Receiver<ingest::Ingested>>,
+    media: MediaService,
+    /// Atlas slot → owning clip index. Fixed pool; distance-based eviction.
+    slots: Vec<Option<usize>>,
+    demo: bool,
     tuning: Tuning,
     tuning_file: TuningFile,
     selected: usize,
@@ -61,7 +85,11 @@ impl Switchblade {
         let demo = rx.is_none();
         let mut app = Self {
             clips: Vec::new(),
+            index: HashMap::new(),
             rx,
+            media: MediaService::new(),
+            slots: vec![None; ATLAS_SLOTS],
+            demo,
             tuning: Tuning::default(),
             tuning_file: TuningFile::new(PathBuf::from("switchblade.toml")),
             selected: 0,
@@ -85,6 +113,7 @@ impl Switchblade {
                     // Staggered spawn cascades the fade-in across the field.
                     spawned: now + Duration::from_millis(i as u64 * 2),
                     scale: 1.0,
+                    thumb: Thumb::Failed, // demo paths aren't real; never request
                 });
             }
         }
@@ -202,11 +231,13 @@ impl Switchblade {
         loop {
             match rx.try_recv() {
                 Ok(item) => {
+                    self.index.insert(item.path.clone(), self.clips.len());
                     self.clips.push(Clip {
                         path: item.path,
                         readable: item.readable,
                         spawned: Instant::now(),
                         scale: 1.0,
+                        thumb: Thumb::None,
                     });
                 }
                 Err(TryRecvError::Empty) => break,
@@ -264,6 +295,76 @@ impl Switchblade {
         }
     }
 
+    /// Rows currently on screen, extended by `margin` prefetch rows.
+    fn visible_rows(&self, lay: &Layout, margin: usize) -> (usize, usize) {
+        let g = self.tuning.gap;
+        let first = (((self.scroll - g) / lay.cell_h).floor().max(0.0)) as usize;
+        let last = (((self.scroll + self.viewport.height) / lay.cell_h).ceil()) as usize;
+        (first.saturating_sub(margin), last + margin)
+    }
+
+    /// Queue thumbnail generation for visible + nearby tiles (PLAN.md M3:
+    /// prioritized by visibility/proximity — proximity via request order).
+    fn request_visible_thumbs(&mut self, lay: &Layout) {
+        if self.demo {
+            return;
+        }
+        let (first_row, last_row) = self.visible_rows(lay, PREFETCH_ROWS);
+        for row in first_row..=last_row {
+            for col in 0..lay.cols {
+                let i = row * lay.cols + col;
+                let Some(clip) = self.clips.get_mut(i) else { break };
+                if clip.readable && matches!(clip.thumb, Thumb::None) {
+                    self.media.request(clip.path.clone());
+                    clip.thumb = Thumb::Pending;
+                }
+            }
+        }
+    }
+
+    /// Collect finished thumbnails into atlas uploads for this frame.
+    fn drain_media(&mut self, lay: &Layout) -> Vec<ThumbUpload> {
+        let mut uploads = Vec::new();
+        while let Some(result) = self.media.try_recv() {
+            match result {
+                ThumbResult::Ready { path, rgba } => {
+                    let Some(&i) = self.index.get(&path) else { continue };
+                    let slot = self.alloc_slot(lay);
+                    self.slots[slot] = Some(i);
+                    self.clips[i].thumb = Thumb::Ready { slot, at: Instant::now() };
+                    uploads.push(ThumbUpload { slot, rgba });
+                }
+                ThumbResult::Failed { path } => {
+                    log::debug!("thumbnail failed: {}", path.display());
+                    if let Some(&i) = self.index.get(&path) {
+                        self.clips[i].thumb = Thumb::Failed;
+                    }
+                }
+            }
+        }
+        uploads
+    }
+
+    /// First free atlas slot, or evict the resident clip farthest from the
+    /// viewport center (it re-requests when visible again — the disk cache
+    /// makes that cheap).
+    fn alloc_slot(&mut self, lay: &Layout) -> usize {
+        let center_row = ((self.scroll + self.viewport.height * 0.5) / lay.cell_h).max(0.0) as i64;
+        let mut best: Option<(usize, i64)> = None;
+        for (j, owner) in self.slots.iter().enumerate() {
+            let Some(owner) = owner else { return j };
+            let dist = ((owner / lay.cols) as i64 - center_row).abs();
+            if best.is_none_or(|(_, bd)| dist > bd) {
+                best = Some((j, dist));
+            }
+        }
+        let (j, _) = best.expect("atlas has at least one slot");
+        if let Some(victim) = self.slots[j] {
+            self.clips[victim].thumb = Thumb::None;
+        }
+        j
+    }
+
     fn update_title(&mut self) {
         let name = self
             .clips
@@ -282,8 +383,7 @@ impl Switchblade {
     fn build_frame(&self) -> Frame {
         let t = &self.tuning;
         let lay = self.layout();
-        let first_row = (((self.scroll - t.gap) / lay.cell_h).floor().max(0.0)) as usize;
-        let last_row = (((self.scroll + self.viewport.height) / lay.cell_h).ceil()) as usize;
+        let (first_row, last_row) = self.visible_rows(&lay, 0);
 
         let now = Instant::now();
         let mut tiles = Vec::new();
@@ -325,6 +425,15 @@ impl Switchblade {
                     ([0.0; 4], 0.0)
                 };
 
+                let (tex_slot, tex_mix) = match clip.thumb {
+                    Thumb::Ready { slot, at } => {
+                        let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
+                            .min(1.0);
+                        (slot as i32, 1.0 - (1.0 - m) * (1.0 - m))
+                    }
+                    _ => (-1, 0.0),
+                };
+
                 let tile = Tile {
                     x: cx - w * 0.5,
                     y: cy - h * 0.5,
@@ -334,6 +443,8 @@ impl Switchblade {
                     border_color,
                     corner_radius: t.corner_radius * s,
                     border_width,
+                    tex_slot,
+                    tex_mix,
                 };
                 if selected {
                     selected_tile = Some(tile);
@@ -347,7 +458,7 @@ impl Switchblade {
             tiles.push(tile);
         }
 
-        Frame { clear: t.background, tiles }
+        Frame { clear: t.background, tiles, uploads: Vec::new() }
     }
 }
 
@@ -380,8 +491,13 @@ impl App for Switchblade {
         }
         self.drain_ingest();
         self.step(dt);
+        let lay = self.layout();
+        self.request_visible_thumbs(&lay);
+        let uploads = self.drain_media(&lay);
         self.update_title();
-        self.build_frame()
+        let mut frame = self.build_frame();
+        frame.uploads = uploads;
+        frame
     }
 
     fn commands(&mut self) -> Vec<WindowCommand> {

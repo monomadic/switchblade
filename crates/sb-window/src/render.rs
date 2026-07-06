@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::{Frame, Viewport};
+use crate::{Frame, Viewport, ATLAS_COLS, ATLAS_ROWS, ATLAS_SLOTS, ATLAS_SLOT_H, ATLAS_SLOT_W};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -20,7 +20,8 @@ struct Instance {
     border: [f32; 4],
     radius: f32,
     border_width: f32,
-    _pad: [f32; 2],
+    tex_slot: f32,
+    tex_mix: f32,
 }
 
 pub struct Gpu {
@@ -31,6 +32,7 @@ pub struct Gpu {
     pipeline: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    atlas: wgpu::Texture,
     instances: wgpu::Buffer,
     instance_capacity: usize,
 }
@@ -83,26 +85,78 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thumb atlas"),
+            size: wgpu::Extent3d {
+                width: ATLAS_COLS * ATLAS_SLOT_W,
+                height: ATLAS_ROWS * ATLAS_SLOT_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("thumb sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("uniforms"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            label: Some("tiles"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("uniforms"),
+            label: Some("tiles"),
             layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniforms.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -121,6 +175,8 @@ impl Gpu {
                 3 => Float32x4,
                 4 => Float32,
                 5 => Float32,
+                6 => Float32,
+                7 => Float32,
             ],
         };
 
@@ -161,6 +217,7 @@ impl Gpu {
             pipeline,
             uniforms,
             bind_group,
+            atlas,
             instances,
             instance_capacity,
         })
@@ -175,6 +232,38 @@ impl Gpu {
         })
     }
 
+    fn upload_thumb(&self, slot: usize, rgba: &[u8]) {
+        let expected = (ATLAS_SLOT_W * ATLAS_SLOT_H * 4) as usize;
+        if slot >= ATLAS_SLOTS || rgba.len() != expected {
+            log::warn!("bad thumb upload: slot {slot}, {} bytes", rgba.len());
+            return;
+        }
+        let (col, row) = (slot as u32 % ATLAS_COLS, slot as u32 / ATLAS_COLS);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: col * ATLAS_SLOT_W,
+                    y: row * ATLAS_SLOT_H,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ATLAS_SLOT_W * 4),
+                rows_per_image: Some(ATLAS_SLOT_H),
+            },
+            wgpu::Extent3d {
+                width: ATLAS_SLOT_W,
+                height: ATLAS_SLOT_H,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -185,6 +274,10 @@ impl Gpu {
     }
 
     pub fn render(&mut self, frame: &Frame, viewport: Viewport) {
+        for up in &frame.uploads {
+            self.upload_thumb(up.slot, &up.rgba);
+        }
+
         let data: Vec<Instance> = frame
             .tiles
             .iter()
@@ -195,7 +288,8 @@ impl Gpu {
                 border: t.border_color,
                 radius: t.corner_radius,
                 border_width: t.border_width,
-                _pad: [0.0; 2],
+                tex_slot: t.tex_slot as f32,
+                tex_mix: t.tex_mix,
             })
             .collect();
 
