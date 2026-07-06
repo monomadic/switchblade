@@ -1,6 +1,6 @@
-// Instanced rounded-rect tiles: SDF corners, border ring, top-weighted rim
-// light, and thumbnail sampling via per-instance atlas UV rects
-// (zero-size uv = flat placeholder color).
+// Instanced rounded-rect tiles: SDF corners, border ring, and thumbnail
+// sampling via per-instance atlas UV rects (zero-size uv = flat
+// placeholder color).
 
 struct Uniforms {
     viewport: vec2<f32>,
@@ -19,8 +19,7 @@ struct Inst {
     @location(4) radius: f32,
     @location(5) border_width: f32,
     @location(6) tex_mix: f32,
-    @location(7) shine: f32,
-    @location(8) uv: vec4<f32>,
+    @location(7) uv: vec4<f32>,
 };
 
 struct VsOut {
@@ -32,8 +31,7 @@ struct VsOut {
     @location(4) radius: f32,
     @location(5) border_width: f32,
     @location(6) tex_mix: f32,
-    @location(7) shine: f32,
-    @location(8) uv: vec4<f32>,
+    @location(7) uv: vec4<f32>,
 };
 
 @vertex
@@ -58,7 +56,6 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     out.radius = inst.radius;
     out.border_width = inst.border_width;
     out.tex_mix = inst.tex_mix;
-    out.shine = inst.shine;
     out.uv = inst.uv;
     return out;
 }
@@ -86,16 +83,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ring = (1.0 - smoothstep(-aa, aa, abs(d + in.border_width * 0.5) - in.border_width * 0.5))
             * in.border.a;
     }
-    var rgb = mix(mix(in.color.rgb, tex.rgb, use_tex), in.border.rgb, ring);
-
-    // Rim light: a thin bright line just inside the border, stronger toward
-    // the top edge — reads as a subtle shine on the selected tile.
-    if (in.shine > 0.0 && in.border_width > 0.0) {
-        let rim_d = abs(d + in.border_width + 1.2) - 1.2;
-        let rim = 1.0 - smoothstep(-1.2, 1.2, rim_d);
-        let top_weight = 0.45 + 0.55 * (1.0 - frac.y);
-        rgb += vec3<f32>(rim * in.shine * top_weight);
-    }
+    let rgb = mix(mix(in.color.rgb, tex.rgb, use_tex), in.border.rgb, ring);
 
     // Border alpha is independent of fill alpha, so a transparent tile can
     // still draw just its outline.

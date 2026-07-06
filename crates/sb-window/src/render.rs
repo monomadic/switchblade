@@ -21,8 +21,8 @@ struct Instance {
     radius: f32,
     border_width: f32,
     tex_mix: f32,
-    shine: f32,
     uv: [f32; 4],
+    _pad: f32,
 }
 
 pub struct Gpu {
@@ -177,8 +177,7 @@ impl Gpu {
                 4 => Float32,
                 5 => Float32,
                 6 => Float32,
-                7 => Float32,
-                8 => Float32x4,
+                7 => Float32x4,
             ],
         };
 
@@ -302,8 +301,8 @@ impl Gpu {
                 radius: t.corner_radius,
                 border_width: t.border_width,
                 tex_mix: t.tex_mix,
-                shine: t.shine,
                 uv: t.uv,
+                _pad: 0.0,
             })
             .collect();
 

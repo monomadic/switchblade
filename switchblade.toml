@@ -41,8 +41,10 @@ selection_corner_radius = 10.0
 border_width = 6.0
 fade_in_ms = 220.0
 
-# Rim light just inside the black selection border (0 = off).
-selection_shine = 0.5
+# Aspect cap (long:short) for the selected/hovered tile. Clips beyond it
+# get pan-and-scan cropped: portrait loses top/bottom, ultrawide loses
+# sides. 1.5 also gently crops 16:9; set 1.78 to leave landscape untouched.
+max_display_aspect = 1.5
 selection_border = [0.0, 0.0, 0.0]
 hover_border = [1.0, 1.0, 1.0]
 # Thin outline for tiles that have no thumbnail yet (fill is transparent).

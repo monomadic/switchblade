@@ -488,15 +488,22 @@ impl Switchblade {
                 let s = clip.scale * (0.92 + 0.08 * ease);
                 let mut w = lay.tile_w * s;
                 let mut h = lay.tile_h * s;
-                // Emphasized tiles show the whole frame: reshape the quad to
-                // the clip's true aspect, contained in the scaled cell box.
+
+                // Emphasized tiles show the clip at its own aspect ratio,
+                // capped at max_display_aspect with a centered pan-and-scan
+                // crop, and sized to *cover* the scaled cell box so no
+                // background peeks out behind portrait clips.
+                let display_aspect = |tw: f32, th: f32| {
+                    let m = t.max_display_aspect.max(1.0);
+                    (tw / th).clamp(1.0 / m, m)
+                };
                 if emphasized {
                     if let Some((_, tw, th)) = thumb {
-                        let a = tw / th;
+                        let a = display_aspect(tw, th);
                         if a > w / h {
-                            h = w / a;
-                        } else {
                             w = h * a;
+                        } else {
+                            h = w / a;
                         }
                     }
                 }
@@ -504,19 +511,20 @@ impl Switchblade {
                 let cx = ox + lay.tile_w * 0.5;
                 let cy = oy + lay.tile_h * 0.5;
 
-                // Grid tiles crop-fill the thumb (centered sub-rect matching
-                // the tile aspect); emphasized tiles sample the whole thumb.
+                // UV window into the thumb: grid tiles crop-fill to the tile
+                // shape; emphasized tiles crop only what the aspect cap chops.
                 let uv = match thumb {
-                    Some((slot, tw, th)) if emphasized => {
-                        sb_window::atlas_uv(slot, 0.0, 0.0, tw, th)
-                    }
                     Some((slot, tw, th)) => {
-                        let tile_a = w / h.max(1.0);
-                        let (mut cw, mut ch) = (tw, th);
-                        if tw / th > tile_a {
-                            cw = th * tile_a;
+                        let target_a = if emphasized {
+                            display_aspect(tw, th)
                         } else {
-                            ch = tw / tile_a;
+                            w / h.max(1.0)
+                        };
+                        let (mut cw, mut ch) = (tw, th);
+                        if tw / th > target_a {
+                            cw = th * target_a;
+                        } else {
+                            ch = tw / target_a;
                         }
                         sb_window::atlas_uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
                     }
@@ -556,7 +564,6 @@ impl Switchblade {
                     border_width,
                     uv,
                     tex_mix,
-                    shine: if selected { t.selection_shine } else { 0.0 },
                 };
                 let out = if selected { &mut selected_group } else { &mut tiles };
                 out.push(tile);
@@ -664,7 +671,6 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
         border_width: 0.0,
         uv: [0.0; 4],
         tex_mix: 0.0,
-        shine: 0.0,
     };
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
     out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump

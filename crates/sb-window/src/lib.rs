@@ -105,8 +105,6 @@ pub struct Tile {
     pub uv: [f32; 4],
     /// 0..1 crossfade from placeholder color to texture.
     pub tex_mix: f32,
-    /// Strength of the inner rim light inside the border (0 = off).
-    pub shine: f32,
 }
 
 /// Everything the renderer needs for one frame.
