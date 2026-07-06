@@ -69,13 +69,23 @@ impl Default for KeyMap {
                 args: vec!["{path}".to_string()],
             },
         );
-        // Preview is deliberately distinct from open: looping, no playlist
-        // behavior — a peek, not a commit (PLAN.md §4 note).
+        // Preview is deliberately distinct from open: a macOS-Quick-Look-ish
+        // peek — windowed, floating on top, looping, sized sensibly.
         commands.insert(
             "preview".to_string(),
             CommandSpec::External {
                 program: "mpv".to_string(),
-                args: vec!["--loop-file=inf".to_string(), "{path}".to_string()],
+                args: [
+                    "--no-fs",
+                    "--loop-file=inf",
+                    "--ontop",
+                    "--no-terminal",
+                    "--force-window=immediate",
+                    "--autofit-larger=70%x70%",
+                    "{path}",
+                ]
+                .map(String::from)
+                .to_vec(),
             },
         );
         Self { keys, commands }

@@ -58,10 +58,10 @@ pub struct Viewport {
 /// Thumbnail atlas geometry. The renderer owns one fixed-slot RGBA atlas;
 /// the app allocates and evicts slot indices (GPU residency, PLAN.md M6
 /// note — simplified LRU arrives with animated thumbs).
-pub const ATLAS_SLOT_W: u32 = 480;
-pub const ATLAS_SLOT_H: u32 = 270;
-pub const ATLAS_COLS: u32 = 8;
-pub const ATLAS_ROWS: u32 = 15;
+pub const ATLAS_SLOT_W: u32 = 640;
+pub const ATLAS_SLOT_H: u32 = 360;
+pub const ATLAS_COLS: u32 = 12;
+pub const ATLAS_ROWS: u32 = 12;
 pub const ATLAS_SLOTS: usize = (ATLAS_COLS * ATLAS_ROWS) as usize;
 
 /// Pixels to copy into one atlas slot this frame. Thumbs keep their source

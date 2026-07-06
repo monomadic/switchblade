@@ -16,13 +16,14 @@ use std::time::UNIX_EPOCH;
 
 /// Thumbnails fit within this box with their aspect ratio preserved; the
 /// grid crops to tile shape at sampling time, so the selected tile can show
-/// the whole frame.
-pub const THUMB_W: u32 = 480;
-pub const THUMB_H: u32 = 270;
+/// the whole frame. 640×360 keeps tiles crisp on 2x displays.
+pub const THUMB_W: u32 = 640;
+pub const THUMB_H: u32 = 360;
 
-/// Cache artifact name. Bumped when the recipe changes (was `thumb.jpg`,
-/// crop-filled): stale artifacts are simply ignored and regenerated.
-const THUMB_FILE: &str = "thumb_fit.jpg";
+/// Cache artifact name. Bumped when the recipe changes (thumb.jpg =
+/// crop-filled 480; thumb_fit.jpg = default-quality 480): stale artifacts
+/// are simply ignored and regenerated.
+const THUMB_FILE: &str = "thumb_fit_640.jpg";
 
 const WORKERS: usize = 3;
 /// Extract the frame this far into the clip (PLAN.md §6 initial policy).
@@ -194,7 +195,10 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
         .args(["-y", "-v", "error", "-ss", &format!("{seek:.3}")])
         .arg("-i")
         .arg(src)
-        .args(["-frames:v", "1", "-vf", &vf, "-strict", "unofficial", "-f", "mjpeg"])
+        .args([
+            // -q:v 2 ≈ visually lossless; the mjpeg default is very blocky.
+            "-frames:v", "1", "-vf", &vf, "-q:v", "2", "-strict", "unofficial", "-f", "mjpeg",
+        ])
         .arg(&tmp)
         .stdin(Stdio::null())
         .output()

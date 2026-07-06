@@ -71,10 +71,20 @@ type = "external"
 program = "mpv"
 args = ["{path}"]
 
+# Quick-Look-ish peek: windowed (never fullscreen), floats on top,
+# loops, opens instantly, capped at 70% of the screen.
 [commands.preview]
 type = "external"
 program = "mpv"
-args = ["--loop-file=inf", "{path}"]
+args = [
+  "--no-fs",
+  "--loop-file=inf",
+  "--ontop",
+  "--no-terminal",
+  "--force-window=immediate",
+  "--autofit-larger=70%x70%",
+  "{path}",
+]
 
 # [commands.rename_script]
 # type = "external"
