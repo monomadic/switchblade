@@ -20,6 +20,13 @@ pan_inertia = 0.0
 snap_strength = 0.22
 rubber_band = 0.25
 scale_smoothing = 0.35
+zoom_smoothing = 0.35
+
+# Pinch-to-zoom (also -/=/0 keys). Zoom scales the ideal tile width,
+# so columns reflow as you zoom.
+pinch_sensitivity = 1.0
+zoom_min = 0.35
+zoom_max = 3.0
 
 # Selected tile scales up and overlaps its neighbors (drawn on top).
 selection_scale = 1.15

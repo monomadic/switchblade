@@ -28,6 +28,12 @@ pub struct Tuning {
     pub border_width: f32,
     /// Tile spawn fade/scale-in duration.
     pub fade_in_ms: f32,
+    /// Pinch delta multiplier for zoom.
+    pub pinch_sensitivity: f32,
+    pub zoom_min: f32,
+    pub zoom_max: f32,
+    /// 0..1, how fast zoom approaches its target per 60fps frame.
+    pub zoom_smoothing: f32,
     pub accent: [f32; 3],
     pub background: [f32; 3],
 }
@@ -48,6 +54,10 @@ impl Default for Tuning {
             corner_radius: 2.0,
             border_width: 6.0,
             fade_in_ms: 220.0,
+            pinch_sensitivity: 1.0,
+            zoom_min: 0.35,
+            zoom_max: 3.0,
+            zoom_smoothing: 0.35,
             accent: [1.0, 1.0, 1.0],
             background: [0.004, 0.004, 0.006],
         }

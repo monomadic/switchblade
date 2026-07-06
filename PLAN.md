@@ -79,6 +79,7 @@ Like `fzf`, but for visual clip selection instead of lines of text.
 
 ### Pointer / trackpad
 - Drag/pan moves the grid.
+- Pinch zooms the grid: tile size scales and columns reflow, anchored on the viewport center. Also on `-` / `=` / `0` keys.
 - Hover may highlight.
 - Click selects.
 - Double-click or configured action opens.
@@ -120,6 +121,7 @@ The first real media milestone.
 - Cache it.
 - Render it as a tile.
 - The app must remain usable while thumbnails are missing/generating.
+- iCloud placeholder (dataless) files are detected at ingest and shown with a cloud badge; their data is **never** read, since reading would trigger a download. (Later: a "download selected" action.)
 
 Initial policies: first frame, N% into clip; maybe later a scene-ish frame.
 

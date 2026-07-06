@@ -15,7 +15,7 @@ cargo run                          # demo mode: 480 fake tiles (stdin is a TTY)
 fd -e mp4 -e mov . ~/Clips | cargo run    # real paths, streamed
 RUST_LOG=debug cargo run           # more logging
 ```
-Keys: `hjkl`/arrows move selection · `f` fullscreen · `Enter`/`o` open (logs until M4) · `Space` preview (logs until M4) · `q` quit. Trackpad pans without changing selection; click selects.
+Keys: `hjkl`/arrows move selection · `f` fullscreen · `Enter`/`o` open (logs until M4) · `Space` preview (logs until M4) · `-`/`=`/`0` zoom out/in/reset · `q` quit. Trackpad pans without changing selection; pinch zooms; click selects. iCloud placeholder files get a blue tile + cloud badge and are never read.
 
 ## Layout
 - `src/main.rs` — thin entrypoint.

@@ -35,6 +35,8 @@ pub enum InputEvent {
     Key { key: Key, repeat: bool },
     /// Trackpad / mouse wheel scroll.
     Scroll { dx: f32, dy: f32 },
+    /// Trackpad pinch; positive delta = fingers spreading (zoom in).
+    Pinch { delta: f32 },
     CursorMoved { x: f32, y: f32 },
     MouseDown { x: f32, y: f32 },
 }
@@ -205,6 +207,9 @@ impl<A: App> ApplicationHandler for Runner<A> {
                     MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
                 };
                 self.app.event(InputEvent::Scroll { dx, dy });
+            }
+            WindowEvent::PinchGesture { delta, .. } => {
+                self.app.event(InputEvent::Pinch { delta: delta as f32 });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f32>(self.scale());
