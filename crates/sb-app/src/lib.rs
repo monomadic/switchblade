@@ -79,6 +79,8 @@ pub struct Switchblade {
     last_cols: usize,
     last_tiles: Vec<Tile>,
     transition: Option<(Vec<Tile>, Instant)>,
+    /// App start, the time base for looping micro-animations (loading dots).
+    t0: Instant,
     last_scroll_event: Instant,
     viewport: Viewport,
     cmds: Vec<WindowCommand>,
@@ -116,6 +118,7 @@ impl Switchblade {
             last_cols: 0,
             last_tiles: Vec::new(),
             transition: None,
+            t0: Instant::now(),
             last_scroll_event: Instant::now(),
             viewport: Viewport { width: 1280.0, height: 800.0 },
             cmds: Vec::new(),
@@ -450,8 +453,11 @@ impl Switchblade {
         let (first_row, last_row) = self.visible_rows(&lay, 0);
 
         let now = Instant::now();
+        let anim_t = now.saturating_duration_since(self.t0).as_secs_f32();
         let mut tiles = Vec::new();
-        // The selected tile (plus any badge) draws last, over neighbors.
+        // Z-order: grid tiles, then the hovered tile lifted above its
+        // neighbors, then the selected tile on top of everything.
+        let mut hovered_group: Vec<Tile> = Vec::new();
         let mut selected_group: Vec<Tile> = Vec::new();
 
         for row in first_row..=last_row {
@@ -565,13 +571,23 @@ impl Switchblade {
                     uv,
                     tex_mix,
                 };
-                let out = if selected { &mut selected_group } else { &mut tiles };
+                let out = if selected {
+                    &mut selected_group
+                } else if hovered {
+                    &mut hovered_group
+                } else {
+                    &mut tiles
+                };
                 out.push(tile);
                 if clip.cloud && w > 70.0 {
                     push_cloud_badge(out, &tile, ease);
                 }
+                if matches!(clip.thumb, Thumb::Pending) && w > 70.0 {
+                    push_loading_dots(out, &tile, ease, anim_t);
+                }
             }
         }
+        tiles.extend(hovered_group);
         tiles.extend(selected_group);
 
         // Photos-style reflow: when the column count changes (zoom/resize),
@@ -675,4 +691,28 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
     out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
     out.push(part(bx, by + 7.0, 28.0, 10.0)); // base bar
+}
+
+/// Three softly pulsing dots in the tile's bottom-right corner while its
+/// thumbnail is being generated.
+fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32) {
+    let d = 5.0;
+    let gap = 4.0;
+    let bx = tile.x + tile.w - (3.0 * d + 2.0 * gap) - 10.0;
+    let by = tile.y + tile.h - d - 10.0;
+    for k in 0..3 {
+        let pulse = 0.5 + 0.5 * (t * 4.5 - k as f32 * 0.9).sin();
+        out.push(Tile {
+            x: bx + k as f32 * (d + gap),
+            y: by,
+            w: d,
+            h: d,
+            color: [0.55, 0.55, 0.62, (0.2 + 0.55 * pulse) * ease],
+            border_color: [0.0; 4],
+            corner_radius: d * 0.5,
+            border_width: 0.0,
+            uv: [0.0; 4],
+            tex_mix: 0.0,
+        });
+    }
 }

@@ -80,7 +80,7 @@ impl Default for Tuning {
             max_display_aspect: 1.5,
             selection_border: [0.0, 0.0, 0.0],
             hover_border: [1.0, 1.0, 1.0],
-            empty_border: [0.16, 0.16, 0.19],
+            empty_border: [0.10, 0.10, 0.13],
             background: [0.004, 0.004, 0.006],
         }
     }
