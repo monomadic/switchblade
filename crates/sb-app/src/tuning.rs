@@ -37,19 +37,19 @@ impl Default for Tuning {
         Self {
             tile_width: 240.0,
             tile_height: 135.0,
-            gap: 18.0,
+            gap: 6.0,
             pan_sensitivity: 1.0,
             pan_inertia: 0.0,
             snap_strength: 0.22,
             rubber_band: 0.25,
-            selection_scale: 1.08,
+            selection_scale: 1.15,
             hover_scale: 1.03,
             scale_smoothing: 0.35,
-            corner_radius: 10.0,
-            border_width: 2.5,
+            corner_radius: 2.0,
+            border_width: 6.0,
             fade_in_ms: 220.0,
-            accent: [1.0, 0.18, 0.53],
-            background: [0.016, 0.016, 0.022],
+            accent: [1.0, 1.0, 1.0],
+            background: [0.004, 0.004, 0.006],
         }
     }
 }

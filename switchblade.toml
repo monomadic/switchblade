@@ -3,9 +3,12 @@
 # constant lives here; if you find yourself hardcoding one, add it instead.
 
 [tuning]
+# Ideal tile size: width picks the column count, then tiles stretch so the
+# columns exactly fill the window (the background should barely show).
+# Width:height sets the aspect ratio (240:135 = 16:9).
 tile_width = 240.0
 tile_height = 135.0
-gap = 18.0
+gap = 6.0
 
 # Scroll delta multiplier; negative flips direction if pan feels inverted.
 pan_sensitivity = 1.0
@@ -18,12 +21,13 @@ snap_strength = 0.22
 rubber_band = 0.25
 scale_smoothing = 0.35
 
-selection_scale = 1.08
+# Selected tile scales up and overlaps its neighbors (drawn on top).
+selection_scale = 1.15
 hover_scale = 1.03
-corner_radius = 10.0
-border_width = 2.5
+corner_radius = 2.0
+# Thick white selection line.
+border_width = 6.0
 fade_in_ms = 220.0
 
-# Hot pink. Obviously.
-accent = [1.0, 0.18, 0.53]
-background = [0.016, 0.016, 0.022]
+accent = [1.0, 1.0, 1.0]
+background = [0.004, 0.004, 0.006]

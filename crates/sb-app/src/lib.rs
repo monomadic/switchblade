@@ -16,6 +16,15 @@ use tuning::{alpha, TuningFile};
 
 const DEMO_TILES: usize = 480;
 
+/// Derived per-frame grid metrics; see [`Switchblade::layout`].
+struct Layout {
+    cols: usize,
+    tile_w: f32,
+    tile_h: f32,
+    cell_w: f32,
+    cell_h: f32,
+}
+
 struct Clip {
     path: PathBuf,
     readable: bool,
@@ -84,46 +93,55 @@ impl Switchblade {
 
     // --- layout ---
 
-    fn columns(&self) -> usize {
+    /// Grid layout derived from tuning + viewport. `tuning.tile_width` is the
+    /// *ideal* width used to choose the column count; tiles then stretch so
+    /// the columns exactly fill the viewport and the background barely shows.
+    fn layout(&self) -> Layout {
         let t = &self.tuning;
-        (((self.viewport.width - t.gap) / (t.tile_width + t.gap)).floor() as usize).max(1)
+        let cols =
+            (((self.viewport.width - t.gap) / (t.tile_width + t.gap)).floor() as usize).max(1);
+        let tile_w =
+            ((self.viewport.width - t.gap * (cols as f32 + 1.0)) / cols as f32).max(1.0);
+        let tile_h = tile_w * t.tile_height / t.tile_width.max(1.0);
+        Layout {
+            cols,
+            tile_w,
+            tile_h,
+            cell_w: tile_w + t.gap,
+            cell_h: tile_h + t.gap,
+        }
     }
 
-    fn rows(&self) -> usize {
-        let cols = self.columns();
-        self.clips.len().div_ceil(cols)
+    fn rows(&self, lay: &Layout) -> usize {
+        self.clips.len().div_ceil(lay.cols)
     }
 
-    fn cell_origin(&self, col: usize, row: usize) -> (f32, f32) {
-        let t = &self.tuning;
+    fn cell_origin(&self, lay: &Layout, col: usize, row: usize) -> (f32, f32) {
+        let g = self.tuning.gap;
         (
-            t.gap + col as f32 * (t.tile_width + t.gap),
-            t.gap + row as f32 * (t.tile_height + t.gap) - self.scroll,
+            g + col as f32 * lay.cell_w,
+            g + row as f32 * lay.cell_h - self.scroll,
         )
     }
 
-    fn max_scroll(&self) -> f32 {
-        let t = &self.tuning;
-        let content = t.gap + self.rows() as f32 * (t.tile_height + t.gap);
+    fn max_scroll(&self, lay: &Layout) -> f32 {
+        let content = self.tuning.gap + self.rows(lay) as f32 * lay.cell_h;
         (content - self.viewport.height).max(0.0)
     }
 
-    fn tile_at(&self, x: f32, y: f32) -> Option<usize> {
-        let t = &self.tuning;
-        let cols = self.columns();
-        let xx = x - t.gap;
-        let yy = y + self.scroll - t.gap;
+    fn tile_at(&self, lay: &Layout, x: f32, y: f32) -> Option<usize> {
+        let g = self.tuning.gap;
+        let xx = x - g;
+        let yy = y + self.scroll - g;
         if xx < 0.0 || yy < 0.0 {
             return None;
         }
-        let cell_w = t.tile_width + t.gap;
-        let cell_h = t.tile_height + t.gap;
-        let col = (xx / cell_w) as usize;
-        let row = (yy / cell_h) as usize;
-        if col >= cols || xx % cell_w > t.tile_width || yy % cell_h > t.tile_height {
+        let col = (xx / lay.cell_w) as usize;
+        let row = (yy / lay.cell_h) as usize;
+        if col >= lay.cols || xx % lay.cell_w > lay.tile_w || yy % lay.cell_h > lay.tile_h {
             return None;
         }
-        let i = row * cols + col;
+        let i = row * lay.cols + col;
         (i < self.clips.len()).then_some(i)
     }
 
@@ -133,8 +151,9 @@ impl Switchblade {
         if self.clips.is_empty() {
             return;
         }
-        let cols = self.columns() as i32;
-        let rows = self.rows() as i32;
+        let lay = self.layout();
+        let cols = lay.cols as i32;
+        let rows = self.rows(&lay) as i32;
         let sel = self.selected as i32;
         let col = (sel % cols + dx).clamp(0, cols - 1);
         let row = (sel / cols + dy).clamp(0, rows - 1);
@@ -145,12 +164,11 @@ impl Switchblade {
 
     /// Smoothly bring the selected row toward the vertical center.
     fn scroll_to_selected(&mut self) {
-        let t = &self.tuning;
-        let cols = self.columns();
-        let row = self.selected / cols;
-        let row_center = t.gap + row as f32 * (t.tile_height + t.gap) + t.tile_height * 0.5;
+        let lay = self.layout();
+        let row = self.selected / lay.cols;
+        let row_center = self.tuning.gap + row as f32 * lay.cell_h + lay.tile_h * 0.5;
         self.scroll_target =
-            (row_center - self.viewport.height * 0.5).clamp(0.0, self.max_scroll());
+            (row_center - self.viewport.height * 0.5).clamp(0.0, self.max_scroll(&lay));
         self.scroll_vel = 0.0;
     }
 
@@ -203,6 +221,7 @@ impl Switchblade {
 
     fn step(&mut self, dt: f32) {
         let t = self.tuning.clone();
+        let lay = self.layout();
 
         // Optional extra inertia (off by default; macOS supplies momentum).
         if t.pan_inertia > 0.0 && self.last_scroll_event.elapsed().as_secs_f32() > 0.04 {
@@ -211,7 +230,7 @@ impl Switchblade {
         }
 
         // Rubber-band the target back into bounds.
-        let max = self.max_scroll();
+        let max = self.max_scroll(&lay);
         if self.scroll_target < 0.0 {
             self.scroll_target *= 1.0 - alpha(t.rubber_band, dt);
             if self.scroll_target > -0.5 {
@@ -229,7 +248,7 @@ impl Switchblade {
         // Camera chases its target.
         self.scroll += (self.scroll_target - self.scroll) * alpha(t.snap_strength, dt);
 
-        self.hovered = self.tile_at(self.cursor.0, self.cursor.1);
+        self.hovered = self.tile_at(&lay, self.cursor.0, self.cursor.1);
 
         // Tile scale springs (selected > hover > rest).
         let a = alpha(t.scale_smoothing, dt);
@@ -262,18 +281,17 @@ impl Switchblade {
 
     fn build_frame(&self) -> Frame {
         let t = &self.tuning;
-        let cols = self.columns();
-        let cell_h = t.tile_height + t.gap;
-        let first_row = (((self.scroll - t.gap) / cell_h).floor().max(0.0)) as usize;
-        let last_row = (((self.scroll + self.viewport.height) / cell_h).ceil()) as usize;
+        let lay = self.layout();
+        let first_row = (((self.scroll - t.gap) / lay.cell_h).floor().max(0.0)) as usize;
+        let last_row = (((self.scroll + self.viewport.height) / lay.cell_h).ceil()) as usize;
 
         let now = Instant::now();
         let mut tiles = Vec::new();
         let mut selected_tile = None;
 
         for row in first_row..=last_row {
-            for col in 0..cols {
-                let i = row * cols + col;
+            for col in 0..lay.cols {
+                let i = row * lay.cols + col;
                 if i >= self.clips.len() {
                     break;
                 }
@@ -292,11 +310,11 @@ impl Switchblade {
                 let selected = i == self.selected;
                 let hovered = Some(i) == self.hovered;
                 let s = clip.scale * (0.92 + 0.08 * ease);
-                let w = t.tile_width * s;
-                let h = t.tile_height * s;
-                let (ox, oy) = self.cell_origin(col, row);
-                let cx = ox + t.tile_width * 0.5;
-                let cy = oy + t.tile_height * 0.5;
+                let w = lay.tile_w * s;
+                let h = lay.tile_h * s;
+                let (ox, oy) = self.cell_origin(&lay, col, row);
+                let cx = ox + lay.tile_w * 0.5;
+                let cy = oy + lay.tile_h * 0.5;
 
                 let base = placeholder_color(i, clip.readable);
                 let (border_color, border_width) = if selected {
@@ -347,7 +365,8 @@ impl App for Switchblade {
                 self.cursor = (x, y);
             }
             InputEvent::MouseDown { x, y } => {
-                if let Some(i) = self.tile_at(x, y) {
+                let lay = self.layout();
+                if let Some(i) = self.tile_at(&lay, x, y) {
                     self.selected = i;
                 }
             }
