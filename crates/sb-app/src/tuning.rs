@@ -46,6 +46,13 @@ pub struct Tuning {
     pub zoom_smoothing: f32,
     /// Crossfade duration when the column count reflows (Photos-style).
     pub zoom_fade_ms: f32,
+    /// Animated thumbnails in the grid (M6 sprite sheets).
+    pub anim: bool,
+    /// Seconds for one full pass through an anim sheet's frames.
+    pub anim_cycle_s: f32,
+    /// Don't animate (or generate sheets) below this tile width — motion
+    /// is invisible on tiny tiles and slots are better spent on statics.
+    pub anim_min_tile_w: f32,
     /// Longest-to-shortest side cap for the selected/hovered tile's shape;
     /// clips beyond it get a centered pan-and-scan crop. 1.78 ≈ 16:9.
     pub max_display_aspect: f32,
@@ -80,6 +87,9 @@ impl Default for Tuning {
             zoom_max: 3.0,
             zoom_smoothing: 0.35,
             zoom_fade_ms: 180.0,
+            anim: true,
+            anim_cycle_s: 2.8,
+            anim_min_tile_w: 140.0,
             max_display_aspect: 1.5,
             selection_border: [0.0, 0.0, 0.0],
             hover_border: [1.0, 1.0, 1.0],

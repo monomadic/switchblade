@@ -25,21 +25,40 @@ pub const THUMB_H: u32 = 360;
 /// are simply ignored and regenerated.
 const THUMB_FILE: &str = "thumb_fit_640.jpg";
 
+/// Animated thumbnails, first recipe (PLAN.md §6 level 2): ANIM_FRAMES
+/// stills sampled evenly across the clip, packed as an ANIM_COLS×ANIM_ROWS
+/// sprite sheet that fits one atlas slot. Frames are crop-filled 16:9.
+pub const ANIM_COLS: u32 = 3;
+pub const ANIM_ROWS: u32 = 3;
+pub const ANIM_FRAMES: u32 = ANIM_COLS * ANIM_ROWS;
+const ANIM_FRAME_W: u32 = THUMB_W / ANIM_COLS; // 213
+const ANIM_FRAME_H: u32 = THUMB_H / ANIM_ROWS; // 120
+const ANIM_FILE: &str = "anim_3x3.jpg";
+
 const WORKERS: usize = 3;
 /// Extract the frame this far into the clip (PLAN.md §6 initial policy).
 const SEEK_FRACTION: f64 = 0.10;
+
+enum Request {
+    Thumb(PathBuf),
+    Anim(PathBuf),
+}
 
 pub enum ThumbResult {
     /// `rgba` is `w × h × 4` bytes, with `w ≤ THUMB_W`, `h ≤ THUMB_H` and
     /// the clip's original aspect ratio.
     Ready { path: PathBuf, w: u32, h: u32, rgba: Vec<u8> },
     Failed { path: PathBuf },
+    /// A sprite sheet of ANIM_FRAMES crop-filled frames; `w × h` are the
+    /// sheet dimensions (frame size = w/ANIM_COLS × h/ANIM_ROWS).
+    AnimReady { path: PathBuf, w: u32, h: u32, rgba: Vec<u8> },
+    AnimFailed { path: PathBuf },
 }
 
 /// Async thumbnail service. `request` from the UI thread, results arrive
 /// via `try_recv` on later frames.
 pub struct MediaService {
-    tx: Sender<PathBuf>,
+    tx: Sender<Request>,
     rx: Receiver<ThumbResult>,
 }
 
@@ -51,7 +70,7 @@ impl Default for MediaService {
 
 impl MediaService {
     pub fn new() -> Self {
-        let (tx_req, rx_req) = mpsc::channel::<PathBuf>();
+        let (tx_req, rx_req) = mpsc::channel::<Request>();
         let (tx_done, rx_done) = mpsc::channel::<ThumbResult>();
         let rx_req = Arc::new(Mutex::new(rx_req));
 
@@ -74,7 +93,11 @@ impl MediaService {
     }
 
     pub fn request(&self, path: PathBuf) {
-        let _ = self.tx.send(path);
+        let _ = self.tx.send(Request::Thumb(path));
+    }
+
+    pub fn request_anim(&self, path: PathBuf) {
+        let _ = self.tx.send(Request::Anim(path));
     }
 
     pub fn try_recv(&self) -> Option<ThumbResult> {
@@ -83,7 +106,7 @@ impl MediaService {
 }
 
 fn worker(
-    rx: Arc<Mutex<Receiver<PathBuf>>>,
+    rx: Arc<Mutex<Receiver<Request>>>,
     tx: Sender<ThumbResult>,
     root: PathBuf,
     have_ffmpeg: bool,
@@ -91,13 +114,19 @@ fn worker(
     loop {
         // The lock is only held while waiting for the next request; the
         // temporary guard drops before any work starts.
-        let path = match { rx.lock().unwrap().recv() } {
-            Ok(p) => p,
+        let req = match { rx.lock().unwrap().recv() } {
+            Ok(r) => r,
             Err(_) => return,
         };
-        let result = match make_thumb(&path, &root, have_ffmpeg) {
-            Some((w, h, rgba)) => ThumbResult::Ready { path, w, h, rgba },
-            None => ThumbResult::Failed { path },
+        let result = match req {
+            Request::Thumb(path) => match make_thumb(&path, &root, have_ffmpeg) {
+                Some((w, h, rgba)) => ThumbResult::Ready { path, w, h, rgba },
+                None => ThumbResult::Failed { path },
+            },
+            Request::Anim(path) => match make_anim(&path, &root, have_ffmpeg) {
+                Some((w, h, rgba)) => ThumbResult::AnimReady { path, w, h, rgba },
+                None => ThumbResult::AnimFailed { path },
+            },
         };
         if tx.send(result).is_err() {
             return;
@@ -132,6 +161,57 @@ fn make_thumb(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, V
             .unwrap_or(0.0);
         extract_frame(src, &jpg, seek)?;
         log::debug!("thumb generated: {}", src.display());
+    }
+    decode_jpeg(&jpg)
+}
+
+/// Generate/serve the animated sprite sheet: ANIM_FRAMES frames sampled
+/// evenly across the clip, crop-filled to 16:9, tiled into one JPEG.
+fn make_anim(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, Vec<u8>)> {
+    let meta = std::fs::metadata(src).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let fp = fingerprint(src, meta.len(), mtime_secs(&meta));
+    let dir = root.join(&fp[..2]).join(&fp);
+    let jpg = dir.join(ANIM_FILE);
+
+    if !jpg.exists() {
+        if !have_ffmpeg {
+            return None;
+        }
+        std::fs::create_dir_all(&dir).ok()?;
+        // Sampling frames across the clip needs its duration.
+        let duration = probe(src).and_then(|m| m.duration).filter(|d| *d > 0.05)?;
+        let tmp = jpg.with_extension("jpg.tmp");
+        // Slightly overshoot the rate so the tile filter always fills all
+        // ANIM_FRAMES cells before EOF (a padded black cell looks broken).
+        let fps = (ANIM_FRAMES as f64 + 0.5) / duration;
+        let vf = format!(
+            "fps={fps:.6},scale={ANIM_FRAME_W}:{ANIM_FRAME_H}:force_original_aspect_ratio=increase,\
+             crop={ANIM_FRAME_W}:{ANIM_FRAME_H},tile={ANIM_COLS}x{ANIM_ROWS}"
+        );
+        let out = Command::new("ffmpeg")
+            .args(["-y", "-v", "error"])
+            .arg("-i")
+            .arg(src)
+            .args(["-frames:v", "1", "-vf", &vf, "-q:v", "3", "-strict", "unofficial", "-f", "mjpeg"])
+            .arg(&tmp)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() || !tmp.exists() {
+            let _ = std::fs::remove_file(&tmp);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            log::debug!(
+                "ffmpeg could not build anim sheet for {}: {}",
+                src.display(),
+                stderr.lines().last().unwrap_or("(no output)")
+            );
+            return None;
+        }
+        std::fs::rename(&tmp, &jpg).ok()?;
+        log::debug!("anim sheet generated: {}", src.display());
     }
     decode_jpeg(&jpg)
 }

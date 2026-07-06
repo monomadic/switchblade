@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use sb_media::{MediaService, ThumbResult};
+use sb_media::{MediaService, ThumbResult, ANIM_COLS, ANIM_ROWS};
 use sb_window::{
     App, Frame, InputEvent, Key, ThumbUpload, Tile, Viewport, WindowCommand, ATLAS_SLOTS,
 };
@@ -40,9 +40,17 @@ enum Thumb {
     /// Not yet requested (or evicted from the atlas; re-requests when visible).
     None,
     Pending,
-    /// `tw × th` = thumb pixels within the slot (original aspect ratio).
+    /// `tw × th` = pixels within the slot (static thumb: original aspect;
+    /// anim: sprite-sheet dimensions).
     Ready { slot: usize, at: Instant, tw: u32, th: u32 },
     Failed,
+}
+
+/// What a given atlas slot holds, so eviction can reset the right state.
+#[derive(Clone, Copy)]
+enum SlotKind {
+    Static,
+    Anim,
 }
 
 struct Clip {
@@ -54,6 +62,9 @@ struct Clip {
     spawned: Instant,
     scale: f32,
     thumb: Thumb,
+    /// Sprite-sheet animation (M6): frames cycle in the grid; the static
+    /// thumb stays authoritative for the emphasized tile.
+    anim: Thumb,
 }
 
 pub struct Switchblade {
@@ -62,8 +73,9 @@ pub struct Switchblade {
     index: HashMap<PathBuf, usize>,
     rx: Option<Receiver<ingest::Ingested>>,
     media: MediaService,
-    /// Atlas slot → owning clip index. Fixed pool; distance-based eviction.
-    slots: Vec<Option<usize>>,
+    /// Atlas slot → owner. Fixed pool shared by static thumbs and anim
+    /// sheets; distance-based eviction.
+    slots: Vec<Option<(usize, SlotKind)>>,
     demo: bool,
     tuning: Tuning,
     keymap: KeyMap,
@@ -140,6 +152,7 @@ impl Switchblade {
                     spawned: now + Duration::from_millis(i as u64 * 2),
                     scale: 1.0,
                     thumb: Thumb::Failed, // demo paths aren't real; never request
+                    anim: Thumb::Failed,
                 });
             }
         }
@@ -300,6 +313,7 @@ impl Switchblade {
                         spawned: Instant::now(),
                         scale: 1.0,
                         thumb,
+                        anim: if item.cloud { Thumb::Failed } else { Thumb::None },
                     });
                 }
                 Err(TryRecvError::Empty) => break,
@@ -388,18 +402,31 @@ impl Switchblade {
 
     /// Queue thumbnail generation for visible + nearby tiles (PLAN.md M3:
     /// prioritized by visibility/proximity — proximity via request order).
+    /// Anim sheets follow once the static thumb exists, and only at tile
+    /// sizes where motion is visible.
     fn request_visible_thumbs(&mut self, lay: &Layout) {
         if self.demo {
             return;
         }
+        let want_anim = self.tuning.anim && lay.tile_w >= self.tuning.anim_min_tile_w;
         let (first_row, last_row) = self.visible_rows(lay, PREFETCH_ROWS);
         for row in first_row..=last_row {
             for col in 0..lay.cols {
                 let i = row * lay.cols + col;
                 let Some(clip) = self.clips.get_mut(i) else { break };
-                if clip.readable && matches!(clip.thumb, Thumb::None) {
+                if !clip.readable {
+                    continue;
+                }
+                if matches!(clip.thumb, Thumb::None) {
                     self.media.request(clip.path.clone());
                     clip.thumb = Thumb::Pending;
+                }
+                if want_anim
+                    && matches!(clip.thumb, Thumb::Ready { .. })
+                    && matches!(clip.anim, Thumb::None)
+                {
+                    self.media.request_anim(clip.path.clone());
+                    clip.anim = Thumb::Pending;
                 }
             }
         }
@@ -413,7 +440,7 @@ impl Switchblade {
                 ThumbResult::Ready { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else { continue };
                     let slot = self.alloc_slot(lay);
-                    self.slots[slot] = Some(i);
+                    self.slots[slot] = Some((i, SlotKind::Static));
                     self.clips[i].thumb =
                         Thumb::Ready { slot, at: Instant::now(), tw: w, th: h };
                     uploads.push(ThumbUpload { slot, w, h, rgba });
@@ -422,6 +449,20 @@ impl Switchblade {
                     log::debug!("thumbnail failed: {}", path.display());
                     if let Some(&i) = self.index.get(&path) {
                         self.clips[i].thumb = Thumb::Failed;
+                    }
+                }
+                ThumbResult::AnimReady { path, w, h, rgba } => {
+                    let Some(&i) = self.index.get(&path) else { continue };
+                    let slot = self.alloc_slot(lay);
+                    self.slots[slot] = Some((i, SlotKind::Anim));
+                    self.clips[i].anim =
+                        Thumb::Ready { slot, at: Instant::now(), tw: w, th: h };
+                    uploads.push(ThumbUpload { slot, w, h, rgba });
+                }
+                ThumbResult::AnimFailed { path } => {
+                    log::debug!("anim sheet failed: {}", path.display());
+                    if let Some(&i) = self.index.get(&path) {
+                        self.clips[i].anim = Thumb::Failed;
                     }
                 }
             }
@@ -436,15 +477,23 @@ impl Switchblade {
         let center_row = ((self.scroll + self.viewport.height * 0.5) / lay.cell_h).max(0.0) as i64;
         let mut best: Option<(usize, i64)> = None;
         for (j, owner) in self.slots.iter().enumerate() {
-            let Some(owner) = owner else { return j };
-            let dist = ((owner / lay.cols) as i64 - center_row).abs();
+            let Some((owner, kind)) = owner else { return j };
+            let mut dist = ((owner / lay.cols) as i64 - center_row).abs();
+            // Prefer evicting anim sheets over static thumbs at equal
+            // distance: losing motion degrades nicer than losing the image.
+            if matches!(kind, SlotKind::Anim) {
+                dist += 1;
+            }
             if best.is_none_or(|(_, bd)| dist > bd) {
                 best = Some((j, dist));
             }
         }
         let (j, _) = best.expect("atlas has at least one slot");
-        if let Some(victim) = self.slots[j] {
-            self.clips[victim].thumb = Thumb::None;
+        if let Some((victim, kind)) = self.slots[j] {
+            match kind {
+                SlotKind::Static => self.clips[victim].thumb = Thumb::None,
+                SlotKind::Anim => self.clips[victim].anim = Thumb::None,
+            }
         }
         j
     }
@@ -534,24 +583,69 @@ impl Switchblade {
                 let cx = ox + lay.tile_w * 0.5;
                 let cy = oy + lay.tile_h * 0.5;
 
-                // UV window into the thumb: grid tiles crop-fill to the tile
-                // shape; emphasized tiles crop only what the aspect cap chops.
-                let uv = match thumb {
-                    Some((slot, tw, th)) => {
-                        let target_a = if emphasized {
-                            display_aspect(tw, th)
-                        } else {
-                            w / h.max(1.0)
-                        };
-                        let (mut cw, mut ch) = (tw, th);
-                        if tw / th > target_a {
-                            cw = th * target_a;
-                        } else {
-                            ch = tw / target_a;
+                // Texture source: in the grid, a cycling anim-sheet frame
+                // once available (M6); the static thumb otherwise, and
+                // always for the emphasized tile (it's higher-res).
+                let anim = if !emphasized && t.anim {
+                    match clip.anim {
+                        Thumb::Ready { slot, at, tw, th } => {
+                            Some((slot, at, tw as f32, th as f32))
                         }
-                        sb_window::atlas_uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
+                        _ => None,
                     }
-                    None => [0.0; 4],
+                } else {
+                    None
+                };
+
+                let mut mix = tex_mix;
+                let uv = if let Some((slot, at, sw, sh)) = anim {
+                    let (cols, rows) = (ANIM_COLS as usize, ANIM_ROWS as usize);
+                    let frames = (cols * rows) as f32;
+                    let (fw, fh) = (sw / cols as f32, sh / rows as f32);
+                    // Per-clip phase offset so neighbors don't tick in
+                    // lockstep.
+                    let phase = (i % 9) as f32 / frames;
+                    let pos = (anim_t / t.anim_cycle_s.max(0.2) + phase).fract();
+                    let k = ((pos * frames) as usize).min(cols * rows - 1);
+                    let (fx, fy) = ((k % cols) as f32 * fw, (k / cols) as f32 * fh);
+
+                    let target_a = w / h.max(1.0);
+                    let (mut cw, mut ch) = (fw, fh);
+                    if fw / fh > target_a {
+                        cw = fh * target_a;
+                    } else {
+                        ch = fw / target_a;
+                    }
+                    let anim_fade = {
+                        let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
+                            .min(1.0);
+                        1.0 - (1.0 - m) * (1.0 - m)
+                    };
+                    // If the static thumb is already showing, swap without
+                    // re-fading (no dip to background).
+                    mix = if thumb.is_some() { mix.max(anim_fade) } else { anim_fade };
+                    sb_window::atlas_uv(slot, fx + (fw - cw) * 0.5, fy + (fh - ch) * 0.5, cw, ch)
+                } else {
+                    // UV window into the static thumb: grid tiles crop-fill
+                    // to the tile shape; emphasized tiles crop only what the
+                    // aspect cap chops.
+                    match thumb {
+                        Some((slot, tw, th)) => {
+                            let target_a = if emphasized {
+                                display_aspect(tw, th)
+                            } else {
+                                w / h.max(1.0)
+                            };
+                            let (mut cw, mut ch) = (tw, th);
+                            if tw / th > target_a {
+                                cw = th * target_a;
+                            } else {
+                                ch = tw / target_a;
+                            }
+                            sb_window::atlas_uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
+                        }
+                        None => [0.0; 4],
+                    }
                 };
 
                 // No random placeholder colors: empty tiles are transparent
@@ -562,7 +656,7 @@ impl Switchblade {
                 } else if !clip.readable {
                     ([0.16, 0.05, 0.06], ease)
                 } else {
-                    ([0.0, 0.0, 0.0], ease * tex_mix)
+                    ([0.0, 0.0, 0.0], ease * mix)
                 };
 
                 let (sb, hb, eb) = (t.selection_border, t.hover_border, t.empty_border);
@@ -586,7 +680,7 @@ impl Switchblade {
                     corner_radius: radius * s,
                     border_width,
                     uv,
-                    tex_mix,
+                    tex_mix: mix,
                 };
                 let out = if selected {
                     &mut selected_group
