@@ -105,6 +105,71 @@ impl MediaService {
     }
 }
 
+/// Live playback for the selected clip (PLAN.md §6 level 3): an ffmpeg
+/// child decodes to raw RGBA on stdout at native pace (`-re`), looping
+/// forever; a reader thread keeps only the latest frame. One instance at a
+/// time, killed on drop. Software decode of a single ≤640px stream is
+/// cheap; hardware decode can slot in later without changing the interface.
+pub struct LivePlayer {
+    child: std::process::Child,
+    frame: Arc<Mutex<Option<Vec<u8>>>>,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl LivePlayer {
+    pub fn spawn(path: &Path, w: u32, h: u32) -> Option<Self> {
+        let (w, h) = (w.max(2), h.max(2));
+        let mut child = Command::new("ffmpeg")
+            .args(["-v", "error", "-stream_loop", "-1", "-re"])
+            .arg("-i")
+            .arg(path)
+            .args([
+                "-an",
+                "-sn",
+                "-vf",
+                &format!("scale={w}:{h}"),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let frame = Arc::new(Mutex::new(None));
+        let latest = frame.clone();
+        let frame_bytes = (w * h * 4) as usize;
+        thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = vec![0u8; frame_bytes];
+            loop {
+                if stdout.read_exact(&mut buf).is_err() {
+                    return; // EOF or killed
+                }
+                *latest.lock().unwrap() = Some(buf.clone());
+            }
+        });
+        Some(Self { child, frame, w, h })
+    }
+
+    /// The newest decoded frame, if one arrived since the last call.
+    pub fn take_frame(&self) -> Option<Vec<u8>> {
+        self.frame.lock().unwrap().take()
+    }
+}
+
+impl Drop for LivePlayer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn worker(
     rx: Arc<Mutex<Receiver<Request>>>,
     tx: Sender<ThumbResult>,

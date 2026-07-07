@@ -46,6 +46,10 @@ pub struct Tuning {
     pub zoom_smoothing: f32,
     /// Crossfade duration when the column count reflows (Photos-style).
     pub zoom_fade_ms: f32,
+    /// Live video playback inside the selected tile.
+    pub live_preview: bool,
+    /// How long the selection must settle before live playback starts.
+    pub live_delay_ms: f32,
     /// Animated thumbnails in the grid (M6 sprite sheets).
     pub anim: bool,
     /// Seconds for one full pass through an anim sheet's frames.
@@ -87,6 +91,8 @@ impl Default for Tuning {
             zoom_max: 3.0,
             zoom_smoothing: 0.35,
             zoom_fade_ms: 180.0,
+            live_preview: true,
+            live_delay_ms: 250.0,
             anim: true,
             anim_cycle_s: 2.8,
             anim_min_tile_w: 140.0,

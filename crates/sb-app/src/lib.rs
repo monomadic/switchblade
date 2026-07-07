@@ -51,6 +51,17 @@ enum Thumb {
 enum SlotKind {
     Static,
     Anim,
+    /// The live-playback frame for the selected clip; never evicted.
+    Live,
+}
+
+/// The selected clip's in-tile video playback (PLAN.md §6 level 3).
+struct LiveState {
+    clip: usize,
+    player: sb_media::LivePlayer,
+    slot: usize,
+    /// Set when the first frame arrives; the tile switches to video then.
+    first_frame: Option<Instant>,
 }
 
 struct Clip {
@@ -73,9 +84,13 @@ pub struct Switchblade {
     index: HashMap<PathBuf, usize>,
     rx: Option<Receiver<ingest::Ingested>>,
     media: MediaService,
-    /// Atlas slot → owner. Fixed pool shared by static thumbs and anim
-    /// sheets; distance-based eviction.
+    /// Atlas slot → owner. Fixed pool shared by static thumbs, anim sheets
+    /// and the live frame; class+distance-based eviction (see alloc_slot).
     slots: Vec<Option<(usize, SlotKind)>>,
+    live: Option<LiveState>,
+    /// Last time the selection changed; live playback starts once it
+    /// settles for live_delay_ms.
+    sel_changed_at: Instant,
     demo: bool,
     tuning: Tuning,
     keymap: KeyMap,
@@ -118,6 +133,8 @@ impl Switchblade {
             rx,
             media: MediaService::new(),
             slots: vec![None; ATLAS_SLOTS],
+            live: None,
+            sel_changed_at: Instant::now(),
             demo,
             tuning: Tuning::default(),
             keymap: KeyMap::default(),
@@ -235,7 +252,10 @@ impl Switchblade {
         let col = (sel % cols + dx).clamp(0, cols - 1);
         let row = (sel / cols + dy).clamp(0, rows - 1);
         let idx = (row * cols + col).min(self.clips.len() as i32 - 1) as usize;
-        self.selected = idx;
+        if idx != self.selected {
+            self.selected = idx;
+            self.sel_changed_at = Instant::now();
+        }
         self.scroll_to_selected();
     }
 
@@ -400,33 +420,65 @@ impl Switchblade {
         (first.saturating_sub(margin), last + margin)
     }
 
-    /// Queue thumbnail generation for visible + nearby tiles (PLAN.md M3:
-    /// prioritized by visibility/proximity — proximity via request order).
-    /// Anim sheets follow once the static thumb exists, and only at tile
-    /// sizes where motion is visible.
+    /// Zone rows ordered center-outward, for prioritized requests.
+    fn zone_rows(&self, lay: &Layout) -> Vec<usize> {
+        let (first_row, last_row) = self.visible_rows(lay, PREFETCH_ROWS);
+        let center = ((self.scroll + self.viewport.height * 0.5) / lay.cell_h).max(0.0) as i64;
+        let mut rows: Vec<usize> = (first_row..=last_row).collect();
+        rows.sort_by_key(|r| (*r as i64 - center).abs());
+        rows
+    }
+
+    /// Queue thumbnail generation for visible + nearby tiles, center-out,
+    /// within the atlas slot budget: statics claim budget first, anim
+    /// sheets get what's left. Without the budget, a big viewport demands
+    /// more slots than exist and eviction churns everything forever.
     fn request_visible_thumbs(&mut self, lay: &Layout) {
         if self.demo {
             return;
         }
-        let want_anim = self.tuning.anim && lay.tile_w >= self.tuning.anim_min_tile_w;
-        let (first_row, last_row) = self.visible_rows(lay, PREFETCH_ROWS);
-        for row in first_row..=last_row {
+        let rows = self.zone_rows(lay);
+        let mut budget = ATLAS_SLOTS as i64 - 8; // headroom incl. live slot
+
+        'statics: for &row in &rows {
             for col in 0..lay.cols {
                 let i = row * lay.cols + col;
                 let Some(clip) = self.clips.get_mut(i) else { break };
-                if !clip.readable {
+                if !clip.readable || matches!(clip.thumb, Thumb::Failed) {
                     continue;
                 }
+                if budget <= 0 {
+                    break 'statics;
+                }
+                budget -= 1;
                 if matches!(clip.thumb, Thumb::None) {
                     self.media.request(clip.path.clone());
                     clip.thumb = Thumb::Pending;
                 }
-                if want_anim
-                    && matches!(clip.thumb, Thumb::Ready { .. })
-                    && matches!(clip.anim, Thumb::None)
-                {
-                    self.media.request_anim(clip.path.clone());
-                    clip.anim = Thumb::Pending;
+            }
+        }
+
+        if !self.tuning.anim || lay.tile_w < self.tuning.anim_min_tile_w {
+            return;
+        }
+        'anims: for &row in &rows {
+            for col in 0..lay.cols {
+                let i = row * lay.cols + col;
+                let Some(clip) = self.clips.get_mut(i) else { break };
+                if !clip.readable || matches!(clip.anim, Thumb::Failed) {
+                    continue;
+                }
+                if budget <= 0 {
+                    break 'anims;
+                }
+                match clip.anim {
+                    Thumb::Ready { .. } | Thumb::Pending => budget -= 1,
+                    Thumb::None if matches!(clip.thumb, Thumb::Ready { .. }) => {
+                        budget -= 1;
+                        self.media.request_anim(clip.path.clone());
+                        clip.anim = Thumb::Pending;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -439,7 +491,12 @@ impl Switchblade {
             match result {
                 ThumbResult::Ready { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else { continue };
-                    let slot = self.alloc_slot(lay);
+                    let Some(slot) = self.alloc_slot(lay, SlotKind::Static) else {
+                        log::debug!("static dropped, atlas full: {}", path.display());
+                        self.clips[i].thumb = Thumb::Failed;
+                        continue;
+                    };
+                    log::debug!("static ready: clip {i} -> slot {slot} ({w}x{h})");
                     self.slots[slot] = Some((i, SlotKind::Static));
                     self.clips[i].thumb =
                         Thumb::Ready { slot, at: Instant::now(), tw: w, th: h };
@@ -453,7 +510,12 @@ impl Switchblade {
                 }
                 ThumbResult::AnimReady { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else { continue };
-                    let slot = self.alloc_slot(lay);
+                    let Some(slot) = self.alloc_slot(lay, SlotKind::Anim) else {
+                        log::debug!("anim dropped, atlas full: {}", path.display());
+                        self.clips[i].anim = Thumb::Failed;
+                        continue;
+                    };
+                    log::debug!("anim ready: clip {i} -> slot {slot} ({w}x{h})");
                     self.slots[slot] = Some((i, SlotKind::Anim));
                     self.clips[i].anim =
                         Thumb::Ready { slot, at: Instant::now(), tw: w, th: h };
@@ -470,32 +532,109 @@ impl Switchblade {
         uploads
     }
 
-    /// First free atlas slot, or evict the resident clip farthest from the
-    /// viewport center (it re-requests when visible again — the disk cache
-    /// makes that cheap).
-    fn alloc_slot(&mut self, lay: &Layout) -> usize {
+    /// First free atlas slot, or evict by class: out-of-zone anims first,
+    /// then out-of-zone statics, then in-zone anims — never an in-zone
+    /// static or the live slot. Returns None (caller drops the pixels) when
+    /// nothing evictable remains; the request budget makes that rare.
+    fn alloc_slot(&mut self, lay: &Layout, incoming: SlotKind) -> Option<usize> {
         let center_row = ((self.scroll + self.viewport.height * 0.5) / lay.cell_h).max(0.0) as i64;
-        let mut best: Option<(usize, i64)> = None;
+        let (zone_first, zone_last) = self.visible_rows(lay, PREFETCH_ROWS);
+        let mut best: Option<(usize, u8, i64)> = None;
         for (j, owner) in self.slots.iter().enumerate() {
-            let Some((owner, kind)) = owner else { return j };
-            let mut dist = ((owner / lay.cols) as i64 - center_row).abs();
-            // Prefer evicting anim sheets over static thumbs at equal
-            // distance: losing motion degrades nicer than losing the image.
-            if matches!(kind, SlotKind::Anim) {
-                dist += 1;
-            }
-            if best.is_none_or(|(_, bd)| dist > bd) {
-                best = Some((j, dist));
+            let Some((owner, kind)) = owner else {
+                return Some(j);
+            };
+            let row = owner / lay.cols;
+            let dist = (row as i64 - center_row).abs();
+            let in_zone = row >= zone_first && row <= zone_last;
+            let class: u8 = match (in_zone, kind) {
+                (_, SlotKind::Live) => 0, // never evicted
+                (true, SlotKind::Static) => 0,
+                (true, SlotKind::Anim) => 1,
+                (false, SlotKind::Static) => 2,
+                (false, SlotKind::Anim) => 3,
+            };
+            if best.is_none_or(|(_, bc, bd)| (class, dist) > (bc, bd)) {
+                best = Some((j, class, dist));
             }
         }
-        let (j, _) = best.expect("atlas has at least one slot");
+        let (j, class, _) = best.expect("atlas has at least one slot");
+        let min_class = match incoming {
+            // A static or the live frame may displace in-zone anims;
+            // an anim sheet may not displace anything in-zone.
+            SlotKind::Static | SlotKind::Live => 1,
+            SlotKind::Anim => 2,
+        };
+        if class < min_class {
+            return None;
+        }
         if let Some((victim, kind)) = self.slots[j] {
+            log::debug!("evict slot {j} (clip {victim})");
             match kind {
                 SlotKind::Static => self.clips[victim].thumb = Thumb::None,
                 SlotKind::Anim => self.clips[victim].anim = Thumb::None,
+                SlotKind::Live => {}
             }
         }
-        j
+        self.slots[j] = None;
+        Some(j)
+    }
+
+    /// Live in-tile playback of the selected clip: starts once the
+    /// selection settles, stops the moment it moves, and pumps the newest
+    /// decoded frame into a dedicated (never-evicted) atlas slot.
+    fn update_live(&mut self, lay: &Layout, uploads: &mut Vec<ThumbUpload>) {
+        let stop = !self.tuning.live_preview
+            || self.demo
+            || self.live.as_ref().is_some_and(|l| l.clip != self.selected);
+        if stop {
+            if let Some(live) = self.live.take() {
+                self.slots[live.slot] = None;
+            }
+            if !self.tuning.live_preview || self.demo {
+                return;
+            }
+        }
+
+        if self.live.is_none()
+            && self.sel_changed_at.elapsed().as_millis() as f32 >= self.tuning.live_delay_ms
+        {
+            let i = self.selected;
+            let Some(clip) = self.clips.get(i) else { return };
+            // Decode at the static thumb's exact fit dimensions, so the
+            // emphasized tile's aspect math applies unchanged.
+            let (readable, cloud, tw, th, path) = match clip.thumb {
+                Thumb::Ready { tw, th, .. } => {
+                    (clip.readable, clip.cloud, tw, th, clip.path.clone())
+                }
+                _ => return,
+            };
+            if !readable || cloud {
+                return;
+            }
+            let Some(slot) = self.alloc_slot(lay, SlotKind::Live) else { return };
+            let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th) else {
+                log::debug!("live preview failed to start: {}", path.display());
+                return;
+            };
+            log::debug!("live preview: {}", path.display());
+            self.slots[slot] = Some((i, SlotKind::Live));
+            self.live = Some(LiveState { clip: i, player, slot, first_frame: None });
+        }
+
+        if let Some(live) = &mut self.live {
+            if let Some(rgba) = live.player.take_frame() {
+                if live.first_frame.is_none() {
+                    live.first_frame = Some(Instant::now());
+                }
+                uploads.push(ThumbUpload {
+                    slot: live.slot,
+                    w: live.player.w,
+                    h: live.player.h,
+                    rgba,
+                });
+            }
+        }
     }
 
     fn update_title(&mut self) {
@@ -548,7 +687,7 @@ impl Switchblade {
                 let hovered = Some(i) == self.hovered;
                 let emphasized = selected || hovered;
 
-                let (thumb, tex_mix) = match clip.thumb {
+                let (mut thumb, tex_mix) = match clip.thumb {
                     Thumb::Ready { slot, at, tw, th } => {
                         let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
                             .min(1.0);
@@ -556,6 +695,16 @@ impl Switchblade {
                     }
                     _ => (None, 0.0),
                 };
+                // The selected tile plays live video once frames arrive; it
+                // decodes at the static thumb's dimensions, so it's a
+                // drop-in slot swap.
+                if selected {
+                    if let Some(live) = &self.live {
+                        if live.clip == i && live.first_frame.is_some() {
+                            thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
+                        }
+                    }
+                }
 
                 let s = clip.scale * (0.92 + 0.08 * ease);
                 let mut w = lay.tile_w * s;
@@ -754,7 +903,10 @@ impl App for Switchblade {
             InputEvent::MouseDown { x, y } => {
                 let lay = self.layout();
                 if let Some(i) = self.tile_at(&lay, x, y) {
-                    self.selected = i;
+                    if i != self.selected {
+                        self.selected = i;
+                        self.sel_changed_at = Instant::now();
+                    }
                 }
             }
         }
@@ -770,7 +922,8 @@ impl App for Switchblade {
         self.step(dt);
         let lay = self.layout();
         self.request_visible_thumbs(&lay);
-        let uploads = self.drain_media(&lay);
+        let mut uploads = self.drain_media(&lay);
+        self.update_live(&lay, &mut uploads);
         self.update_title();
         let mut frame = self.build_frame();
         frame.uploads = uploads;
