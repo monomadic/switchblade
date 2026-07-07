@@ -55,14 +55,43 @@ pub struct Viewport {
     pub height: f32,
 }
 
-/// Thumbnail atlas geometry. The renderer owns one fixed-slot RGBA atlas;
-/// the app allocates and evicts slot indices (GPU residency, PLAN.md M6
-/// note — simplified LRU arrives with animated thumbs).
-pub const ATLAS_SLOT_W: u32 = 640;
-pub const ATLAS_SLOT_H: u32 = 360;
-pub const ATLAS_COLS: u32 = 12;
-pub const ATLAS_ROWS: u32 = 12;
-pub const ATLAS_SLOTS: usize = (ATLAS_COLS * ATLAS_ROWS) as usize;
+/// Thumbnail atlas geometry, chosen by the app at startup (from tuning).
+/// The renderer owns one fixed-slot RGBA atlas; the app allocates and
+/// evicts slot indices.
+#[derive(Debug, Clone, Copy)]
+pub struct AtlasCfg {
+    pub slot_w: u32,
+    pub slot_h: u32,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+impl AtlasCfg {
+    pub fn slots(&self) -> usize {
+        (self.cols * self.rows) as usize
+    }
+    pub fn tex_w(&self) -> u32 {
+        self.cols * self.slot_w
+    }
+    pub fn tex_h(&self) -> u32 {
+        self.rows * self.slot_h
+    }
+
+    /// Normalized atlas UV rect `[x, y, w, h]` for a `tw × th` region
+    /// within `slot`, offset by `(ox, oy)` pixels and inset half a texel
+    /// against bleeding. This is how tiles say which part of which thumb
+    /// they show.
+    pub fn uv(&self, slot: usize, ox: f32, oy: f32, tw: f32, th: f32) -> [f32; 4] {
+        let (col, row) = (
+            (slot % self.cols as usize) as f32,
+            (slot / self.cols as usize) as f32,
+        );
+        let (aw, ah) = (self.tex_w() as f32, self.tex_h() as f32);
+        let x = col * self.slot_w as f32 + ox + 0.5;
+        let y = row * self.slot_h as f32 + oy + 0.5;
+        [x / aw, y / ah, (tw - 1.0).max(0.0) / aw, (th - 1.0).max(0.0) / ah]
+    }
+}
 
 /// Pixels to copy into one atlas slot this frame. Thumbs keep their source
 /// aspect ratio, so `w × h` may be smaller than the slot; they land at the
@@ -73,20 +102,6 @@ pub struct ThumbUpload {
     pub h: u32,
     /// Exactly `w × h × 4` RGBA bytes.
     pub rgba: Vec<u8>,
-}
-
-/// Normalized atlas UV rect `[x, y, w, h]` for a `tw × th` region within
-/// `slot`, offset by `(ox, oy)` pixels and inset half a texel against
-/// bleeding. This is how tiles say which part of which thumb they show.
-pub fn atlas_uv(slot: usize, ox: f32, oy: f32, tw: f32, th: f32) -> [f32; 4] {
-    let (col, row) = ((slot % ATLAS_COLS as usize) as f32, (slot / ATLAS_COLS as usize) as f32);
-    let (aw, ah) = (
-        (ATLAS_COLS * ATLAS_SLOT_W) as f32,
-        (ATLAS_ROWS * ATLAS_SLOT_H) as f32,
-    );
-    let x = col * ATLAS_SLOT_W as f32 + ox + 0.5;
-    let y = row * ATLAS_SLOT_H as f32 + oy + 0.5;
-    [x / aw, y / ah, (tw - 1.0).max(0.0) / aw, (th - 1.0).max(0.0) / ah]
 }
 
 /// One tile to draw. Position/size in logical pixels, origin top-left.
@@ -115,6 +130,8 @@ pub struct Frame {
 }
 
 pub trait App {
+    /// Atlas geometry, read once at window/GPU init.
+    fn atlas(&self) -> AtlasCfg;
     fn event(&mut self, event: InputEvent);
     /// Advance the simulation by `dt` seconds and describe the frame.
     fn frame(&mut self, dt: f32, viewport: Viewport) -> Frame;
@@ -182,7 +199,8 @@ impl<A: App> ApplicationHandler for Runner<A> {
             .with_title("switchblade")
             .with_inner_size(LogicalSize::new(1280.0, 800.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gpu = pollster::block_on(render::Gpu::new(window.clone())).expect("init gpu");
+        let gpu = pollster::block_on(render::Gpu::new(window.clone(), self.app.atlas()))
+            .expect("init gpu");
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.last_frame = Instant::now();

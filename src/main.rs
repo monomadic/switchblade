@@ -21,13 +21,16 @@ CONFIG:
     while the app runs.
 
 OPTIONS:
+    --no-anim       start with background tile animation off (toggle: 'a')
     -h, --help      print this help
     -V, --version   print version
 ";
 
 fn main() -> anyhow::Result<()> {
+    let mut opts = sb_app::Options::default();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
+            "--no-anim" => opts.anim = false,
             "--help" | "-h" => {
                 print!("{HELP}");
                 return Ok(());
@@ -44,5 +47,5 @@ fn main() -> anyhow::Result<()> {
         }
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    sb_window::run(sb_app::Switchblade::new())
+    sb_window::run(sb_app::Switchblade::with_options(opts))
 }

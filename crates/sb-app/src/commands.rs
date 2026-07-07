@@ -36,6 +36,7 @@ pub enum Action {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ToggleAnim,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +59,7 @@ impl Default for KeyMap {
             ("=", "zoom_in"),
             ("+", "zoom_in"),
             ("0", "zoom_reset"),
+            ("a", "toggle_anim"),
         ] {
             keys.insert(k.to_string(), v.to_string());
         }
@@ -137,6 +139,7 @@ fn internal_action(name: &str) -> Option<Action> {
         "zoom_in" => Action::ZoomIn,
         "zoom_out" => Action::ZoomOut,
         "zoom_reset" => Action::ZoomReset,
+        "toggle_anim" => Action::ToggleAnim,
         other => {
             log::warn!("unknown command '{other}': no [commands.{other}] entry and not a built-in action");
             return None;

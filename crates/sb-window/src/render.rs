@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::{Frame, Viewport, ATLAS_COLS, ATLAS_ROWS, ATLAS_SLOTS, ATLAS_SLOT_H, ATLAS_SLOT_W};
+use crate::{AtlasCfg, Frame, Viewport};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -34,12 +34,13 @@ pub struct Gpu {
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     atlas: wgpu::Texture,
+    atlas_cfg: AtlasCfg,
     instances: wgpu::Buffer,
     instance_capacity: usize,
 }
 
 impl Gpu {
-    pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
+    pub async fn new(window: Arc<Window>, atlas_cfg: AtlasCfg) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window)?;
@@ -89,8 +90,8 @@ impl Gpu {
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("thumb atlas"),
             size: wgpu::Extent3d {
-                width: ATLAS_COLS * ATLAS_SLOT_W,
-                height: ATLAS_ROWS * ATLAS_SLOT_H,
+                width: atlas_cfg.tex_w(),
+                height: atlas_cfg.tex_h(),
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -219,6 +220,7 @@ impl Gpu {
             uniforms,
             bind_group,
             atlas,
+            atlas_cfg,
             instances,
             instance_capacity,
         })
@@ -234,11 +236,12 @@ impl Gpu {
     }
 
     fn upload_thumb(&self, up: &crate::ThumbUpload) {
-        let ok = up.slot < ATLAS_SLOTS
+        let cfg = &self.atlas_cfg;
+        let ok = up.slot < cfg.slots()
             && up.w >= 1
-            && up.w <= ATLAS_SLOT_W
+            && up.w <= cfg.slot_w
             && up.h >= 1
-            && up.h <= ATLAS_SLOT_H
+            && up.h <= cfg.slot_h
             && up.rgba.len() == (up.w * up.h * 4) as usize;
         if !ok {
             log::warn!(
@@ -250,14 +253,14 @@ impl Gpu {
             );
             return;
         }
-        let (col, row) = (up.slot as u32 % ATLAS_COLS, up.slot as u32 / ATLAS_COLS);
+        let (col, row) = (up.slot as u32 % cfg.cols, up.slot as u32 / cfg.cols);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.atlas,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
-                    x: col * ATLAS_SLOT_W,
-                    y: row * ATLAS_SLOT_H,
+                    x: col * cfg.slot_w,
+                    y: row * cfg.slot_h,
                     z: 0,
                 },
                 aspect: wgpu::TextureAspect::All,

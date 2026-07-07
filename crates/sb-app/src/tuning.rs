@@ -50,6 +50,16 @@ pub struct Tuning {
     pub live_preview: bool,
     /// How long the selection must settle before live playback starts.
     pub live_delay_ms: f32,
+    /// Media quality — read once at startup (restart to apply). Thumb size
+    /// doubles as the atlas slot size, so higher resolution = fewer slots:
+    /// slots = floor(atlas_w/thumb_w) × floor(atlas_h/thumb_h).
+    pub thumb_width: u32,
+    pub thumb_height: u32,
+    /// ffmpeg -q:v for thumbs/sheets: 2 ≈ visually lossless, 31 = worst.
+    pub thumb_quality: u8,
+    /// Atlas texture dimensions (VRAM ≈ w×h×4 bytes). Clamped to 8192.
+    pub atlas_width: u32,
+    pub atlas_height: u32,
     /// Animated thumbnails in the grid (M6 sprite sheets).
     pub anim: bool,
     /// Seconds for one full pass through an anim sheet's frames.
@@ -92,7 +102,12 @@ impl Default for Tuning {
             zoom_smoothing: 0.35,
             zoom_fade_ms: 180.0,
             live_preview: true,
-            live_delay_ms: 250.0,
+            live_delay_ms: 100.0,
+            thumb_width: 640,
+            thumb_height: 360,
+            thumb_quality: 2,
+            atlas_width: 7680,
+            atlas_height: 4320,
             anim: true,
             anim_cycle_s: 2.8,
             anim_min_tile_w: 140.0,

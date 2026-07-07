@@ -14,26 +14,36 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
-/// Thumbnails fit within this box with their aspect ratio preserved; the
-/// grid crops to tile shape at sampling time, so the selected tile can show
-/// the whole frame. 640×360 keeps tiles crisp on 2x displays.
-pub const THUMB_W: u32 = 640;
-pub const THUMB_H: u32 = 360;
-
-/// Cache artifact name. Bumped when the recipe changes (thumb.jpg =
-/// crop-filled 480; thumb_fit.jpg = default-quality 480): stale artifacts
-/// are simply ignored and regenerated.
-const THUMB_FILE: &str = "thumb_fit_640.jpg";
-
 /// Animated thumbnails, first recipe (PLAN.md §6 level 2): ANIM_FRAMES
 /// stills sampled evenly across the clip, packed as an ANIM_COLS×ANIM_ROWS
 /// sprite sheet that fits one atlas slot. Frames are crop-filled 16:9.
 pub const ANIM_COLS: u32 = 3;
 pub const ANIM_ROWS: u32 = 3;
 pub const ANIM_FRAMES: u32 = ANIM_COLS * ANIM_ROWS;
-const ANIM_FRAME_W: u32 = THUMB_W / ANIM_COLS; // 213
-const ANIM_FRAME_H: u32 = THUMB_H / ANIM_ROWS; // 120
-const ANIM_FILE: &str = "anim_3x3.jpg";
+
+/// Generation parameters, chosen by the app from tuning at startup.
+/// Cache artifact names encode size + quality, so changing the recipe
+/// regenerates rather than serving stale files.
+#[derive(Debug, Clone, Copy)]
+pub struct Recipe {
+    /// Thumbs fit within this box, aspect preserved (= atlas slot size).
+    pub thumb_w: u32,
+    pub thumb_h: u32,
+    /// ffmpeg -q:v — 2 ≈ visually lossless, 31 = worst.
+    pub quality: u8,
+}
+
+impl Recipe {
+    fn thumb_file(&self) -> String {
+        format!("thumb_fit_{}x{}_q{}.jpg", self.thumb_w, self.thumb_h, self.quality)
+    }
+    fn anim_file(&self) -> String {
+        format!("anim_3x3_{}x{}_q{}.jpg", self.thumb_w, self.thumb_h, self.quality)
+    }
+    fn anim_frame(&self) -> (u32, u32) {
+        ((self.thumb_w / ANIM_COLS).max(2), (self.thumb_h / ANIM_ROWS).max(2))
+    }
+}
 
 const WORKERS: usize = 3;
 /// Extract the frame this far into the clip (PLAN.md §6 initial policy).
@@ -45,7 +55,7 @@ enum Request {
 }
 
 pub enum ThumbResult {
-    /// `rgba` is `w × h × 4` bytes, with `w ≤ THUMB_W`, `h ≤ THUMB_H` and
+    /// `rgba` is `w × h × 4` bytes, fitting the recipe's thumb box with
     /// the clip's original aspect ratio.
     Ready { path: PathBuf, w: u32, h: u32, rgba: Vec<u8> },
     Failed { path: PathBuf },
@@ -62,14 +72,8 @@ pub struct MediaService {
     rx: Receiver<ThumbResult>,
 }
 
-impl Default for MediaService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MediaService {
-    pub fn new() -> Self {
+    pub fn new(recipe: Recipe) -> Self {
         let (tx_req, rx_req) = mpsc::channel::<Request>();
         let (tx_done, rx_done) = mpsc::channel::<ThumbResult>();
         let rx_req = Arc::new(Mutex::new(rx_req));
@@ -87,7 +91,7 @@ impl MediaService {
             let rx = rx_req.clone();
             let tx = tx_done.clone();
             let root = root.clone();
-            thread::spawn(move || worker(rx, tx, root, have_ffmpeg));
+            thread::spawn(move || worker(rx, tx, root, have_ffmpeg, recipe));
         }
         Self { tx: tx_req, rx: rx_done }
     }
@@ -175,6 +179,7 @@ fn worker(
     tx: Sender<ThumbResult>,
     root: PathBuf,
     have_ffmpeg: bool,
+    recipe: Recipe,
 ) {
     loop {
         // The lock is only held while waiting for the next request; the
@@ -184,11 +189,11 @@ fn worker(
             Err(_) => return,
         };
         let result = match req {
-            Request::Thumb(path) => match make_thumb(&path, &root, have_ffmpeg) {
+            Request::Thumb(path) => match make_thumb(&path, &root, have_ffmpeg, &recipe) {
                 Some((w, h, rgba)) => ThumbResult::Ready { path, w, h, rgba },
                 None => ThumbResult::Failed { path },
             },
-            Request::Anim(path) => match make_anim(&path, &root, have_ffmpeg) {
+            Request::Anim(path) => match make_anim(&path, &root, have_ffmpeg, &recipe) {
                 Some((w, h, rgba)) => ThumbResult::AnimReady { path, w, h, rgba },
                 None => ThumbResult::AnimFailed { path },
             },
@@ -200,14 +205,19 @@ fn worker(
 }
 
 /// Serve from the sidecar cache, generating on miss. See PLAN.md §7/§8.
-fn make_thumb(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, Vec<u8>)> {
+fn make_thumb(
+    src: &Path,
+    root: &Path,
+    have_ffmpeg: bool,
+    recipe: &Recipe,
+) -> Option<(u32, u32, Vec<u8>)> {
     let meta = std::fs::metadata(src).ok()?;
     if !meta.is_file() {
         return None;
     }
     let fp = fingerprint(src, meta.len(), mtime_secs(&meta));
     let dir = root.join(&fp[..2]).join(&fp);
-    let jpg = dir.join(THUMB_FILE);
+    let jpg = dir.join(recipe.thumb_file());
 
     if !jpg.exists() {
         if !have_ffmpeg {
@@ -224,22 +234,27 @@ fn make_thumb(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, V
             .and_then(|m| m.duration)
             .map(|d| (d * SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        extract_frame(src, &jpg, seek)?;
+        extract_frame(src, &jpg, seek, recipe)?;
         log::debug!("thumb generated: {}", src.display());
     }
-    decode_jpeg(&jpg)
+    decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
 }
 
 /// Generate/serve the animated sprite sheet: ANIM_FRAMES frames sampled
 /// evenly across the clip, crop-filled to 16:9, tiled into one JPEG.
-fn make_anim(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, Vec<u8>)> {
+fn make_anim(
+    src: &Path,
+    root: &Path,
+    have_ffmpeg: bool,
+    recipe: &Recipe,
+) -> Option<(u32, u32, Vec<u8>)> {
     let meta = std::fs::metadata(src).ok()?;
     if !meta.is_file() {
         return None;
     }
     let fp = fingerprint(src, meta.len(), mtime_secs(&meta));
     let dir = root.join(&fp[..2]).join(&fp);
-    let jpg = dir.join(ANIM_FILE);
+    let jpg = dir.join(recipe.anim_file());
 
     if !jpg.exists() {
         if !have_ffmpeg {
@@ -252,15 +267,17 @@ fn make_anim(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, Ve
         // Slightly overshoot the rate so the tile filter always fills all
         // ANIM_FRAMES cells before EOF (a padded black cell looks broken).
         let fps = (ANIM_FRAMES as f64 + 0.5) / duration;
+        let (fw, fh) = recipe.anim_frame();
+        let q = recipe.quality.clamp(2, 31).to_string();
         let vf = format!(
-            "fps={fps:.6},scale={ANIM_FRAME_W}:{ANIM_FRAME_H}:force_original_aspect_ratio=increase,\
-             crop={ANIM_FRAME_W}:{ANIM_FRAME_H},tile={ANIM_COLS}x{ANIM_ROWS}"
+            "fps={fps:.6},scale={fw}:{fh}:force_original_aspect_ratio=increase,\
+             crop={fw}:{fh},tile={ANIM_COLS}x{ANIM_ROWS}"
         );
         let out = Command::new("ffmpeg")
             .args(["-y", "-v", "error"])
             .arg("-i")
             .arg(src)
-            .args(["-frames:v", "1", "-vf", &vf, "-q:v", "3", "-strict", "unofficial", "-f", "mjpeg"])
+            .args(["-frames:v", "1", "-vf", &vf, "-q:v", &q, "-strict", "unofficial", "-f", "mjpeg"])
             .arg(&tmp)
             .stdin(Stdio::null())
             .output()
@@ -278,7 +295,7 @@ fn make_anim(src: &Path, root: &Path, have_ffmpeg: bool) -> Option<(u32, u32, Ve
         std::fs::rename(&tmp, &jpg).ok()?;
         log::debug!("anim sheet generated: {}", src.display());
     }
-    decode_jpeg(&jpg)
+    decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
 }
 
 /// Cached probe results — a snapshot for humans and future features.
@@ -326,12 +343,13 @@ fn probe(src: &Path) -> Option<Meta> {
     })
 }
 
-fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
+fn extract_frame(src: &Path, dst: &Path, seek: f64, recipe: &Recipe) -> Option<()> {
     // Write to a temp name and rename, so a half-written jpg never
     // looks like a cache hit to another worker or a later run.
     let tmp = dst.with_extension("jpg.tmp");
-    let vf =
-        format!("scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease");
+    let (tw, th) = (recipe.thumb_w, recipe.thumb_h);
+    let q = recipe.quality.clamp(2, 31).to_string();
+    let vf = format!("scale={tw}:{th}:force_original_aspect_ratio=decrease");
     // stderr is captured, not inherited: decode noise from damaged files
     // must never spam the console (it becomes one debug line below).
     // `-strict unofficial` lets mjpeg accept full-range YUV sources
@@ -341,8 +359,8 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
         .arg("-i")
         .arg(src)
         .args([
-            // -q:v 2 ≈ visually lossless; the mjpeg default is very blocky.
-            "-frames:v", "1", "-vf", &vf, "-q:v", "2", "-strict", "unofficial", "-f", "mjpeg",
+            // the mjpeg default quality is very blocky; 2 ≈ visually lossless
+            "-frames:v", "1", "-vf", &vf, "-q:v", &q, "-strict", "unofficial", "-f", "mjpeg",
         ])
         .arg(&tmp)
         .stdin(Stdio::null())
@@ -352,7 +370,7 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
     if !out.status.success() || !tmp.exists() {
         let _ = std::fs::remove_file(&tmp);
         if seek > 0.0 {
-            return extract_frame(src, dst, 0.0);
+            return extract_frame(src, dst, 0.0, recipe);
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         log::debug!(
@@ -365,17 +383,17 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64) -> Option<()> {
     std::fs::rename(&tmp, dst).ok()
 }
 
-fn decode_jpeg(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
+fn decode_jpeg(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)> {
     let img = image::open(path).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
-    if w <= THUMB_W && h <= THUMB_H {
+    if w <= max_w && h <= max_h {
         return Some((w, h, img.into_raw()));
     }
     // Oversized (foreign/stale artifact): scale down, keep aspect.
-    let s = (THUMB_W as f32 / w as f32).min(THUMB_H as f32 / h as f32);
+    let s = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
     let (nw, nh) = (((w as f32 * s) as u32).max(1), ((h as f32 * s) as u32).max(1));
     let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
     Some((nw, nh, resized.into_raw()))

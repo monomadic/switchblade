@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use sb_media::{MediaService, ThumbResult, ANIM_COLS, ANIM_ROWS};
+use sb_media::{MediaService, Recipe, ThumbResult, ANIM_COLS, ANIM_ROWS};
 use sb_window::{
-    App, Frame, InputEvent, Key, ThumbUpload, Tile, Viewport, WindowCommand, ATLAS_SLOTS,
+    App, AtlasCfg, Frame, InputEvent, Key, ThumbUpload, Tile, Viewport, WindowCommand,
 };
 
 use commands::{Action, KeyMap};
@@ -78,6 +78,18 @@ struct Clip {
     anim: Thumb,
 }
 
+/// Startup options from the CLI (config handles everything else).
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    pub anim: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { anim: true }
+    }
+}
+
 pub struct Switchblade {
     clips: Vec<Clip>,
     /// Path → clip index, for routing async thumbnail results.
@@ -92,6 +104,13 @@ pub struct Switchblade {
     /// settles for live_delay_ms.
     sel_changed_at: Instant,
     demo: bool,
+    /// Runtime animation toggle (`a` key / --no-anim), ANDed with tuning.anim.
+    anim_on: bool,
+    atlas_cfg: AtlasCfg,
+    /// Background job counters for the progress indicator.
+    jobs_total: u64,
+    jobs_done: u64,
+    jobs_finished_at: Option<Instant>,
     tuning: Tuning,
     keymap: KeyMap,
     tuning_file: TuningFile,
@@ -125,20 +144,52 @@ impl Default for Switchblade {
 
 impl Switchblade {
     pub fn new() -> Self {
+        Self::with_options(Options::default())
+    }
+
+    pub fn with_options(opts: Options) -> Self {
         let rx = ingest::spawn_stdin_reader();
         let demo = rx.is_none();
+
+        // Load config up front: atlas geometry and the media recipe are
+        // startup-only (the rest keeps hot-reloading per frame).
+        let mut tuning_file = TuningFile::new(PathBuf::from("switchblade.toml"));
+        let (tuning, keymap) = match tuning_file.poll() {
+            Some(cfg) => (cfg.tuning, cfg.keymap),
+            None => (Tuning::default(), KeyMap::default()),
+        };
+        let (slot_w, slot_h) = (tuning.thumb_width.clamp(64, 2048), tuning.thumb_height.clamp(36, 2048));
+        let atlas_cfg = AtlasCfg {
+            slot_w,
+            slot_h,
+            cols: (tuning.atlas_width.min(8192) / slot_w).max(1),
+            rows: (tuning.atlas_height.min(8192) / slot_h).max(1),
+        };
+        log::info!(
+            "atlas: {}x{} slots of {slot_w}x{slot_h} ({} MB)",
+            atlas_cfg.cols,
+            atlas_cfg.rows,
+            atlas_cfg.tex_w() as u64 * atlas_cfg.tex_h() as u64 * 4 / (1024 * 1024)
+        );
+        let recipe = Recipe { thumb_w: slot_w, thumb_h: slot_h, quality: tuning.thumb_quality };
+
         let mut app = Self {
             clips: Vec::new(),
             index: HashMap::new(),
             rx,
-            media: MediaService::new(),
-            slots: vec![None; ATLAS_SLOTS],
+            media: MediaService::new(recipe),
+            slots: vec![None; atlas_cfg.slots()],
             live: None,
             sel_changed_at: Instant::now(),
             demo,
-            tuning: Tuning::default(),
-            keymap: KeyMap::default(),
-            tuning_file: TuningFile::new(PathBuf::from("switchblade.toml")),
+            anim_on: opts.anim,
+            atlas_cfg,
+            jobs_total: 0,
+            jobs_done: 0,
+            jobs_finished_at: None,
+            tuning,
+            keymap,
+            tuning_file,
             selected: 0,
             hovered: None,
             cursor: (0.0, 0.0),
@@ -291,6 +342,13 @@ impl Switchblade {
             Action::ZoomIn => self.set_zoom(self.zoom_target * 1.15),
             Action::ZoomOut => self.set_zoom(self.zoom_target / 1.15),
             Action::ZoomReset => self.set_zoom(1.0),
+            Action::ToggleAnim => {
+                self.anim_on = !self.anim_on;
+                log::info!(
+                    "background animation {}",
+                    if self.anim_on { "on" } else { "off" }
+                );
+            }
             Action::CopyPath => {
                 if let Some(clip) = self.clips.get(self.selected) {
                     commands::copy_path(&clip.path);
@@ -438,7 +496,7 @@ impl Switchblade {
             return;
         }
         let rows = self.zone_rows(lay);
-        let mut budget = ATLAS_SLOTS as i64 - 8; // headroom incl. live slot
+        let mut budget = self.atlas_cfg.slots() as i64 - 8; // headroom incl. live slot
 
         'statics: for &row in &rows {
             for col in 0..lay.cols {
@@ -454,11 +512,12 @@ impl Switchblade {
                 if matches!(clip.thumb, Thumb::None) {
                     self.media.request(clip.path.clone());
                     clip.thumb = Thumb::Pending;
+                    self.jobs_total += 1;
                 }
             }
         }
 
-        if !self.tuning.anim || lay.tile_w < self.tuning.anim_min_tile_w {
+        if !(self.tuning.anim && self.anim_on) || lay.tile_w < self.tuning.anim_min_tile_w {
             return;
         }
         'anims: for &row in &rows {
@@ -477,6 +536,7 @@ impl Switchblade {
                         budget -= 1;
                         self.media.request_anim(clip.path.clone());
                         clip.anim = Thumb::Pending;
+                        self.jobs_total += 1;
                     }
                     _ => {}
                 }
@@ -488,6 +548,7 @@ impl Switchblade {
     fn drain_media(&mut self, lay: &Layout) -> Vec<ThumbUpload> {
         let mut uploads = Vec::new();
         while let Some(result) = self.media.try_recv() {
+            self.jobs_done += 1;
             match result {
                 ThumbResult::Ready { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else { continue };
@@ -698,10 +759,12 @@ impl Switchblade {
                 // The selected tile plays live video once frames arrive; it
                 // decodes at the static thumb's dimensions, so it's a
                 // drop-in slot swap.
+                let mut live_showing = false;
                 if selected {
                     if let Some(live) = &self.live {
                         if live.clip == i && live.first_frame.is_some() {
                             thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
+                            live_showing = true;
                         }
                     }
                 }
@@ -733,9 +796,13 @@ impl Switchblade {
                 let cy = oy + lay.tile_h * 0.5;
 
                 // Texture source: in the grid, a cycling anim-sheet frame
-                // once available (M6); the static thumb otherwise, and
-                // always for the emphasized tile (it's higher-res).
-                let anim = if !emphasized && t.anim {
+                // once available (M6); the static thumb otherwise. The
+                // selected tile keeps its sheet animating as a bridge until
+                // live video's first frame lands — motion never stops.
+                let anim_allowed = t.anim
+                    && self.anim_on
+                    && (!emphasized || (selected && !live_showing));
+                let anim = if anim_allowed {
                     match clip.anim {
                         Thumb::Ready { slot, at, tw, th } => {
                             Some((slot, at, tw as f32, th as f32))
@@ -773,7 +840,8 @@ impl Switchblade {
                     // If the static thumb is already showing, swap without
                     // re-fading (no dip to background).
                     mix = if thumb.is_some() { mix.max(anim_fade) } else { anim_fade };
-                    sb_window::atlas_uv(slot, fx + (fw - cw) * 0.5, fy + (fh - ch) * 0.5, cw, ch)
+                    self.atlas_cfg
+                        .uv(slot, fx + (fw - cw) * 0.5, fy + (fh - ch) * 0.5, cw, ch)
                 } else {
                     // UV window into the static thumb: grid tiles crop-fill
                     // to the tile shape; emphasized tiles crop only what the
@@ -791,7 +859,7 @@ impl Switchblade {
                             } else {
                                 ch = tw / target_a;
                             }
-                            sb_window::atlas_uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
+                            self.atlas_cfg.uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
                         }
                         None => [0.0; 4],
                     }
@@ -850,6 +918,43 @@ impl Switchblade {
         tiles.extend(hovered_group);
         tiles.extend(selected_group);
 
+        // Background-jobs indicator: a hairline progress bar, bottom-right.
+        // Lingers full for a moment when the batch finishes, then fades.
+        let pending = self.jobs_total.saturating_sub(self.jobs_done);
+        if self.jobs_total > 0 {
+            let fade = if pending > 0 {
+                self.jobs_finished_at = None;
+                1.0
+            } else {
+                let at = *self.jobs_finished_at.get_or_insert(now);
+                1.0 - (now.saturating_duration_since(at).as_secs_f32() / 0.7).min(1.0)
+            };
+            if fade <= 0.0 {
+                self.jobs_total = 0;
+                self.jobs_done = 0;
+                self.jobs_finished_at = None;
+            } else {
+                let progress = self.jobs_done as f32 / self.jobs_total as f32;
+                let (bw, bh) = (110.0, 3.0);
+                let bx = self.viewport.width - bw - 14.0;
+                let by = self.viewport.height - bh - 12.0;
+                let bar = |x: f32, w: f32, a: f32| Tile {
+                    x,
+                    y: by,
+                    w,
+                    h: bh,
+                    color: [0.85, 0.85, 0.9, a * fade],
+                    border_color: [0.0; 4],
+                    corner_radius: bh * 0.5,
+                    border_width: 0.0,
+                    uv: [0.0; 4],
+                    tex_mix: 0.0,
+                };
+                tiles.push(bar(bx, bw, 0.10)); // track
+                tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
+            }
+        }
+
         // Photos-style reflow: when the column count changes (zoom/resize),
         // the previous layout fades out on top of the new one.
         if lay.cols != self.last_cols && !self.last_tiles.is_empty() {
@@ -883,6 +988,10 @@ impl Switchblade {
 }
 
 impl App for Switchblade {
+    fn atlas(&self) -> AtlasCfg {
+        self.atlas_cfg
+    }
+
     fn event(&mut self, event: InputEvent) {
         match event {
             InputEvent::Key { key, .. } => self.key(key),
