@@ -34,7 +34,7 @@ zoom_fade_ms = 180.0
 # it stand out even more as you zoom out (0 = off).
 selection_scale = 1.15
 selection_zoom_boost = 0.35
-hover_scale = 1.03
+hover_scale = 1.06
 
 corner_radius = 5.0
 selection_corner_radius = 10.0
@@ -64,10 +64,12 @@ atlas_width = 7680
 atlas_height = 4320
 
 # Animated thumbnails (sprite sheets, 9 frames sampled across each clip).
-# One full cycle takes anim_cycle_s; tiles narrower than anim_min_tile_w
-# stay static (motion is invisible there and atlas slots are precious).
+# One full cycle takes anim_cycle_s; frames crossfade into each other for
+# anim_crossfade of each interval (0 = hard cuts). Tiles narrower than
+# anim_min_tile_w stay static. Toggle live with 'a' or start --no-anim.
 anim = true
 anim_cycle_s = 2.8
+anim_crossfade = 0.35
 anim_min_tile_w = 140.0
 
 # Aspect cap (long:short) for the selected/hovered tile. Clips beyond it
@@ -94,6 +96,7 @@ o = "open"
 space = "quickview"   # internal preview; Esc or Space closes, arrows browse
 # space = "preview"   # alternative: external looping mpv
 c = "copy_path"
+a = "toggle_anim"     # background tile animation on/off
 # r = "rename_script"
 
 [commands.open]

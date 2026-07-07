@@ -19,7 +19,9 @@ struct Inst {
     @location(4) radius: f32,
     @location(5) border_width: f32,
     @location(6) tex_mix: f32,
-    @location(7) uv: vec4<f32>,
+    @location(7) frame_fade: f32,
+    @location(8) uv: vec4<f32>,
+    @location(9) uv2: vec4<f32>,
 };
 
 struct VsOut {
@@ -31,7 +33,9 @@ struct VsOut {
     @location(4) radius: f32,
     @location(5) border_width: f32,
     @location(6) tex_mix: f32,
-    @location(7) uv: vec4<f32>,
+    @location(7) frame_fade: f32,
+    @location(8) uv: vec4<f32>,
+    @location(9) uv2: vec4<f32>,
 };
 
 @vertex
@@ -56,7 +60,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     out.radius = inst.radius;
     out.border_width = inst.border_width;
     out.tex_mix = inst.tex_mix;
+    out.frame_fade = inst.frame_fade;
     out.uv = inst.uv;
+    out.uv2 = inst.uv2;
     return out;
 }
 
@@ -69,7 +75,10 @@ fn sd_round_rect(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let frac = clamp(in.local / in.size, vec2<f32>(0.0), vec2<f32>(1.0));
     // Sampled unconditionally: textureSample requires uniform control flow.
-    let tex = textureSample(atlas, samp, in.uv.xy + frac * in.uv.zw);
+    // Two taps let anim-sheet frames crossfade (frame_fade blends uv→uv2).
+    let tex_a = textureSample(atlas, samp, in.uv.xy + frac * in.uv.zw);
+    let tex_b = textureSample(atlas, samp, in.uv2.xy + frac * in.uv2.zw);
+    let tex = mix(tex_a, tex_b, clamp(in.frame_fade, 0.0, 1.0));
     let use_tex = select(0.0, clamp(in.tex_mix, 0.0, 1.0), in.uv.z > 0.0);
 
     let p = in.local - in.size * 0.5;

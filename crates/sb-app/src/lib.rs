@@ -72,6 +72,10 @@ struct Clip {
     cloud: bool,
     spawned: Instant,
     scale: f32,
+    /// 0..1 emphasis spring: morphs the tile between its grid shape and
+    /// the emphasized (true-aspect, cover-fit) shape. Keyboard selection
+    /// and hover both ride this same animation.
+    emph: f32,
     thumb: Thumb,
     /// Sprite-sheet animation (M6): frames cycle in the grid; the static
     /// thumb stays authoritative for the emphasized tile.
@@ -236,6 +240,7 @@ impl Switchblade {
                     // Staggered spawn cascades the fade-in across the field.
                     spawned: now + Duration::from_millis(i as u64 * 2),
                     scale: 1.0,
+                    emph: 0.0,
                     thumb: Thumb::Failed, // demo paths aren't real; never request
                     anim: Thumb::Failed,
                 });
@@ -424,6 +429,7 @@ impl Switchblade {
                         cloud: item.cloud,
                         spawned: Instant::now(),
                         scale: 1.0,
+                        emph: 0.0,
                         thumb,
                         anim: if item.cloud { Thumb::Failed } else { Thumb::None },
                     });
@@ -494,9 +500,11 @@ impl Switchblade {
             .clamp(1.0, 2.2);
         let sel_scale = t.selection_scale * boost;
 
-        // Tile scale springs (selected > hover > rest).
+        // Tile scale + emphasis springs (selected > hover > rest); both
+        // keyboard moves and hover ride the same tween.
         let a = alpha(t.scale_smoothing, dt);
         for (i, clip) in self.clips.iter_mut().enumerate() {
+            let emphasized = i == self.selected || Some(i) == self.hovered;
             let target = if i == self.selected {
                 sel_scale
             } else if Some(i) == self.hovered {
@@ -505,6 +513,7 @@ impl Switchblade {
                 1.0
             };
             clip.scale += (target - clip.scale) * a;
+            clip.emph += ((emphasized as u8 as f32) - clip.emph) * a;
         }
     }
 
@@ -830,7 +839,11 @@ impl Switchblade {
                 // Selected/hovered tiles play live video once frames
                 // arrive; decode dims match the static thumb, so it's a
                 // drop-in slot swap.
-                let lane = if selected {
+                // During quickview the grid shows thumbnails only; the live
+                // stream belongs to the modal.
+                let lane = if self.quickview {
+                    None
+                } else if selected {
                     self.live_sel.as_ref()
                 } else if hovered {
                     self.live_hover.as_ref()
@@ -846,25 +859,27 @@ impl Switchblade {
                 }
 
                 let s = clip.scale * (0.92 + 0.08 * ease);
-                let mut w = lay.tile_w * s;
-                let mut h = lay.tile_h * s;
+                let (wg, hg) = (lay.tile_w * s, lay.tile_h * s);
+                let mut w = wg;
+                let mut h = hg;
 
-                // Emphasized tiles show the clip at its own aspect ratio,
-                // capped at max_display_aspect with a centered pan-and-scan
-                // crop, and sized to *cover* the scaled cell box so no
-                // background peeks out behind portrait clips.
-                let display_aspect = |tw: f32, th: f32| {
-                    let m = t.max_display_aspect.max(1.0);
-                    (tw / th).clamp(1.0 / m, m)
-                };
-                if emphasized {
+                // Emphasized tiles morph (via the emph spring) toward the
+                // clip's own aspect ratio, capped at max_display_aspect
+                // (pan & scan), sized to *cover* the scaled cell box so no
+                // background peeks out behind portrait clips. The crop
+                // below derives from w/h, so it morphs along.
+                let e = clip.emph.clamp(0.0, 1.0);
+                if e > 0.001 {
                     if let Some((_, tw, th)) = thumb {
-                        let a = display_aspect(tw, th);
-                        if a > w / h {
-                            w = h * a;
+                        let m = t.max_display_aspect.max(1.0);
+                        let a = (tw / th).clamp(1.0 / m, m);
+                        let (we, he) = if a > wg / hg {
+                            (hg * a, hg)
                         } else {
-                            h = w / a;
-                        }
+                            (wg, wg / a)
+                        };
+                        w = wg + (we - wg) * e;
+                        h = hg + (he - hg) * e;
                     }
                 }
                 let (ox, oy) = self.cell_origin(&lay, col, row);
@@ -892,6 +907,8 @@ impl Switchblade {
                 };
 
                 let mut mix = tex_mix;
+                let mut uv2 = [0.0; 4];
+                let mut frame_fade = 0.0;
                 let uv = if let Some((slot, at, sw, sh)) = anim {
                     let cols = self.anim_grid as usize;
                     let frames = (cols * cols) as f32;
@@ -899,9 +916,8 @@ impl Switchblade {
                     // Per-clip phase offset so neighbors don't tick in
                     // lockstep.
                     let phase = (i % (cols * cols)) as f32 / frames;
-                    let pos = (anim_t / t.anim_cycle_s.max(0.2) + phase).fract();
-                    let k = ((pos * frames) as usize).min(cols * cols - 1);
-                    let (fx, fy) = ((k % cols) as f32 * fw, (k / cols) as f32 * fh);
+                    let pos = (anim_t / t.anim_cycle_s.max(0.2) + phase).fract() * frames;
+                    let k = (pos as usize).min(cols * cols - 1);
 
                     let target_a = w / h.max(1.0);
                     let (mut cw, mut ch) = (fw, fh);
@@ -909,6 +925,25 @@ impl Switchblade {
                         cw = fh * target_a;
                     } else {
                         ch = fw / target_a;
+                    }
+                    let (ox, oy) = ((fw - cw) * 0.5, (fh - ch) * 0.5);
+                    let frame_uv = |kk: usize| {
+                        self.atlas_cfg.uv(
+                            slot,
+                            (kk % cols) as f32 * fw + ox,
+                            (kk / cols) as f32 * fh + oy,
+                            cw,
+                            ch,
+                        )
+                    };
+                    // Crossfade the tail of each frame interval into the
+                    // next frame (blended in the shader — two texture taps).
+                    let win = t.anim_crossfade.clamp(0.0, 1.0);
+                    if win > 0.0 {
+                        let ff = pos - k as f32;
+                        let f = ((ff - (1.0 - win)) / win).clamp(0.0, 1.0);
+                        frame_fade = f * f * (3.0 - 2.0 * f);
+                        uv2 = frame_uv((k + 1) % (cols * cols));
                     }
                     let anim_fade = {
                         let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
@@ -918,19 +953,14 @@ impl Switchblade {
                     // If the static thumb is already showing, swap without
                     // re-fading (no dip to background).
                     mix = if thumb.is_some() { mix.max(anim_fade) } else { anim_fade };
-                    self.atlas_cfg
-                        .uv(slot, fx + (fw - cw) * 0.5, fy + (fh - ch) * 0.5, cw, ch)
+                    frame_uv(k)
                 } else {
-                    // UV window into the static thumb: grid tiles crop-fill
-                    // to the tile shape; emphasized tiles crop only what the
-                    // aspect cap chops.
+                    // UV window into the static thumb, cropped to the tile's
+                    // current shape — the shape morphs with the emphasis
+                    // spring, so the crop morphs along with it.
                     match thumb {
                         Some((slot, tw, th)) => {
-                            let target_a = if emphasized {
-                                display_aspect(tw, th)
-                            } else {
-                                w / h.max(1.0)
-                            };
+                            let target_a = w / h.max(1.0);
                             let (mut cw, mut ch) = (tw, th);
                             if tw / th > target_a {
                                 cw = th * target_a;
@@ -962,7 +992,7 @@ impl Switchblade {
                 let (border_color, border_width, radius) = if selected {
                     ([sb[0], sb[1], sb[2], ease], t.border_width, t.selection_corner_radius)
                 } else if hovered {
-                    ([hb[0], hb[1], hb[2], 0.35 * ease], 1.5, t.corner_radius)
+                    ([hb[0], hb[1], hb[2], 0.35 * ease], 1.0, t.corner_radius)
                 } else if thumb.is_none() && clip.readable && !clip.cloud {
                     ([eb[0], eb[1], eb[2], ease], 1.0, t.corner_radius)
                 } else {
@@ -979,6 +1009,8 @@ impl Switchblade {
                     corner_radius: radius * s,
                     border_width,
                     uv,
+                    uv2,
+                    frame_fade,
                     tex_mix: mix,
                 };
                 let out = if selected {
@@ -1031,6 +1063,8 @@ impl Switchblade {
                     corner_radius: bh * 0.5,
                     border_width: 0.0,
                     uv: [0.0; 4],
+                    uv2: [0.0; 4],
+                    frame_fade: 0.0,
                     tex_mix: 0.0,
                 };
                 tiles.push(bar(bx, bw, 0.10)); // track
@@ -1083,6 +1117,8 @@ impl Switchblade {
                     corner_radius: 0.0,
                     border_width: 0.0,
                     uv: [0.0; 4],
+                    uv2: [0.0; 4],
+                    frame_fade: 0.0,
                     tex_mix: 0.0,
                 };
                 tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 0.82 * fade]));
@@ -1114,6 +1150,8 @@ impl Switchblade {
                         corner_radius: t.selection_corner_radius,
                         border_width: 0.0,
                         uv: self.atlas_cfg.uv(slot, 0.0, 0.0, tw, th),
+                        uv2: [0.0; 4],
+                        frame_fade: 0.0,
                         tex_mix: fade,
                     });
                 } else {
@@ -1201,6 +1239,8 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
         corner_radius: h * 0.5,
         border_width: 0.0,
         uv: [0.0; 4],
+        uv2: [0.0; 4],
+        frame_fade: 0.0,
         tex_mix: 0.0,
     };
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
@@ -1238,6 +1278,8 @@ fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: b
             corner_radius: d * 0.5,
             border_width: 0.0,
             uv: [0.0; 4],
+            uv2: [0.0; 4],
+            frame_fade: 0.0,
             tex_mix: 0.0,
         });
     }

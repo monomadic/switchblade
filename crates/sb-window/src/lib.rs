@@ -116,8 +116,13 @@ pub struct Tile {
     pub border_color: [f32; 4],
     pub corner_radius: f32,
     pub border_width: f32,
-    /// Normalized atlas UV rect (see [`atlas_uv`]); zero size = no texture.
+    /// Normalized atlas UV rect (see [`AtlasCfg::uv`]); zero size = none.
     pub uv: [f32; 4],
+    /// Second UV rect blended over the first by `frame_fade` — used to
+    /// crossfade between anim-sheet frames.
+    pub uv2: [f32; 4],
+    /// 0..1 blend from `uv` to `uv2`.
+    pub frame_fade: f32,
     /// 0..1 crossfade from placeholder color to texture.
     pub tex_mix: f32,
 }

@@ -67,6 +67,9 @@ pub struct Tuning {
     pub anim: bool,
     /// Seconds for one full pass through an anim sheet's frames.
     pub anim_cycle_s: f32,
+    /// Portion (0..1) of each frame interval spent crossfading into the
+    /// next frame; 0 = hard cuts.
+    pub anim_crossfade: f32,
     /// Don't animate (or generate sheets) below this tile width — motion
     /// is invisible on tiny tiles and slots are better spent on statics.
     pub anim_min_tile_w: f32,
@@ -93,7 +96,7 @@ impl Default for Tuning {
             rubber_band: 0.25,
             selection_scale: 1.15,
             selection_zoom_boost: 0.35,
-            hover_scale: 1.03,
+            hover_scale: 1.06,
             scale_smoothing: 0.35,
             corner_radius: 5.0,
             selection_corner_radius: 10.0,
@@ -114,6 +117,7 @@ impl Default for Tuning {
             atlas_height: 4320,
             anim: true,
             anim_cycle_s: 2.8,
+            anim_crossfade: 0.35,
             anim_min_tile_w: 140.0,
             max_display_aspect: 1.5,
             selection_border: [0.0, 0.0, 0.0],
