@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use sb_media::{MediaService, Recipe, ThumbResult, ANIM_COLS, ANIM_ROWS};
+use sb_media::{MediaService, Recipe, ThumbResult};
 use sb_window::{
     App, AtlasCfg, Frame, InputEvent, Key, ThumbUpload, Tile, Viewport, WindowCommand,
 };
@@ -106,7 +106,11 @@ pub struct Switchblade {
     demo: bool,
     /// Runtime animation toggle (`a` key / --no-anim), ANDed with tuning.anim.
     anim_on: bool,
+    anim_grid: u32,
     atlas_cfg: AtlasCfg,
+    /// Internal fullscreen-ish preview of the selected clip.
+    quickview: bool,
+    quickview_at: Instant,
     /// Background job counters for the progress indicator.
     jobs_total: u64,
     jobs_done: u64,
@@ -171,7 +175,13 @@ impl Switchblade {
             atlas_cfg.rows,
             atlas_cfg.tex_w() as u64 * atlas_cfg.tex_h() as u64 * 4 / (1024 * 1024)
         );
-        let recipe = Recipe { thumb_w: slot_w, thumb_h: slot_h, quality: tuning.thumb_quality };
+        let anim_grid = tuning.anim_grid.clamp(1, 4);
+        let recipe = Recipe {
+            thumb_w: slot_w,
+            thumb_h: slot_h,
+            quality: tuning.thumb_quality,
+            anim_grid,
+        };
 
         let mut app = Self {
             clips: Vec::new(),
@@ -183,7 +193,10 @@ impl Switchblade {
             sel_changed_at: Instant::now(),
             demo,
             anim_on: opts.anim,
+            anim_grid,
             atlas_cfg,
+            quickview: false,
+            quickview_at: Instant::now(),
             jobs_total: 0,
             jobs_done: 0,
             jobs_finished_at: None,
@@ -297,12 +310,19 @@ impl Switchblade {
             return;
         }
         let lay = self.layout();
-        let cols = lay.cols as i32;
-        let rows = self.rows(&lay) as i32;
         let sel = self.selected as i32;
-        let col = (sel % cols + dx).clamp(0, cols - 1);
-        let row = (sel / cols + dy).clamp(0, rows - 1);
-        let idx = (row * cols + col).min(self.clips.len() as i32 - 1) as usize;
+        let last = self.clips.len() as i32 - 1;
+        let idx = if dy == 0 {
+            // Horizontal moves are linear: right at the row's end wraps to
+            // the next row's first chip (the "next" clip in stdin order).
+            (sel + dx).clamp(0, last) as usize
+        } else {
+            let cols = lay.cols as i32;
+            let rows = self.rows(&lay) as i32;
+            let col = (sel % cols).clamp(0, cols - 1);
+            let row = (sel / cols + dy).clamp(0, rows - 1);
+            (row * cols + col).min(last) as usize
+        };
         if idx != self.selected {
             self.selected = idx;
             self.sel_changed_at = Instant::now();
@@ -327,6 +347,10 @@ impl Switchblade {
     fn key(&mut self, key: Key) {
         // Movement keys are reserved; everything else goes through the keymap.
         match key {
+            Key::Escape if self.quickview => {
+                self.quickview = false;
+                return;
+            }
             Key::Char('h') | Key::Left => return self.move_selection(-1, 0),
             Key::Char('l') | Key::Right => return self.move_selection(1, 0),
             Key::Char('k') | Key::Up => return self.move_selection(0, -1),
@@ -348,6 +372,12 @@ impl Switchblade {
                     "background animation {}",
                     if self.anim_on { "on" } else { "off" }
                 );
+            }
+            Action::Quickview => {
+                self.quickview = !self.quickview;
+                if self.quickview {
+                    self.quickview_at = Instant::now();
+                }
             }
             Action::CopyPath => {
                 if let Some(clip) = self.clips.get(self.selected) {
@@ -674,7 +704,13 @@ impl Switchblade {
                 return;
             }
             let Some(slot) = self.alloc_slot(lay, SlotKind::Live) else { return };
-            let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th) else {
+            // Start where the thumbnail was taken, so video continues from
+            // the frame the tile already shows instead of jolting to 0:00.
+            let seek = sb_media::cached_meta(&path)
+                .and_then(|m| m.duration)
+                .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
+                .unwrap_or(0.0);
+            let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek) else {
                 log::debug!("live preview failed to start: {}", path.display());
                 return;
             };
@@ -815,14 +851,14 @@ impl Switchblade {
 
                 let mut mix = tex_mix;
                 let uv = if let Some((slot, at, sw, sh)) = anim {
-                    let (cols, rows) = (ANIM_COLS as usize, ANIM_ROWS as usize);
-                    let frames = (cols * rows) as f32;
-                    let (fw, fh) = (sw / cols as f32, sh / rows as f32);
+                    let cols = self.anim_grid as usize;
+                    let frames = (cols * cols) as f32;
+                    let (fw, fh) = (sw / cols as f32, sh / cols as f32);
                     // Per-clip phase offset so neighbors don't tick in
                     // lockstep.
-                    let phase = (i % 9) as f32 / frames;
+                    let phase = (i % (cols * cols)) as f32 / frames;
                     let pos = (anim_t / t.anim_cycle_s.max(0.2) + phase).fract();
-                    let k = ((pos * frames) as usize).min(cols * rows - 1);
+                    let k = ((pos * frames) as usize).min(cols * cols - 1);
                     let (fx, fy) = ((k % cols) as f32 * fw, (k / cols) as f32 * fh);
 
                     let target_a = w / h.max(1.0);
@@ -872,6 +908,10 @@ impl Switchblade {
                     ([0.05, 0.08, 0.13], ease)
                 } else if !clip.readable {
                     ([0.16, 0.05, 0.06], ease)
+                } else if selected {
+                    // The selected tile always has a visible body, even
+                    // before its thumbnail exists.
+                    ([0.055, 0.055, 0.07], ease)
                 } else {
                     ([0.0, 0.0, 0.0], ease * mix)
                 };
@@ -911,7 +951,8 @@ impl Switchblade {
                     push_cloud_badge(out, &tile, ease);
                 }
                 if matches!(clip.thumb, Thumb::Pending) && w > 70.0 {
-                    push_loading_dots(out, &tile, ease, anim_t);
+                    // Selected tiles make the wait obvious: big, centered.
+                    push_loading_dots(out, &tile, ease, anim_t, selected);
                 }
             }
         }
@@ -981,6 +1022,64 @@ impl Switchblade {
         }
         if done {
             self.transition = None;
+        }
+
+        // Quickview (PLAN.md §6 level 3, internal): dim everything and show
+        // the selected clip large, centered, playing via the live slot.
+        // Arrows keep working — the modal follows the selection.
+        if self.quickview {
+            if let Some(clip) = self.clips.get(self.selected) {
+                let fade = (self.quickview_at.elapsed().as_secs_f32() / 0.15).min(1.0);
+                let (vw, vh) = (self.viewport.width, self.viewport.height);
+                let full = |x, y, w, h, color| Tile {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    border_color: [0.0; 4],
+                    corner_radius: 0.0,
+                    border_width: 0.0,
+                    uv: [0.0; 4],
+                    tex_mix: 0.0,
+                };
+                tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 0.82 * fade]));
+
+                let mut src = match clip.thumb {
+                    Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
+                    _ => None,
+                };
+                if let Some(l) = &self.live {
+                    if l.clip == self.selected && l.first_frame.is_some() {
+                        src = Some((l.slot, l.player.w as f32, l.player.h as f32));
+                    }
+                }
+                if let Some((slot, tw, th)) = src {
+                    let a = tw / th.max(1.0);
+                    let (mut w, mut h) = (vw * 0.86, vh * 0.86);
+                    if a > w / h {
+                        h = w / a;
+                    } else {
+                        w = h * a;
+                    }
+                    tiles.push(Tile {
+                        x: (vw - w) * 0.5,
+                        y: (vh - h) * 0.5,
+                        w,
+                        h,
+                        color: [0.0, 0.0, 0.0, fade],
+                        border_color: [0.0; 4],
+                        corner_radius: t.selection_corner_radius,
+                        border_width: 0.0,
+                        uv: self.atlas_cfg.uv(slot, 0.0, 0.0, tw, th),
+                        tex_mix: fade,
+                    });
+                } else {
+                    // Nothing decoded yet: big dots in the middle.
+                    let stage = full((vw - 300.0) * 0.5, (vh - 100.0) * 0.5, 300.0, 100.0, [0.0; 4]);
+                    push_loading_dots(&mut tiles, &stage, fade, anim_t, true);
+                }
+            }
         }
 
         Frame { clear: t.background, tiles, uploads: Vec::new() }
@@ -1067,21 +1166,32 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
     out.push(part(bx, by + 7.0, 28.0, 10.0)); // base bar
 }
 
-/// Three softly pulsing dots in the tile's bottom-right corner while its
-/// thumbnail is being generated.
-fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32) {
-    let d = 5.0;
-    let gap = 4.0;
-    let bx = tile.x + tile.w - (3.0 * d + 2.0 * gap) - 10.0;
-    let by = tile.y + tile.h - d - 10.0;
+/// Three pulsing dots while a thumbnail is generating: each breathes from
+/// near-transparent up to opaque near-white. Small in the bottom-right
+/// corner normally; big and centered when the tile is selected.
+fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: bool) {
+    let (d, gap) = if big { (13.0, 11.0) } else { (5.0, 4.0) };
+    let total_w = 3.0 * d + 2.0 * gap;
+    let (bx, by) = if big {
+        (
+            tile.x + (tile.w - total_w) * 0.5,
+            tile.y + (tile.h - d) * 0.5,
+        )
+    } else {
+        (
+            tile.x + tile.w - total_w - 10.0,
+            tile.y + tile.h - d - 10.0,
+        )
+    };
     for k in 0..3 {
-        let pulse = 0.5 + 0.5 * (t * 4.5 - k as f32 * 0.9).sin();
+        let wave = 0.5 + 0.5 * (t * 4.5 - k as f32 * 0.9).sin();
+        let pulse = wave * wave; // sharpen: dwell near-dark, peak bright
         out.push(Tile {
             x: bx + k as f32 * (d + gap),
             y: by,
             w: d,
             h: d,
-            color: [0.55, 0.55, 0.62, (0.2 + 0.55 * pulse) * ease],
+            color: [0.94, 0.94, 0.97, (0.04 + 0.96 * pulse) * ease],
             border_color: [0.0; 4],
             corner_radius: d * 0.5,
             border_width: 0.0,

@@ -57,6 +57,9 @@ pub struct Tuning {
     pub thumb_height: u32,
     /// ffmpeg -q:v for thumbs/sheets: 2 ≈ visually lossless, 31 = worst.
     pub thumb_quality: u8,
+    /// Anim sheet grid (frames = grid², frame size = thumb/grid). 3 = more
+    /// motion, 2 = crisper frames. Startup-only.
+    pub anim_grid: u32,
     /// Atlas texture dimensions (VRAM ≈ w×h×4 bytes). Clamped to 8192.
     pub atlas_width: u32,
     pub atlas_height: u32,
@@ -103,9 +106,10 @@ impl Default for Tuning {
             zoom_fade_ms: 180.0,
             live_preview: true,
             live_delay_ms: 100.0,
-            thumb_width: 640,
-            thumb_height: 360,
+            thumb_width: 960,
+            thumb_height: 540,
             thumb_quality: 2,
+            anim_grid: 3,
             atlas_width: 7680,
             atlas_height: 4320,
             anim: true,

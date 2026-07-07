@@ -7,23 +7,17 @@
 //! `ffmpeg` CLI into a content-addressed sidecar cache, then decodes it to
 //! RGBA for the renderer's atlas. The render thread never blocks on this.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
-/// Animated thumbnails, first recipe (PLAN.md §6 level 2): ANIM_FRAMES
-/// stills sampled evenly across the clip, packed as an ANIM_COLS×ANIM_ROWS
-/// sprite sheet that fits one atlas slot. Frames are crop-filled 16:9.
-pub const ANIM_COLS: u32 = 3;
-pub const ANIM_ROWS: u32 = 3;
-pub const ANIM_FRAMES: u32 = ANIM_COLS * ANIM_ROWS;
-
 /// Generation parameters, chosen by the app from tuning at startup.
-/// Cache artifact names encode size + quality, so changing the recipe
-/// regenerates rather than serving stale files.
+/// Cache artifact names encode size + quality + grid, so changing the
+/// recipe regenerates rather than serving stale files.
 #[derive(Debug, Clone, Copy)]
 pub struct Recipe {
     /// Thumbs fit within this box, aspect preserved (= atlas slot size).
@@ -31,6 +25,10 @@ pub struct Recipe {
     pub thumb_h: u32,
     /// ffmpeg -q:v — 2 ≈ visually lossless, 31 = worst.
     pub quality: u8,
+    /// Anim sheets are `anim_grid × anim_grid` crop-filled frames sampled
+    /// evenly across the clip (PLAN.md §6 level 2), packed into one slot.
+    /// Frame resolution = thumb / anim_grid: 3 = more motion, 2 = crisper.
+    pub anim_grid: u32,
 }
 
 impl Recipe {
@@ -38,21 +36,34 @@ impl Recipe {
         format!("thumb_fit_{}x{}_q{}.jpg", self.thumb_w, self.thumb_h, self.quality)
     }
     fn anim_file(&self) -> String {
-        format!("anim_3x3_{}x{}_q{}.jpg", self.thumb_w, self.thumb_h, self.quality)
+        let g = self.anim_grid;
+        format!("anim_{g}x{g}_{}x{}_q{}.jpg", self.thumb_w, self.thumb_h, self.quality)
     }
     fn anim_frame(&self) -> (u32, u32) {
-        ((self.thumb_w / ANIM_COLS).max(2), (self.thumb_h / ANIM_ROWS).max(2))
+        let g = self.anim_grid.max(1);
+        ((self.thumb_w / g).max(2), (self.thumb_h / g).max(2))
     }
 }
 
 const WORKERS: usize = 3;
 /// Extract the frame this far into the clip (PLAN.md §6 initial policy).
-const SEEK_FRACTION: f64 = 0.10;
+/// Public so live playback can start from the same frame the thumb shows.
+pub const SEEK_FRACTION: f64 = 0.10;
 
 enum Request {
     Thumb(PathBuf),
     Anim(PathBuf),
 }
+
+/// Two-priority work queue: static thumbs always dispatch before anim
+/// sheets, so scrolling into fresh territory never waits on animations.
+#[derive(Default)]
+struct Queues {
+    thumbs: VecDeque<PathBuf>,
+    anims: VecDeque<PathBuf>,
+}
+
+type SharedQueue = Arc<(Mutex<Queues>, Condvar)>;
 
 pub enum ThumbResult {
     /// `rgba` is `w × h × 4` bytes, fitting the recipe's thumb box with
@@ -68,15 +79,14 @@ pub enum ThumbResult {
 /// Async thumbnail service. `request` from the UI thread, results arrive
 /// via `try_recv` on later frames.
 pub struct MediaService {
-    tx: Sender<Request>,
+    queue: SharedQueue,
     rx: Receiver<ThumbResult>,
 }
 
 impl MediaService {
     pub fn new(recipe: Recipe) -> Self {
-        let (tx_req, rx_req) = mpsc::channel::<Request>();
+        let queue: SharedQueue = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
         let (tx_done, rx_done) = mpsc::channel::<ThumbResult>();
-        let rx_req = Arc::new(Mutex::new(rx_req));
 
         let have_ffmpeg = have_binary("ffmpeg") && have_binary("ffprobe");
         if !have_ffmpeg {
@@ -88,20 +98,24 @@ impl MediaService {
         let root = cache_root();
 
         for _ in 0..WORKERS {
-            let rx = rx_req.clone();
+            let q = queue.clone();
             let tx = tx_done.clone();
             let root = root.clone();
-            thread::spawn(move || worker(rx, tx, root, have_ffmpeg, recipe));
+            thread::spawn(move || worker(q, tx, root, have_ffmpeg, recipe));
         }
-        Self { tx: tx_req, rx: rx_done }
+        Self { queue, rx: rx_done }
     }
 
     pub fn request(&self, path: PathBuf) {
-        let _ = self.tx.send(Request::Thumb(path));
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().thumbs.push_back(path);
+        cv.notify_one();
     }
 
     pub fn request_anim(&self, path: PathBuf) {
-        let _ = self.tx.send(Request::Anim(path));
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().anims.push_back(path);
+        cv.notify_one();
     }
 
     pub fn try_recv(&self) -> Option<ThumbResult> {
@@ -122,10 +136,16 @@ pub struct LivePlayer {
 }
 
 impl LivePlayer {
-    pub fn spawn(path: &Path, w: u32, h: u32) -> Option<Self> {
+    /// `seek` starts playback that many seconds in — pass the thumbnail's
+    /// frame time so live video continues from what the tile showed.
+    pub fn spawn(path: &Path, w: u32, h: u32, seek: f64) -> Option<Self> {
         let (w, h) = (w.max(2), h.max(2));
-        let mut child = Command::new("ffmpeg")
-            .args(["-v", "error", "-stream_loop", "-1", "-re"])
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-stream_loop", "-1", "-re"]);
+        if seek > 0.05 {
+            cmd.args(["-ss", &format!("{seek:.3}")]);
+        }
+        let mut child = cmd
             .arg("-i")
             .arg(path)
             .args([
@@ -175,18 +195,26 @@ impl Drop for LivePlayer {
 }
 
 fn worker(
-    rx: Arc<Mutex<Receiver<Request>>>,
+    queue: SharedQueue,
     tx: Sender<ThumbResult>,
     root: PathBuf,
     have_ffmpeg: bool,
     recipe: Recipe,
 ) {
     loop {
-        // The lock is only held while waiting for the next request; the
-        // temporary guard drops before any work starts.
-        let req = match { rx.lock().unwrap().recv() } {
-            Ok(r) => r,
-            Err(_) => return,
+        // Thumbs always beat anims; the lock drops before any work starts.
+        let req = {
+            let (lock, cv) = &*queue;
+            let mut q = lock.lock().unwrap();
+            loop {
+                if let Some(p) = q.thumbs.pop_front() {
+                    break Request::Thumb(p);
+                }
+                if let Some(p) = q.anims.pop_front() {
+                    break Request::Anim(p);
+                }
+                q = cv.wait(q).unwrap();
+            }
         };
         let result = match req {
             Request::Thumb(path) => match make_thumb(&path, &root, have_ffmpeg, &recipe) {
@@ -265,13 +293,14 @@ fn make_anim(
         let duration = probe(src).and_then(|m| m.duration).filter(|d| *d > 0.05)?;
         let tmp = jpg.with_extension("jpg.tmp");
         // Slightly overshoot the rate so the tile filter always fills all
-        // ANIM_FRAMES cells before EOF (a padded black cell looks broken).
-        let fps = (ANIM_FRAMES as f64 + 0.5) / duration;
+        // cells before EOF (a padded black cell looks broken).
+        let g = recipe.anim_grid.max(1);
+        let fps = ((g * g) as f64 + 0.5) / duration;
         let (fw, fh) = recipe.anim_frame();
         let q = recipe.quality.clamp(2, 31).to_string();
         let vf = format!(
             "fps={fps:.6},scale={fw}:{fh}:force_original_aspect_ratio=increase,\
-             crop={fw}:{fh},tile={ANIM_COLS}x{ANIM_ROWS}"
+             crop={fw}:{fh},tile={g}x{g}"
         );
         let out = Command::new("ffmpeg")
             .args(["-y", "-v", "error"])
@@ -299,7 +328,7 @@ fn make_anim(
 }
 
 /// Cached probe results — a snapshot for humans and future features.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Meta {
     pub src: PathBuf,
     pub duration: Option<f64>,
@@ -307,6 +336,15 @@ pub struct Meta {
     pub height: Option<u64>,
     pub codec: Option<String>,
     pub fps: Option<f64>,
+}
+
+/// Read the cached meta.json for a clip without probing (cheap: one small
+/// file read; no process spawn). Present for anything with a thumbnail.
+pub fn cached_meta(path: &Path) -> Option<Meta> {
+    let meta = std::fs::metadata(path).ok()?;
+    let fp = fingerprint(path, meta.len(), mtime_secs(&meta));
+    let file = cache_root().join(&fp[..2]).join(&fp).join("meta.json");
+    serde_json::from_slice(&std::fs::read(file).ok()?).ok()
 }
 
 fn probe(src: &Path) -> Option<Meta> {

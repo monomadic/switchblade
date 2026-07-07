@@ -10,7 +10,7 @@ USAGE:
 KEYS (defaults; remappable via [keys]/[commands] in ./switchblade.toml):
     hjkl / arrows   move selection
     Enter / o       open selected clip (mpv)
-    Space           preview selected clip (looping windowed mpv)
+    Space           quickview: in-app preview (Esc closes, arrows browse)
     c               copy path
     - / = / 0       zoom out / in / reset (also trackpad pinch)
     f               fullscreen
