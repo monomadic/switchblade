@@ -850,11 +850,9 @@ impl Switchblade {
                 } else {
                     None
                 };
-                let mut live_showing = false;
                 if let Some(live) = lane {
                     if live.clip == i && live.first_frame.is_some() {
                         thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
-                        live_showing = true;
                     }
                 }
 
@@ -888,13 +886,12 @@ impl Switchblade {
 
                 // Texture source: in the grid, a cycling anim-sheet frame
                 // once available (M6); the static thumb otherwise.
-                // Selected/hovered tiles keep their sheet animating as a
-                // bridge until live video's first frame lands — motion
-                // never stops. With live off, emphasized tiles stay static
-                // (higher res).
-                let anim_allowed = t.anim
-                    && self.anim_on
-                    && (!emphasized || (t.live_preview && !live_showing));
+                // Emphasized tiles never use the sheet: its tiny 16:9
+                // crop-fill frames zoom horribly when the tile morphs to
+                // true aspect, and live video (seek-matched to the static
+                // thumb's frame) would land on different content. The
+                // emphasis morph itself keeps the tile alive until then.
+                let anim_allowed = t.anim && self.anim_on && !emphasized;
                 let anim = if anim_allowed {
                     match clip.anim {
                         Thumb::Ready { slot, at, tw, th } => {

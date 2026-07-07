@@ -68,8 +68,8 @@ atlas_height = 4320
 # anim_crossfade of each interval (0 = hard cuts). Tiles narrower than
 # anim_min_tile_w stay static. Toggle live with 'a' or start --no-anim.
 anim = true
-anim_cycle_s = 2.8
-anim_crossfade = 0.35
+anim_cycle_s = 10.8
+anim_crossfade = 1.0
 anim_min_tile_w = 140.0
 
 # Aspect cap (long:short) for the selected/hovered tile. Clips beyond it
