@@ -421,20 +421,36 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64, recipe: &Recipe) -> Option<(
     std::fs::rename(&tmp, dst).ok()
 }
 
+/// Decode a cached artifact to RGBA **via ffmpeg**, so thumbnails go
+/// through the exact same YUV→RGB conversion as live playback. Decoding
+/// JPEG with a JFIF-assuming image library uses subtly different color
+/// math (BT.601 full-range vs the source matrix) — enough for a visible
+/// gamma/color pop the moment live video replaces the thumb.
 fn decode_jpeg(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let img = image::open(path).ok()?.to_rgba8();
-    let (w, h) = img.dimensions();
+    // Header-only dimension read; no full decode.
+    let (mut w, mut h) = image::image_dimensions(path).ok()?;
     if w == 0 || h == 0 {
         return None;
     }
-    if w <= max_w && h <= max_h {
-        return Some((w, h, img.into_raw()));
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error"]).arg("-i").arg(path);
+    if w > max_w || h > max_h {
+        // Oversized (foreign/stale artifact): scale down, keep aspect.
+        let s = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
+        w = ((w as f32 * s) as u32).max(1);
+        h = ((h as f32 * s) as u32).max(1);
+        cmd.args(["-vf", &format!("scale={w}:{h}")]);
     }
-    // Oversized (foreign/stale artifact): scale down, keep aspect.
-    let s = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
-    let (nw, nh) = (((w as f32 * s) as u32).max(1), ((h as f32 * s) as u32).max(1));
-    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
-    Some((nw, nh, resized.into_raw()))
+    let out = cmd
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.len() != (w * h * 4) as usize {
+        return None;
+    }
+    Some((w, h, out.stdout))
 }
 
 /// Pragmatic MVP fingerprint: absolute path + size + mtime (PLAN.md §8).

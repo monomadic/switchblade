@@ -99,10 +99,12 @@ pub struct Switchblade {
     /// Atlas slot → owner. Fixed pool shared by static thumbs, anim sheets
     /// and the live frame; class+distance-based eviction (see alloc_slot).
     slots: Vec<Option<(usize, SlotKind)>>,
-    live: Option<LiveState>,
-    /// Last time the selection changed; live playback starts once it
-    /// settles for live_delay_ms.
+    /// Live playback lanes: the selected tile and the hovered tile each
+    /// get one, started once their target settles for live_delay_ms.
+    live_sel: Option<LiveState>,
+    live_hover: Option<LiveState>,
     sel_changed_at: Instant,
+    hover_changed_at: Instant,
     demo: bool,
     /// Runtime animation toggle (`a` key / --no-anim), ANDed with tuning.anim.
     anim_on: bool,
@@ -189,8 +191,10 @@ impl Switchblade {
             rx,
             media: MediaService::new(recipe),
             slots: vec![None; atlas_cfg.slots()],
-            live: None,
+            live_sel: None,
+            live_hover: None,
             sel_changed_at: Instant::now(),
+            hover_changed_at: Instant::now(),
             demo,
             anim_on: opts.anim,
             anim_grid,
@@ -478,7 +482,11 @@ impl Switchblade {
         // Camera chases its target (key moves use a gentler chase).
         self.scroll += (self.scroll_target - self.scroll) * alpha(self.chase, dt);
 
-        self.hovered = self.tile_at(&lay, self.cursor.0, self.cursor.1);
+        let hover_now = self.tile_at(&lay, self.cursor.0, self.cursor.1);
+        if hover_now != self.hovered {
+            self.hovered = hover_now;
+            self.hover_changed_at = Instant::now();
+        }
 
         // Selection stands out more the further you zoom out.
         let boost = (1.0 / self.zoom.max(0.05))
@@ -671,67 +679,94 @@ impl Switchblade {
         Some(j)
     }
 
-    /// Live in-tile playback of the selected clip: starts once the
-    /// selection settles, stops the moment it moves, and pumps the newest
-    /// decoded frame into a dedicated (never-evicted) atlas slot.
+    /// Live in-tile playback for the selected and hovered tiles: each lane
+    /// starts once its target settles, stops the moment it moves, and
+    /// pumps the newest decoded frame into a never-evicted atlas slot.
     fn update_live(&mut self, lay: &Layout, uploads: &mut Vec<ThumbUpload>) {
-        let stop = !self.tuning.live_preview
-            || self.demo
-            || self.live.as_ref().is_some_and(|l| l.clip != self.selected);
-        if stop {
-            if let Some(live) = self.live.take() {
-                self.slots[live.slot] = None;
+        let enabled = self.tuning.live_preview && !self.demo;
+        let delay_ms = self.tuning.live_delay_ms;
+        let sel_target = enabled.then_some(self.selected);
+        // The hover lane is suppressed during quickview (grid is hidden)
+        // and when hover sits on the selected tile (that lane owns it).
+        let hover_target = if enabled && !self.quickview {
+            self.hovered.filter(|h| *h != self.selected)
+        } else {
+            None
+        };
+
+        // Stop lanes whose target moved away.
+        if let Some(l) = &self.live_sel {
+            if sel_target != Some(l.clip) {
+                let slot = l.slot;
+                self.live_sel = None;
+                self.slots[slot] = None;
             }
-            if !self.tuning.live_preview || self.demo {
-                return;
+        }
+        if let Some(l) = &self.live_hover {
+            if hover_target != Some(l.clip) {
+                let slot = l.slot;
+                self.live_hover = None;
+                self.slots[slot] = None;
             }
         }
 
-        if self.live.is_none()
-            && self.sel_changed_at.elapsed().as_millis() as f32 >= self.tuning.live_delay_ms
-        {
-            let i = self.selected;
-            let Some(clip) = self.clips.get(i) else { return };
-            // Decode at the static thumb's exact fit dimensions, so the
-            // emphasized tile's aspect math applies unchanged.
-            let (readable, cloud, tw, th, path) = match clip.thumb {
-                Thumb::Ready { tw, th, .. } => {
-                    (clip.readable, clip.cloud, tw, th, clip.path.clone())
+        // Start lanes whose target has settled.
+        if self.live_sel.is_none() {
+            if let Some(i) = sel_target {
+                if self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms {
+                    self.live_sel = self.start_live(lay, i);
                 }
-                _ => return,
-            };
-            if !readable || cloud {
-                return;
             }
-            let Some(slot) = self.alloc_slot(lay, SlotKind::Live) else { return };
-            // Start where the thumbnail was taken, so video continues from
-            // the frame the tile already shows instead of jolting to 0:00.
-            let seek = sb_media::cached_meta(&path)
-                .and_then(|m| m.duration)
-                .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
-                .unwrap_or(0.0);
-            let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek) else {
-                log::debug!("live preview failed to start: {}", path.display());
-                return;
-            };
-            log::debug!("live preview: {}", path.display());
-            self.slots[slot] = Some((i, SlotKind::Live));
-            self.live = Some(LiveState { clip: i, player, slot, first_frame: None });
+        }
+        if self.live_hover.is_none() {
+            if let Some(i) = hover_target {
+                if self.hover_changed_at.elapsed().as_millis() as f32 >= delay_ms {
+                    self.live_hover = self.start_live(lay, i);
+                }
+            }
         }
 
-        if let Some(live) = &mut self.live {
-            if let Some(rgba) = live.player.take_frame() {
-                if live.first_frame.is_none() {
-                    live.first_frame = Some(Instant::now());
+        for lane in [&mut self.live_sel, &mut self.live_hover] {
+            if let Some(live) = lane {
+                if let Some(rgba) = live.player.take_frame() {
+                    if live.first_frame.is_none() {
+                        live.first_frame = Some(Instant::now());
+                    }
+                    uploads.push(ThumbUpload {
+                        slot: live.slot,
+                        w: live.player.w,
+                        h: live.player.h,
+                        rgba,
+                    });
                 }
-                uploads.push(ThumbUpload {
-                    slot: live.slot,
-                    w: live.player.w,
-                    h: live.player.h,
-                    rgba,
-                });
             }
         }
+    }
+
+    fn start_live(&mut self, lay: &Layout, i: usize) -> Option<LiveState> {
+        let clip = self.clips.get(i)?;
+        // Decode at the static thumb's exact fit dimensions, so the
+        // emphasized tile's aspect math applies unchanged.
+        let (tw, th, path) = match clip.thumb {
+            Thumb::Ready { tw, th, .. } if clip.readable && !clip.cloud => {
+                (tw, th, clip.path.clone())
+            }
+            _ => return None,
+        };
+        let slot = self.alloc_slot(lay, SlotKind::Live)?;
+        // Start where the thumbnail was taken, so video continues from
+        // the frame the tile already shows instead of jolting to 0:00.
+        let seek = sb_media::cached_meta(&path)
+            .and_then(|m| m.duration)
+            .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
+            .unwrap_or(0.0);
+        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek) else {
+            log::debug!("live preview failed to start: {}", path.display());
+            return None;
+        };
+        log::debug!("live preview: {}", path.display());
+        self.slots[slot] = Some((i, SlotKind::Live));
+        Some(LiveState { clip: i, player, slot, first_frame: None })
     }
 
     fn update_title(&mut self) {
@@ -792,16 +827,21 @@ impl Switchblade {
                     }
                     _ => (None, 0.0),
                 };
-                // The selected tile plays live video once frames arrive; it
-                // decodes at the static thumb's dimensions, so it's a
+                // Selected/hovered tiles play live video once frames
+                // arrive; decode dims match the static thumb, so it's a
                 // drop-in slot swap.
+                let lane = if selected {
+                    self.live_sel.as_ref()
+                } else if hovered {
+                    self.live_hover.as_ref()
+                } else {
+                    None
+                };
                 let mut live_showing = false;
-                if selected {
-                    if let Some(live) = &self.live {
-                        if live.clip == i && live.first_frame.is_some() {
-                            thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
-                            live_showing = true;
-                        }
+                if let Some(live) = lane {
+                    if live.clip == i && live.first_frame.is_some() {
+                        thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
+                        live_showing = true;
                     }
                 }
 
@@ -832,12 +872,14 @@ impl Switchblade {
                 let cy = oy + lay.tile_h * 0.5;
 
                 // Texture source: in the grid, a cycling anim-sheet frame
-                // once available (M6); the static thumb otherwise. The
-                // selected tile keeps its sheet animating as a bridge until
-                // live video's first frame lands — motion never stops.
+                // once available (M6); the static thumb otherwise.
+                // Selected/hovered tiles keep their sheet animating as a
+                // bridge until live video's first frame lands — motion
+                // never stops. With live off, emphasized tiles stay static
+                // (higher res).
                 let anim_allowed = t.anim
                     && self.anim_on
-                    && (!emphasized || (selected && !live_showing));
+                    && (!emphasized || (t.live_preview && !live_showing));
                 let anim = if anim_allowed {
                     match clip.anim {
                         Thumb::Ready { slot, at, tw, th } => {
@@ -1049,7 +1091,7 @@ impl Switchblade {
                     Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
                     _ => None,
                 };
-                if let Some(l) = &self.live {
+                if let Some(l) = &self.live_sel {
                     if l.clip == self.selected && l.first_frame.is_some() {
                         src = Some((l.slot, l.player.w as f32, l.player.h as f32));
                     }

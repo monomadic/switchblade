@@ -50,15 +50,15 @@ live_delay_ms = 100.0
 
 # ── Media quality (read at startup — restart to apply) ─────────────────
 # Thumb size doubles as the atlas slot size, so resolution trades against
-# slot count: 640x360 -> 144 slots, 960x540 -> 64. Try 960x540 for a
-# crisper gallery on a big display; thumb_quality is ffmpeg -q:v
-# (2 = visually lossless … 31 = worst). Changing any of these regenerates
+# slot count: 640x360 -> 144 slots, 960x540 -> 64. thumb_quality is
+# ffmpeg -q:v (2 = near lossless … 31 = worst); 5 is a good
+# size/speed/quality balance. Changing any of these regenerates
 # thumbnails (cache files are named by recipe).
-thumb_width = 960
-thumb_height = 540
-thumb_quality = 2
+thumb_width = 640
+thumb_height = 360
+thumb_quality = 5
 # Anim sheet grid: frames = grid², frame size = thumb/grid.
-# 3 = 9 frames @ 320x180 (more motion), 2 = 4 frames @ 480x270 (crisper).
+# 3 = 9 smaller frames (more motion), 2 = 4 crisper frames.
 anim_grid = 3
 atlas_width = 7680
 atlas_height = 4320
