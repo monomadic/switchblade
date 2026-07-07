@@ -140,6 +140,12 @@ pub struct Switchblade {
     transition: Option<(Vec<Tile>, Instant)>,
     /// App start, the time base for looping micro-animations (loading dots).
     t0: Instant,
+    /// Springs still in flight this frame (drives idle throttling).
+    motion: bool,
+    /// An anim-sheet frame was drawn this frame (grid is visibly cycling).
+    anim_rendered: bool,
+    /// Stay awake at least until this instant (input, fades, fresh uploads).
+    wake_until: Instant,
     last_scroll_event: Instant,
     viewport: Viewport,
     cmds: Vec<WindowCommand>,
@@ -224,6 +230,9 @@ impl Switchblade {
             last_tiles: Vec::new(),
             transition: None,
             t0: Instant::now(),
+            motion: true,
+            anim_rendered: false,
+            wake_until: Instant::now() + Duration::from_secs(1),
             last_scroll_event: Instant::now(),
             viewport: Viewport { width: 1280.0, height: 800.0 },
             cmds: Vec::new(),
@@ -407,6 +416,14 @@ impl Switchblade {
         }
     }
 
+    /// Keep the render loop awake for at least `secs` (covers fades and
+    /// settle timers that plain spring-residual checks can't see).
+    fn wake(&mut self, secs: f32) {
+        self.wake_until = self
+            .wake_until
+            .max(Instant::now() + Duration::from_secs_f32(secs));
+    }
+
     fn set_zoom(&mut self, target: f32) {
         let t = &self.tuning;
         self.zoom_target = target.clamp(t.zoom_min, t.zoom_max);
@@ -419,6 +436,9 @@ impl Switchblade {
         loop {
             match rx.try_recv() {
                 Ok(item) => {
+                    // spawn fade-in (field update: `rx` is borrowed here)
+                    self.wake_until =
+                        self.wake_until.max(Instant::now() + Duration::from_millis(600));
                     self.index.insert(item.path.clone(), self.clips.len());
                     // Cloud placeholders never request a thumbnail: reading
                     // the file would force iCloud to download it.
@@ -501,7 +521,10 @@ impl Switchblade {
         let sel_scale = t.selection_scale * boost;
 
         // Tile scale + emphasis springs (selected > hover > rest); both
-        // keyboard moves and hover ride the same tween.
+        // keyboard moves and hover ride the same tween. Track whether any
+        // spring is still in flight for idle throttling.
+        let mut motion = (self.scroll_target - self.scroll).abs() > 0.3
+            || (self.zoom_target - self.zoom).abs() > 1e-3;
         let a = alpha(t.scale_smoothing, dt);
         for (i, clip) in self.clips.iter_mut().enumerate() {
             let emphasized = i == self.selected || Some(i) == self.hovered;
@@ -512,9 +535,14 @@ impl Switchblade {
             } else {
                 1.0
             };
+            let e_target = emphasized as u8 as f32;
+            if (target - clip.scale).abs() > 0.002 || (e_target - clip.emph).abs() > 0.005 {
+                motion = true;
+            }
             clip.scale += (target - clip.scale) * a;
-            clip.emph += ((emphasized as u8 as f32) - clip.emph) * a;
+            clip.emph += (e_target - clip.emph) * a;
         }
+        self.motion = motion;
     }
 
     /// Rows currently on screen, extended by `margin` prefetch rows.
@@ -596,6 +624,7 @@ impl Switchblade {
         let mut uploads = Vec::new();
         while let Some(result) = self.media.try_recv() {
             self.jobs_done += 1;
+            self.wake(0.6); // thumb crossfade + progress bar linger
             match result {
                 ThumbResult::Ready { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else { continue };
@@ -800,6 +829,7 @@ impl Switchblade {
 
         let now = Instant::now();
         let anim_t = now.saturating_duration_since(self.t0).as_secs_f32();
+        self.anim_rendered = false;
         let mut tiles = Vec::new();
         // Z-order: grid tiles, then the hovered tile lifted above its
         // neighbors, then the selected tile on top of everything.
@@ -907,6 +937,7 @@ impl Switchblade {
                 let mut uv2 = [0.0; 4];
                 let mut frame_fade = 0.0;
                 let uv = if let Some((slot, at, sw, sh)) = anim {
+                    self.anim_rendered = true;
                     let cols = self.anim_grid as usize;
                     let frames = (cols * cols) as f32;
                     let (fw, fh) = (sw / cols as f32, sh / cols as f32);
@@ -1159,7 +1190,7 @@ impl Switchblade {
             }
         }
 
-        Frame { clear: t.background, tiles, uploads: Vec::new() }
+        Frame { clear: t.background, tiles, uploads: Vec::new(), animating: true }
     }
 }
 
@@ -1169,6 +1200,9 @@ impl App for Switchblade {
     }
 
     fn event(&mut self, event: InputEvent) {
+        // Any input keeps the loop awake long enough for settle timers
+        // (live start, hover) to fire.
+        self.wake(0.6);
         match event {
             InputEvent::Key { key, .. } => self.key(key),
             InputEvent::Scroll { dy, .. } => {
@@ -1186,9 +1220,18 @@ impl App for Switchblade {
                 self.cursor = (x, y);
             }
             InputEvent::MouseDown { x, y } => {
+                // Any click closes quickview; a click on the already-
+                // selected chip opens it.
+                if self.quickview {
+                    self.quickview = false;
+                    return;
+                }
                 let lay = self.layout();
                 if let Some(i) = self.tile_at(&lay, x, y) {
-                    if i != self.selected {
+                    if i == self.selected {
+                        self.quickview = true;
+                        self.quickview_at = Instant::now();
+                    } else {
                         self.selected = i;
                         self.sel_changed_at = Instant::now();
                     }
@@ -1212,6 +1255,17 @@ impl App for Switchblade {
         self.update_title();
         let mut frame = self.build_frame();
         frame.uploads = uploads;
+        // Idle throttling: with nothing in motion — springs settled, no
+        // sheets cycling (e.g. animation toggled off), no live video, no
+        // background jobs, stdin closed — the loop drops to a slow tick.
+        frame.animating = self.motion
+            || self.anim_rendered
+            || self.transition.is_some()
+            || self.live_sel.is_some()
+            || self.live_hover.is_some()
+            || self.jobs_total > 0
+            || self.rx.is_some()
+            || Instant::now() < self.wake_until;
         frame
     }
 

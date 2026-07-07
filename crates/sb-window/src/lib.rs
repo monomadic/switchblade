@@ -132,6 +132,9 @@ pub struct Frame {
     pub clear: [f32; 3],
     pub tiles: Vec<Tile>,
     pub uploads: Vec<ThumbUpload>,
+    /// False when nothing on screen is in motion: the loop drops to a
+    /// slow idle tick instead of redrawing every vsync.
+    pub animating: bool,
 }
 
 pub trait App {
@@ -153,10 +156,15 @@ pub fn run(app: impl App) -> anyhow::Result<()> {
         gpu: None,
         last_frame: Instant::now(),
         cursor: (0.0, 0.0),
+        animating: true,
     };
     event_loop.run_app(&mut runner)?;
     Ok(())
 }
+
+/// Redraw cadence while idle — keeps config hot-reload and stdin ingest
+/// ticking without burning CPU on a static grid.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 
 struct Runner<A: App> {
     app: A,
@@ -164,6 +172,7 @@ struct Runner<A: App> {
     gpu: Option<render::Gpu>,
     last_frame: Instant,
     cursor: (f32, f32),
+    animating: bool,
 }
 
 impl<A: App> Runner<A> {
@@ -212,6 +221,19 @@ impl<A: App> ApplicationHandler for Runner<A> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Any interaction wakes the loop optimistically; the next frame's
+        // `animating` flag decides whether it stays awake.
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::PinchGesture { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::Resized(_)
+        ) {
+            self.animating = true;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -280,6 +302,7 @@ impl<A: App> ApplicationHandler for Runner<A> {
                     height: size.height as f32 / scale,
                 };
                 let frame = self.app.frame(dt, viewport);
+                self.animating = frame.animating;
                 gpu.render(&frame, viewport);
                 self.apply_commands(event_loop);
             }
@@ -287,10 +310,17 @@ impl<A: App> ApplicationHandler for Runner<A> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Game-style continuous redraw; the app's motion is dt-scaled.
-        if let Some(w) = &self.window {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Game-style continuous redraw while anything moves; a slow idle
+        // tick otherwise. The app's motion is dt-scaled either way.
+        let Some(w) = &self.window else { return };
+        if self.animating {
+            event_loop.set_control_flow(ControlFlow::Poll);
             w.request_redraw();
+        } else if self.last_frame.elapsed() >= IDLE_TICK {
+            w.request_redraw();
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_frame + IDLE_TICK));
         }
     }
 }
