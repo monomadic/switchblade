@@ -225,7 +225,10 @@ impl Switchblade {
         let recipe = Recipe {
             thumb_w: slot_w,
             thumb_h: slot_h,
-            quality: tuning.thumb_quality,
+            // Config quality is 1..10 (10 = best); ffmpeg -q:v wants
+            // 2..31 (2 = best). 12 - q spans 2..11 — even quality 1
+            // avoids the hideous end of the scale.
+            quality: 12 - tuning.thumb_quality.clamp(1, 10),
             anim_grid,
         };
 
@@ -932,12 +935,24 @@ impl Switchblade {
             .live_sel
             .as_ref()
             .is_some_and(|l| l.first_frame.is_some());
-        if sel_ready && self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms {
-            for &i in &warm_targets {
-                if self.warm.iter().all(|w| w.clip != i) {
-                    if let Some(l) = self.start_sel_live(i) {
-                        self.warm.push(l);
-                    }
+        // ...and one at a time: a cold spawn burns a core for up to ~1s
+        // (probe + decoder init + first GOP), so the next warm-up starts
+        // only after the previous one has produced a frame and stalled.
+        // The playing video's decoder is never outnumbered.
+        // (5s escape hatch: a dead decoder never buffers and must not
+        // block warming the other destinations forever.)
+        let warming_up = self
+            .warm
+            .iter()
+            .any(|w| w.player.buffered() == 0 && w.spawned.elapsed().as_secs_f32() < 5.0);
+        if sel_ready && !warming_up && self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
+        {
+            if let Some(&i) = warm_targets
+                .iter()
+                .find(|&&i| self.warm.iter().all(|w| w.clip != i))
+            {
+                if let Some(l) = self.start_sel_live(i) {
+                    self.warm.push(l);
                 }
             }
         }
@@ -1503,7 +1518,7 @@ impl Switchblade {
                     };
                     let sb = t.selection_border;
                     let (border_color, border_width) = if sel {
-                        ([sb[0], sb[1], sb[2], fade], t.border_width * 0.7)
+                        ([sb[0], sb[1], sb[2], fade], t.strip_border_width)
                     } else {
                         ([0.30, 0.30, 0.34, 0.55 * fade], 1.0)
                     };
@@ -1514,7 +1529,7 @@ impl Switchblade {
                         h,
                         color: [0.03, 0.03, 0.04, fade],
                         border_color,
-                        corner_radius: t.corner_radius,
+                        corner_radius: t.strip_corner_radius,
                         border_width,
                         uv,
                         uv2: [0.0; 4],

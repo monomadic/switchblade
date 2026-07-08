@@ -21,7 +21,7 @@ Built for VJs picking clips mid-set, creators sorting AI-generated footage, and 
 - **Live playback in-tile** — the selected and hovered clips play real (silent, looping) video inside their tiles, seek-matched to the thumbnail's frame so nothing jumps.
 - **Quickview** — `Space` (or click the selection): the grid dims and the clip plays large and centered at natural resolution (up to 1080p, configurable). Arrows keep browsing without closing it.
 - **Pinch zoom** — tile size scales, columns reflow with a crossfade. `-`/`=`/`0` on the keyboard.
-- **Keymap** — bind any non-movement key to internal actions or external commands with `{path}`/`{dir}`/`{name}` templates: open in mpv, reveal in Finder, run your renamer script, push to a VJ tool.
+- **Keymap** — bind any non-movement key to internal actions or launched programs with `{path}`/`{dir}`/`{name}` templates: open in mpv, reveal in Finder, run your renamer script, push to a VJ tool.
 - **Hot-tunable feel** — every motion constant (springs, gaps, scales, fades) lives in `switchblade.toml` and reloads within 250ms while the app runs.
 - **iCloud-aware** — placeholder (not-downloaded) files get a cloud badge and are never force-downloaded.
 - **Cheap when still** — the render loop idles at ~2% of a core when nothing is animating, and playback/animation pause automatically while the window is unfocused (configurable).
@@ -68,7 +68,7 @@ Trackpad pans without changing the selection. Click selects; clicking the select
 r = "rename_script"
 
 [commands.rename_script]
-type = "external"
+type = "launch"
 program = "~/bin/rename-media"
 args = ["{path}"]
 ```

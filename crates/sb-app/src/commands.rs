@@ -15,7 +15,10 @@ use sb_window::Key;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandSpec {
-    External {
+    /// Launch a program on the selected clip ("external" accepted as a
+    /// legacy alias for configs written before the rename).
+    #[serde(alias = "external")]
+    Launch {
         program: String,
         #[serde(default)]
         args: Vec<String>,
@@ -70,7 +73,7 @@ impl Default for KeyMap {
         let mut commands = HashMap::new();
         commands.insert(
             "open".to_string(),
-            CommandSpec::External {
+            CommandSpec::Launch {
                 program: "mpv".to_string(),
                 args: vec!["{path}".to_string()],
             },
@@ -79,7 +82,7 @@ impl Default for KeyMap {
         // peek — windowed, floating on top, looping, sized sensibly.
         commands.insert(
             "preview".to_string(),
-            CommandSpec::External {
+            CommandSpec::Launch {
                 program: "mpv".to_string(),
                 args: [
                     "--no-fs",
@@ -98,7 +101,7 @@ impl Default for KeyMap {
         // remap or replace it freely (macOS default).
         commands.insert(
             "reveal".to_string(),
-            CommandSpec::External {
+            CommandSpec::Launch {
                 program: "open".to_string(),
                 args: vec!["-R".to_string(), "{path}".to_string()],
             },
@@ -122,7 +125,7 @@ impl KeyMap {
     pub fn action_for(&self, key: &Key) -> Option<Action> {
         let name = self.keys.get(&key_name(key)?)?;
         match self.commands.get(name) {
-            Some(CommandSpec::External { program, args }) => Some(Action::Spawn {
+            Some(CommandSpec::Launch { program, args }) => Some(Action::Spawn {
                 program: program.clone(),
                 args: args.clone(),
             }),
@@ -273,11 +276,20 @@ mod tests {
     }
 
     #[test]
+    fn launch_parses_and_external_stays_an_alias() {
+        for ty in ["launch", "external"] {
+            let spec: CommandSpec =
+                toml::from_str(&format!("type = \"{ty}\"\nprogram = \"mpv\"")).unwrap();
+            assert!(matches!(spec, CommandSpec::Launch { .. }), "type = {ty}");
+        }
+    }
+
+    #[test]
     fn user_entries_override_defaults() {
         let keys = HashMap::from([("o".to_string(), "reveal".to_string())]);
         let commands = HashMap::from([(
             "reveal".to_string(),
-            CommandSpec::External {
+            CommandSpec::Launch {
                 program: "open".to_string(),
                 args: vec!["-R".to_string(), "{path}".to_string()],
             },

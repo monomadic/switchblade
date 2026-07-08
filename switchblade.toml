@@ -54,14 +54,19 @@ live_delay_ms = 100.0
 pause_unfocused = true
 
 # ── Media quality (read at startup — restart to apply) ─────────────────
-# Thumb size doubles as the atlas slot size, so resolution trades against
-# slot count: 640x360 -> 144 slots, 960x540 -> 64. thumb_quality is
-# ffmpeg -q:v (2 = near lossless … 31 = worst); 5 is a good
-# size/speed/quality balance. Changing any of these regenerates
-# thumbnails (cache files are named by recipe).
-thumb_width = 640
-thumb_height = 360
-thumb_quality = 5
+# Thumbnails are generated at exactly thumb_width x thumb_height — any
+# resolution works, nothing needs to be a multiple of anything. The GPU
+# atlas (atlas_width x atlas_height below) is carved into fixed slots of
+# that same size, so the only real trade-off is slot count: bigger thumbs
+# = fewer clips resident on the GPU at once (640x360 -> 144 slots,
+# 960x540 -> 64). Fewer slots only bites when zoomed way out on a big
+# library (more thumbnail churn); bigger thumbs = sharper selected/zoomed
+# tiles. thumb_quality is 1..10: 10 ≈ visually lossless, 1 = heavily
+# compressed but still presentable. Changing any of these regenerates
+# thumbnails (cache files are named by recipe; old ones are kept).
+thumb_width = 960
+thumb_height = 540
+thumb_quality = 9
 # Anim sheet grid: frames = grid², frame size = thumb/grid.
 # 3 = 9 smaller frames (more motion), 2 = 4 crisper frames.
 anim_grid = 3
@@ -75,11 +80,13 @@ quickview_max_width = 1920
 quickview_max_height = 1080
 # Quickview filmstrip: chip height (16:9), spacing, and how hard the
 # strip chases the selection per 60fps frame (same curve family as
-# key_snap_strength; 0.99 ≈ instant snap — handy to prove the slide and
-# video start are unrelated).
+# key_snap_strength; 0.99 ≈ instant snap). The selected chip's border
+# takes its color from selection_border, size/rounding from these.
 strip_height = 92.0
 strip_gap = 10.0
 strip_snap_strength = 0.5
+strip_corner_radius = 5.0
+strip_border_width = 4.0
 # Quickview backdrop: black dim strength (0..1) and frosted-glass blur
 # level — the grid is downsampled 2^level before drawing back, so
 # 1 = subtle, 4 = heavy frost, 0 = no blur. GPU-cheap either way.
@@ -104,6 +111,8 @@ selection_border = [0.0, 0.0, 0.0]
 hover_border = [0.0, 0.0, 0.0]
 # Thin outline for tiles that have no thumbnail yet (fill is transparent).
 empty_border = [0.10, 0.10, 0.13]
+
+# global background
 background = [0.004, 0.004, 0.006]
 
 # ── Keys & commands (PLAN.md §11) ────────────────────────────────────────
@@ -123,19 +132,19 @@ c = "copy_path"
 a = "toggle_anim"       # background tile animation on/off
 p = "toggle_focus_pause" # pause-when-unfocused on/off
 r = "reveal"            # reveal in Finder (open -R)
-# n = "rename_script"   # any key -> any external command; see below
+# n = "rename_script"   # any key -> any launched program; see below
 
 # "open" is just a command like any other — swap mpv for whatever you
 # like, or add more commands and bind keys to them.
 [commands.open]
-type = "external"
+type = "launch"
 program = "mpv"
 args = ["{path}"]
 
 # Quick-Look-ish peek: windowed (never fullscreen), floats on top,
 # loops, opens instantly, capped at 70% of the screen.
 [commands.preview]
-type = "external"
+type = "launch"
 program = "mpv"
 args = [
   "--no-fs",
@@ -149,11 +158,11 @@ args = [
 
 # Built-in default, shown for reference — override to change it:
 # [commands.reveal]
-# type = "external"
+# type = "launch"
 # program = "open"
 # args = ["-R", "{path}"]
 
 # [commands.rename_script]
-# type = "external"
+# type = "launch"
 # program = "~/bin/rename-media"
 # args = ["{path}"]

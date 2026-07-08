@@ -53,12 +53,15 @@ pub struct Tuning {
     pub live_preview: bool,
     /// How long the selection must settle before live playback starts.
     pub live_delay_ms: f32,
-    /// Media quality — read once at startup (restart to apply). Thumb size
-    /// doubles as the atlas slot size, so higher resolution = fewer slots:
+    /// Media quality — read once at startup (restart to apply).
+    /// Thumbnails generate at exactly this size; any resolution works.
+    /// The GPU atlas is carved into fixed slots of this same size, so
+    /// bigger thumbs = fewer clips resident on the GPU at once:
     /// slots = floor(atlas_w/thumb_w) × floor(atlas_h/thumb_h).
     pub thumb_width: u32,
     pub thumb_height: u32,
-    /// ffmpeg -q:v for thumbs/sheets: 2 ≈ visually lossless, 31 = worst.
+    /// 1..10, 10 ≈ visually lossless, 1 = heavily compressed (maps to
+    /// ffmpeg -q:v 12 - q, so even 1 stays presentable).
     pub thumb_quality: u8,
     /// Anim sheet grid (frames = grid², frame size = thumb/grid). 3 = more
     /// motion, 2 = crisper frames. Startup-only.
@@ -76,6 +79,10 @@ pub struct Tuning {
     /// 0..1, how hard the filmstrip chases the selection per 60fps frame
     /// (same curve family as key_snap_strength; 0.99 ≈ instant snap).
     pub strip_snap_strength: f32,
+    /// Corner radius of filmstrip chips and border width of the selected
+    /// chip (color comes from selection_border).
+    pub strip_corner_radius: f32,
+    pub strip_border_width: f32,
     /// Quickview backdrop: black-overlay strength (0..1) and frosted-glass
     /// blur level. The grid renders offscreen and is downsampled 2^level×
     /// before drawing back — a few tiny GPU passes, only while quickview
@@ -131,7 +138,7 @@ impl Default for Tuning {
             live_delay_ms: 100.0,
             thumb_width: 640,
             thumb_height: 360,
-            thumb_quality: 5,
+            thumb_quality: 7,
             anim_grid: 3,
             atlas_width: 7680,
             atlas_height: 4320,
@@ -140,6 +147,8 @@ impl Default for Tuning {
             strip_height: 92.0,
             strip_gap: 10.0,
             strip_snap_strength: 0.12,
+            strip_corner_radius: 5.0,
+            strip_border_width: 4.0,
             quickview_dim: 0.90,
             quickview_blur: 3.0,
             anim: true,
