@@ -137,11 +137,13 @@ fn media_cmd(bin: &str) -> Command {
     Command::new(bin)
 }
 
-/// Live playback for the selected clip (PLAN.md §6 level 3): an ffmpeg
-/// child decodes to raw RGBA on stdout at native pace (`-re`), looping
-/// forever; a reader thread keeps only the latest frame. One instance at a
-/// time, killed on drop. Software decode of a single ≤640px stream is
-/// cheap; hardware decode can slot in later without changing the interface.
+/// Live playback (PLAN.md §6 level 3): an ffmpeg child decodes to raw
+/// RGBA on stdout, looping forever; the reader thread paces frames to the
+/// clip's fps and keeps only the newest. Pacing is deliberately on OUR
+/// side, not ffmpeg's `-re`: input-side readrate lets the decode pipeline
+/// burst several seconds of frames at startup (a visible fast-forward),
+/// while a sleeping reader plus pipe backpressure throttles ffmpeg
+/// exactly. Killed on drop.
 pub struct LivePlayer {
     child: std::process::Child,
     frame: Arc<Mutex<Option<Vec<u8>>>>,
@@ -152,10 +154,12 @@ pub struct LivePlayer {
 impl LivePlayer {
     /// `seek` starts playback that many seconds in — pass the thumbnail's
     /// frame time so live video continues from what the tile showed.
-    pub fn spawn(path: &Path, w: u32, h: u32, seek: f64) -> Option<Self> {
+    /// `fps` paces delivery (the clip's rate from cached meta; ~30 if
+    /// unknown).
+    pub fn spawn(path: &Path, w: u32, h: u32, seek: f64, fps: f64) -> Option<Self> {
         let (w, h) = (w.max(2), h.max(2));
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-v", "error", "-stream_loop", "-1", "-re"]);
+        cmd.args(["-v", "error", "-stream_loop", "-1"]);
         if seek > 0.05 {
             cmd.args(["-ss", &format!("{seek:.3}")]);
         }
@@ -182,13 +186,25 @@ impl LivePlayer {
         let frame = Arc::new(Mutex::new(None));
         let latest = frame.clone();
         let frame_bytes = (w * h * 4) as usize;
+        let fps = if fps.is_finite() { fps.clamp(1.0, 240.0) } else { 30.0 };
         thread::spawn(move || {
             use std::io::Read;
+            use std::time::{Duration, Instant};
             let mut buf = vec![0u8; frame_bytes];
+            let mut t0: Option<Instant> = None;
+            let mut n: u64 = 0;
             loop {
                 if stdout.read_exact(&mut buf).is_err() {
                     return; // EOF or killed
                 }
+                // Publish frame n no earlier than t0 + n/fps. Decoding
+                // slower than realtime just publishes immediately.
+                let start = *t0.get_or_insert_with(Instant::now);
+                let due = start + Duration::from_secs_f64(n as f64 / fps);
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    thread::sleep(wait);
+                }
+                n += 1;
                 *latest.lock().unwrap() = Some(buf.clone());
             }
         });
@@ -515,4 +531,58 @@ fn have_binary(name: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live playback must deliver frames at the clip's rate from the very
+    /// start — no initial burst (the fast-forward bug) and no stall.
+    #[test]
+    fn live_player_paces_frames() {
+        if !have_binary("ffmpeg") {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_pace_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("pace.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=320x180:rate=30")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0).expect("spawn");
+        // Give it a moment to open the input, then measure one second.
+        let mut first = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while first.is_none() && std::time::Instant::now() < deadline {
+            first = player.take_frame();
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(first.is_some(), "no first frame within 3s");
+
+        let t0 = std::time::Instant::now();
+        let mut frames = 0u32;
+        while t0.elapsed() < std::time::Duration::from_secs(1) {
+            if player.take_frame().is_some() {
+                frames += 1;
+            }
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // 30fps paced => ~30 frames. The burst bug delivered 90+ in the
+        // first second; a stall delivers ~0.
+        assert!(
+            (20..=45).contains(&frames),
+            "expected ~30 paced frames in 1s, got {frames}"
+        );
+    }
 }

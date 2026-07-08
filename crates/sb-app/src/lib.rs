@@ -853,10 +853,12 @@ impl Switchblade {
         // Start where the thumbnail was taken, so video continues from the
         // frame the tile already shows instead of jolting to 0:00.
         let seek = meta
+            .as_ref()
             .and_then(|m| m.duration)
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek)?;
+        let fps = meta.and_then(|m| m.fps).unwrap_or(30.0);
+        let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek, fps)?;
         log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
         Some(SelLive { clip: i, player, first_frame: None })
     }
@@ -874,11 +876,14 @@ impl Switchblade {
         let slot = self.alloc_slot(lay, SlotKind::Live)?;
         // Start where the thumbnail was taken, so video continues from
         // the frame the tile already shows instead of jolting to 0:00.
-        let seek = sb_media::cached_meta(&path)
+        let meta = sb_media::cached_meta(&path);
+        let seek = meta
+            .as_ref()
             .and_then(|m| m.duration)
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek) else {
+        let fps = meta.and_then(|m| m.fps).unwrap_or(30.0);
+        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek, fps) else {
             log::debug!("live preview failed to start: {}", path.display());
             return None;
         };
