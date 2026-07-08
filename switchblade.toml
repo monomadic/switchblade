@@ -41,9 +41,10 @@ selection_corner_radius = 10.0
 border_width = 6.0
 fade_in_ms = 220.0
 
-# Live video inside the selected tile, starting after the selection
-# settles for live_delay_ms (so flying across the grid doesn't spawn a
-# decoder per keypress).
+# Live video inside the selected/hovered tiles, starting after the
+# target settles for live_delay_ms (so flying across the grid doesn't
+# spawn a decoder per keypress). Quickview plays regardless — this only
+# controls the passive in-tile playback.
 live_preview = true
 live_delay_ms = 100.0
 
@@ -75,7 +76,7 @@ quickview_max_height = 1080
 # One full cycle takes anim_cycle_s; frames crossfade into each other for
 # anim_crossfade of each interval (0 = hard cuts). Tiles narrower than
 # anim_min_tile_w stay static. Toggle live with 'a' or start --no-anim.
-anim = true
+anim = false
 anim_cycle_s = 10.8
 anim_crossfade = 1.0
 anim_min_tile_w = 140.0

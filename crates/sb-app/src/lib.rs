@@ -63,6 +63,10 @@ struct LiveState {
     slot: usize,
     /// Set when the first frame arrives; the tile switches to video then.
     first_frame: Option<Instant>,
+    /// Where playback started (seconds) and when — approximates the
+    /// current position so quickview can take over without jumping.
+    seek: f64,
+    started: Instant,
 }
 
 /// Quickview's high-resolution decoder — frames go to the dedicated hires
@@ -757,10 +761,13 @@ impl Switchblade {
     fn update_live(&mut self, lay: &Layout, uploads: &mut Vec<ThumbUpload>) {
         let enabled = self.tuning.live_preview && !self.demo && !self.paused();
         let delay_ms = self.tuning.live_delay_ms;
-        // During quickview the modal's hires decoder replaces the tile-size
-        // selected lane.
-        let sel_target = (enabled && !self.quickview).then_some(self.selected);
-        let qv_target = (enabled && self.quickview).then_some(self.selected);
+        // The sel lane keeps running during quickview: its already-playing
+        // video fills the modal until the hires decoder's first frame.
+        let sel_target = enabled.then_some(self.selected);
+        // Quickview is an explicit "play this" — it must work even with
+        // live_preview (passive tile playback) turned off.
+        let qv_target =
+            (self.quickview && !self.demo && !self.paused()).then_some(self.selected);
         // The hover lane is suppressed during quickview (grid is hidden)
         // and when hover sits on the selected tile (that lane owns it).
         let hover_target = if enabled && !self.quickview {
@@ -864,12 +871,22 @@ impl Switchblade {
             ((sw * scale) as u32).max(2),
             ((sh * scale) as u32).max(2),
         );
-        let seek = meta
-            .and_then(|m| m.duration)
+        let duration = meta.and_then(|m| m.duration);
+        let mut seek = duration
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
+        // Take over from the tile lane's current position (start + elapsed,
+        // valid until its first loop wraps) so the handoff doesn't jump.
+        if let Some(l) = &self.live_sel {
+            if l.clip == i && l.first_frame.is_some() {
+                let pos = l.seek + l.started.elapsed().as_secs_f64();
+                if duration.is_none_or(|d| pos < d * 0.95) {
+                    seek = pos;
+                }
+            }
+        }
         let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek)?;
-        log::debug!("quickview live {dw}x{dh}: {}", path.display());
+        log::debug!("quickview live {dw}x{dh} @{seek:.1}s: {}", path.display());
         Some(QvLive { clip: i, player, first_frame: None })
     }
 
@@ -896,7 +913,14 @@ impl Switchblade {
         };
         log::debug!("live preview: {}", path.display());
         self.slots[slot] = Some((i, SlotKind::Live));
-        Some(LiveState { clip: i, player, slot, first_frame: None })
+        Some(LiveState {
+            clip: i,
+            player,
+            slot,
+            first_frame: None,
+            seek,
+            started: Instant::now(),
+        })
     }
 
     fn update_title(&mut self) {
@@ -1246,12 +1270,17 @@ impl Switchblade {
                 };
                 tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 0.82 * fade]));
 
-                // High-res video once the quickview decoder delivers;
-                // the static thumb stands in until then.
+                // Source priority: hires video once the quickview decoder
+                // delivers → the tile lane's already-playing video (media
+                // is moving the instant the modal opens) → static thumb.
                 let qv = self
                     .qv_live
                     .as_ref()
                     .filter(|q| q.clip == self.selected && q.first_frame.is_some());
+                let tile_live = self
+                    .live_sel
+                    .as_ref()
+                    .filter(|l| l.clip == self.selected && l.first_frame.is_some());
                 let src = if let Some(q) = qv {
                     let (w, h) = (q.player.w as f32, q.player.h as f32);
                     let (hw, hh) =
@@ -1262,6 +1291,9 @@ impl Switchblade {
                         h,
                         true,
                     ))
+                } else if let Some(l) = tile_live {
+                    let (w, h) = (l.player.w as f32, l.player.h as f32);
+                    Some((self.atlas_cfg.uv(l.slot, 0.0, 0.0, w, h), w, h, false))
                 } else {
                     match clip.thumb {
                         Thumb::Ready { slot, tw, th, .. } => Some((
