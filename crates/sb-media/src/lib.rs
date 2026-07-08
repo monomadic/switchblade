@@ -192,16 +192,29 @@ impl LivePlayer {
     /// `seek` starts playback that many seconds in — pass the thumbnail's
     /// frame time so live video continues from what the tile showed.
     /// `fps` paces delivery (the clip's rate from cached meta; ~30 if
-    /// unknown).
-    pub fn spawn(path: &Path, w: u32, h: u32, seek: f64, fps: f64) -> Option<Self> {
+    /// unknown). `codec` (from cached meta) gates hardware decode.
+    pub fn spawn(
+        path: &Path,
+        w: u32,
+        h: u32,
+        seek: f64,
+        fps: f64,
+        codec: Option<&str>,
+    ) -> Option<Self> {
         let (w, h) = (w.max(2), h.max(2));
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-stream_loop", "-1"]);
-        // Hardware decode where available (falls back to software with a
-        // warning for codecs VideoToolbox doesn't cover) — keeps 4K HEVC
-        // ahead of realtime, which software decode can't guarantee.
+        // Hardware decode, but only for codecs VideoToolbox actually
+        // accelerates: it keeps 4K HEVC ahead of realtime (software
+        // can't guarantee that), yet VP9/AV1 measured *slower* routed
+        // through -hwaccel videotoolbox than straight software decode —
+        // don't send them there.
         #[cfg(target_os = "macos")]
-        cmd.args(["-hwaccel", "videotoolbox"]);
+        if matches!(codec, Some("h264" | "hevc" | "h265" | "prores")) {
+            cmd.args(["-hwaccel", "videotoolbox"]);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = codec;
         if seek > 0.05 {
             cmd.args(["-ss", &format!("{seek:.3}")]);
         }
@@ -685,7 +698,7 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0).expect("spawn");
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0, Some("h264")).expect("spawn");
         // Give it a moment to open the input, then measure one second.
         let mut first = None;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -743,7 +756,7 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0).expect("spawn");
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0, Some("h264")).expect("spawn");
         // Warm without watching: the queue caps at LIVE_QUEUE_DEPTH and
         // the decoder stalls behind it.
         thread::sleep(std::time::Duration::from_millis(800));

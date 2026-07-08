@@ -79,7 +79,7 @@ quickview_max_height = 1080
 # video start are unrelated).
 strip_height = 92.0
 strip_gap = 10.0
-strip_snap_strength = 0.12
+strip_snap_strength = 0.5
 # Quickview backdrop: black dim strength (0..1) and frosted-glass blur
 # level — the grid is downsampled 2^level before drawing back, so
 # 1 = subtle, 4 = heavy frost, 0 = no blur. GPU-cheap either way.

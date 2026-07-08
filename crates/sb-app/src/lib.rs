@@ -853,16 +853,28 @@ impl Switchblade {
             None
         };
 
-        // Filmstrip pre-warm (quickview only): the neighbors' decoders run
-        // ahead of need so advancing shows video instantly.
+        // Pre-warm decoders for the four movement destinations (±1 and
+        // ±row) so a selection move shows video instantly instead of
+        // paying a cold ffmpeg spawn (~1s on 4K sources). Active in
+        // quickview and — when live_preview is on — in the grid.
         let mut warm_targets: Vec<usize> = Vec::new();
-        if base && self.quickview {
-            if self.selected > 0 {
-                warm_targets.push(self.selected - 1);
+        if base && (self.quickview || lanes) {
+            let s = self.selected;
+            let cols = lay.cols.max(1);
+            let n = self.clips.len();
+            let mut push = |i: usize| {
+                if i < n && i != s && !warm_targets.contains(&i) {
+                    warm_targets.push(i);
+                }
+            };
+            if s > 0 {
+                push(s - 1);
             }
-            if self.selected + 1 < self.clips.len() {
-                warm_targets.push(self.selected + 1);
+            push(s + 1);
+            if s >= cols {
+                push(s - cols);
             }
+            push(s + cols);
         }
 
         // Stop lanes whose target moved away. In quickview the selected
@@ -912,10 +924,20 @@ impl Switchblade {
             }
         }
         self.warm.retain(|w| warm_targets.contains(&w.clip));
-        for &i in &warm_targets {
-            if self.warm.iter().all(|w| w.clip != i) {
-                if let Some(l) = self.start_sel_live(i) {
-                    self.warm.push(l);
+        // New warm decoders spawn only once the selection has settled AND
+        // the selected stream has its first frame on screen — the clip
+        // being watched owns the CPU until then (user attention first).
+        // Promotion above never waits; this only staggers fresh spawns.
+        let sel_ready = self
+            .live_sel
+            .as_ref()
+            .is_some_and(|l| l.first_frame.is_some());
+        if sel_ready && self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms {
+            for &i in &warm_targets {
+                if self.warm.iter().all(|w| w.clip != i) {
+                    if let Some(l) = self.start_sel_live(i) {
+                        self.warm.push(l);
+                    }
                 }
             }
         }
@@ -984,8 +1006,9 @@ impl Switchblade {
             .and_then(|m| m.duration)
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        let fps = meta.and_then(|m| m.fps).unwrap_or(30.0);
-        let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek, fps)?;
+        let fps = meta.as_ref().and_then(|m| m.fps).unwrap_or(30.0);
+        let codec = meta.as_ref().and_then(|m| m.codec.as_deref());
+        let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek, fps, codec)?;
         log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
         Some(SelLive {
             clip: i,
@@ -1014,8 +1037,9 @@ impl Switchblade {
             .and_then(|m| m.duration)
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        let fps = meta.and_then(|m| m.fps).unwrap_or(30.0);
-        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek, fps) else {
+        let fps = meta.as_ref().and_then(|m| m.fps).unwrap_or(30.0);
+        let codec = meta.as_ref().and_then(|m| m.codec.as_deref());
+        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek, fps, codec) else {
             log::debug!("live preview failed to start: {}", path.display());
             return None;
         };
