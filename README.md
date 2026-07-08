@@ -5,6 +5,7 @@
 Pipe file paths in on stdin, fly around a grid of moving thumbnails, act on the clip you land on.
 
 ```sh
+switchblade ~/Clips                        # or:
 fd -e mp4 -e mov . ~/Clips | switchblade
 ```
 
@@ -78,7 +79,7 @@ See the [example config](switchblade.toml) — it documents every field.
 ## Cache
 
 Thumbnails, sprite sheets, and probed metadata live under
-`~/Library/Caches/switchblade/v1/objects/` keyed by file fingerprint
+`~/Library/Caches/switchblade.noindex/v1/objects/` keyed by file fingerprint (`.noindex` keeps Spotlight away)
 (path + size + mtime). It's plain files — inspect it, or delete it any
 time and it regenerates.
 

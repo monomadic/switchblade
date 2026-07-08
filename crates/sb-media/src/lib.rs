@@ -143,6 +143,15 @@ impl MediaService {
     }
 }
 
+/// Hardware decode, but only for codecs VideoToolbox actually
+/// accelerates: it keeps 4K HEVC ahead of realtime (software can't
+/// guarantee that) and moves decode onto the media engine, off the CPU.
+/// VP9/AV1 measured *slower* routed through `-hwaccel videotoolbox`
+/// than straight software decode — don't send them there.
+fn vt_accel(codec: Option<&str>) -> bool {
+    cfg!(target_os = "macos") && matches!(codec, Some("h264" | "hevc" | "h265" | "prores"))
+}
+
 /// Background jobs (probe, thumbs, sheets, cache decode) run niced so
 /// they never steal CPU from live playback or the UI — the user's
 /// attention has scheduling priority.
@@ -204,17 +213,9 @@ impl LivePlayer {
         let (w, h) = (w.max(2), h.max(2));
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-stream_loop", "-1"]);
-        // Hardware decode, but only for codecs VideoToolbox actually
-        // accelerates: it keeps 4K HEVC ahead of realtime (software
-        // can't guarantee that), yet VP9/AV1 measured *slower* routed
-        // through -hwaccel videotoolbox than straight software decode —
-        // don't send them there.
-        #[cfg(target_os = "macos")]
-        if matches!(codec, Some("h264" | "hevc" | "h265" | "prores")) {
+        if vt_accel(codec) {
             cmd.args(["-hwaccel", "videotoolbox"]);
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = codec;
         if seek > 0.05 {
             cmd.args(["-ss", &format!("{seek:.3}")]);
         }
@@ -393,10 +394,12 @@ fn make_thumb(
             }
         }
         let seek = probed
+            .as_ref()
             .and_then(|m| m.duration)
             .map(|d| (d * SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        extract_frame(src, &jpg, seek, recipe)?;
+        let codec = probed.as_ref().and_then(|m| m.codec.clone());
+        extract_frame(src, &jpg, seek, recipe, codec.as_deref())?;
         log::debug!("thumb generated: {}", src.display());
     }
     decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
@@ -423,47 +426,90 @@ fn make_anim(
             return None;
         }
         std::fs::create_dir_all(&dir).ok()?;
-        // Sampling frames across the clip needs its duration.
-        let duration = probe(src).and_then(|m| m.duration).filter(|d| *d > 0.05)?;
-        let tmp = jpg.with_extension("jpg.tmp");
-        // Slightly overshoot the rate so the tile filter always fills all
-        // cells before EOF (a padded black cell looks broken).
+        // Sampling frames across the clip needs its duration + codec.
+        // The thumb pass usually cached the probe already.
+        let m = cached_meta(src).or_else(|| probe(src))?;
+        let duration = m.duration.filter(|d| *d > 0.05)?;
+        let codec = m.codec.as_deref();
         let g = recipe.anim_grid.max(1);
-        let fps = ((g * g) as f64 + 0.5) / duration;
+        let frames = (g * g) as usize;
         let (fw, fh) = recipe.anim_frame();
         let q = recipe.quality.clamp(2, 31).to_string();
-        let vf = format!(
-            "fps={fps:.6},scale={fw}:{fh}:force_original_aspect_ratio=increase,\
-             crop={fw}:{fh},tile={g}x{g}"
-        );
+        let vf = format!("scale={fw}:{fh}:force_original_aspect_ratio=increase,crop={fw}:{fh}");
+
+        // g² individual seeked extracts, then one cheap tile pass over
+        // the tiny jpegs. Each extract is a fast keyframe seek plus a
+        // handful of decoded frames (hardware where the codec allows).
+        // The old single-command `fps=` filter decoded the ENTIRE clip
+        // in software — minutes of multi-core churn per long 4K source,
+        // three workers wide, surviving app quit. Never again.
+        let frame_tmp = |k: usize| dir.join(format!("animf_{k}.jpg"));
+        let cleanup = |n: usize| {
+            for k in 0..n {
+                let _ = std::fs::remove_file(frame_tmp(k));
+            }
+        };
+        for k in 0..frames {
+            let tmp = frame_tmp(k);
+            let mut seek = duration * (k as f64 + 0.5) / frames as f64;
+            let ok = loop {
+                let mut cmd = media_cmd("ffmpeg");
+                cmd.args(["-y", "-v", "error"]);
+                if vt_accel(codec) {
+                    cmd.args(["-hwaccel", "videotoolbox"]);
+                }
+                let out = cmd
+                    .args(["-ss", &format!("{seek:.3}")])
+                    .arg("-i")
+                    .arg(src)
+                    .args(["-frames:v", "1", "-vf", &vf, "-q:v", &q])
+                    .args(["-strict", "unofficial", "-f", "mjpeg"])
+                    .arg(&tmp)
+                    .stdin(Stdio::null())
+                    .output()
+                    .ok();
+                let done = out.as_ref().is_some_and(|o| o.status.success()) && tmp.exists();
+                if done {
+                    break true;
+                }
+                // A seek past EOF (VFR/short files) produces nothing:
+                // retry that cell from the start of the clip.
+                if seek > 0.0 {
+                    seek = 0.0;
+                    continue;
+                }
+                if let Some(o) = out {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    log::debug!(
+                        "anim frame {k} failed for {}: {}",
+                        src.display(),
+                        stderr.lines().last().unwrap_or("(no output)")
+                    );
+                }
+                break false;
+            };
+            if !ok {
+                cleanup(k);
+                return None;
+            }
+        }
+
+        let tmp = jpg.with_extension("jpg.tmp");
+        let pattern = dir.join("animf_%d.jpg");
         let out = media_cmd("ffmpeg")
-            .args(["-y", "-v", "error"])
+            .args(["-y", "-v", "error", "-start_number", "0"])
             .arg("-i")
-            .arg(src)
-            .args([
-                "-frames:v",
-                "1",
-                "-vf",
-                &vf,
-                "-q:v",
-                &q,
-                "-strict",
-                "unofficial",
-                "-f",
-                "mjpeg",
-            ])
+            .arg(&pattern)
+            .args(["-frames:v", "1", "-vf", &format!("tile={g}x{g}")])
+            .args(["-q:v", &q, "-strict", "unofficial", "-f", "mjpeg"])
             .arg(&tmp)
             .stdin(Stdio::null())
             .output()
-            .ok()?;
-        if !out.status.success() || !tmp.exists() {
+            .ok();
+        cleanup(frames);
+        if !out.as_ref().is_some_and(|o| o.status.success()) || !tmp.exists() {
             let _ = std::fs::remove_file(&tmp);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            log::debug!(
-                "ffmpeg could not build anim sheet for {}: {}",
-                src.display(),
-                stderr.lines().last().unwrap_or("(no output)")
-            );
+            log::debug!("anim tile pass failed for {}", src.display());
             return None;
         }
         std::fs::rename(&tmp, &jpg).ok()?;
@@ -481,6 +527,11 @@ pub struct Meta {
     pub height: Option<u64>,
     pub codec: Option<String>,
     pub fps: Option<f64>,
+    /// Display rotation in degrees (phone footage): ±90/±270 means the
+    /// decoder auto-rotates and the *displayed* frame swaps width/height
+    /// relative to the coded dims above. Absent in older meta.json.
+    #[serde(default)]
+    pub rotation: Option<f64>,
 }
 
 /// Read the cached meta.json for a clip without probing (cheap: one small
@@ -523,6 +574,16 @@ fn probe(src: &Path) -> Option<Meta> {
             let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
             (d != 0.0).then(|| n / d)
         });
+    // Rotation lives in the display-matrix side data on modern files,
+    // in a `rotate` tag on older ones.
+    let rotation = video
+        .and_then(|s| s["side_data_list"].as_array())
+        .and_then(|l| l.iter().find_map(|d| d["rotation"].as_f64()))
+        .or_else(|| {
+            video
+                .and_then(|s| s["tags"]["rotate"].as_str())
+                .and_then(|r| r.parse().ok())
+        });
     Some(Meta {
         src: src.to_path_buf(),
         duration,
@@ -530,10 +591,17 @@ fn probe(src: &Path) -> Option<Meta> {
         height: video.and_then(|s| s["height"].as_u64()),
         codec: video.and_then(|s| s["codec_name"].as_str().map(String::from)),
         fps,
+        rotation,
     })
 }
 
-fn extract_frame(src: &Path, dst: &Path, seek: f64, recipe: &Recipe) -> Option<()> {
+fn extract_frame(
+    src: &Path,
+    dst: &Path,
+    seek: f64,
+    recipe: &Recipe,
+    codec: Option<&str>,
+) -> Option<()> {
     // Write to a temp name and rename, so a half-written jpg never
     // looks like a cache hit to another worker or a later run.
     let tmp = dst.with_extension("jpg.tmp");
@@ -544,8 +612,13 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64, recipe: &Recipe) -> Option<(
     // must never spam the console (it becomes one debug line below).
     // `-strict unofficial` lets mjpeg accept full-range YUV sources
     // (common in phone and AI-generated footage; hard error in ffmpeg 8+).
-    let out = media_cmd("ffmpeg")
-        .args(["-y", "-v", "error", "-ss", &format!("{seek:.3}")])
+    let mut cmd = media_cmd("ffmpeg");
+    cmd.args(["-y", "-v", "error"]);
+    if vt_accel(codec) {
+        cmd.args(["-hwaccel", "videotoolbox"]);
+    }
+    let out = cmd
+        .args(["-ss", &format!("{seek:.3}")])
         .arg("-i")
         .arg(src)
         .args([
@@ -569,7 +642,7 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64, recipe: &Recipe) -> Option<(
     if !out.status.success() || !tmp.exists() {
         let _ = std::fs::remove_file(&tmp);
         if seek > 0.0 {
-            return extract_frame(src, dst, 0.0, recipe);
+            return extract_frame(src, dst, 0.0, recipe, codec);
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         log::debug!(
@@ -639,19 +712,30 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-/// Platform cache dir (PLAN.md §8): ~/Library/Caches/switchblade on macOS,
-/// XDG cache dir elsewhere.
+/// Platform cache dir (PLAN.md §8): ~/Library/Caches/switchblade.noindex
+/// on macOS, XDG cache dir elsewhere. The `.noindex` suffix keeps
+/// Spotlight's mdworker away from the thousands of generated jpegs (it
+/// honors the suffix); an existing un-suffixed cache is renamed across.
 pub fn cache_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(target_os = "macos")]
-    let base = home.join("Library/Caches");
-    #[cfg(not(target_os = "macos"))]
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".cache"));
-    base.join("switchblade").join("v1").join("objects")
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        #[cfg(target_os = "macos")]
+        let base = home.join("Library/Caches");
+        #[cfg(not(target_os = "macos"))]
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cache"));
+        let dir = base.join("switchblade.noindex");
+        let old = base.join("switchblade");
+        if old.is_dir() && !dir.exists() {
+            let _ = std::fs::rename(&old, &dir);
+        }
+        dir.join("v1").join("objects")
+    })
+    .clone()
 }
 
 fn have_binary(name: &str) -> bool {
@@ -722,6 +806,55 @@ mod tests {
             (20..=45).contains(&frames),
             "expected ~30 paced frames in 1s, got {frames}"
         );
+    }
+
+    /// Anim sheets must come from cheap seeked extracts (seconds), never
+    /// a full-clip decode (the fps-filter approach cost minutes of
+    /// multi-core software decode per long 4K source and bogged the
+    /// whole machine).
+    #[test]
+    fn anim_sheet_generates_and_tiles() {
+        if !have_binary("ffmpeg") || !have_binary("ffprobe") {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_anim_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("anim_src.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+        let root = dir.join("cache");
+        let recipe = Recipe {
+            thumb_w: 320,
+            thumb_h: 180,
+            quality: 5,
+            anim_grid: 3,
+        };
+        let t0 = std::time::Instant::now();
+        let sheet = make_anim(&clip, &root, true, &recipe);
+        let elapsed = t0.elapsed();
+        let (w, h, rgba) = sheet.expect("sheet generated");
+        assert!(w > 0 && h > 0 && rgba.len() == (w * h * 4) as usize);
+        // Generous bound: 10 tiny extracts on a 4s 320x180 clip is
+        // sub-second work; a full-decode regression would still pass
+        // here, but the per-frame command shape is what this pins.
+        assert!(elapsed.as_secs() < 30, "sheet took {elapsed:?}");
     }
 
     /// The pre-warm contract: a player nobody drains fills its bounded

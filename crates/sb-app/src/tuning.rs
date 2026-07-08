@@ -49,6 +49,9 @@ pub struct Tuning {
     /// Pause live playback and sheet animation while the window is
     /// unfocused (the grid stays visible, just still — big CPU saver).
     pub pause_unfocused: bool,
+    /// Walk directories given as inputs (CLI args or stdin) for video
+    /// files. Off: directories are skipped entirely. Startup-only.
+    pub recurse: bool,
     /// Live video playback inside the selected tile.
     pub live_preview: bool,
     /// How long the selection must settle before live playback starts.
@@ -134,6 +137,7 @@ impl Default for Tuning {
             zoom_smoothing: 0.35,
             zoom_fade_ms: 180.0,
             pause_unfocused: true,
+            recurse: true,
             live_preview: true,
             live_delay_ms: 100.0,
             thumb_width: 640,

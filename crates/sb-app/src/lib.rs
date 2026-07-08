@@ -99,14 +99,23 @@ struct Clip {
 }
 
 /// Startup options from the CLI (config handles everything else).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Options {
     pub anim: bool,
+    /// Paths from the CLI; when non-empty they are the input source and
+    /// stdin is ignored.
+    pub inputs: Vec<PathBuf>,
+    /// Force the fake-tile demo grid.
+    pub demo: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { anim: true }
+        Self {
+            anim: true,
+            inputs: Vec::new(),
+            demo: false,
+        }
     }
 }
 
@@ -193,16 +202,28 @@ impl Switchblade {
     }
 
     pub fn with_options(opts: Options) -> Self {
-        let rx = ingest::spawn_stdin_reader();
-        let demo = rx.is_none();
-
-        // Load config up front: atlas geometry and the media recipe are
-        // startup-only (the rest keeps hot-reloading per frame).
+        // Load config up front: atlas geometry, the media recipe, and the
+        // ingest recurse flag are startup-only (the rest keeps
+        // hot-reloading per frame).
         let mut tuning_file = TuningFile::new(PathBuf::from("switchblade.toml"));
         let (tuning, keymap) = match tuning_file.poll() {
             Some(cfg) => (cfg.tuning, cfg.keymap),
             None => (Tuning::default(), KeyMap::default()),
         };
+
+        // CLI paths beat stdin; --demo beats both; a TTY stdin with
+        // neither also falls back to the demo grid.
+        let rx = if !opts.inputs.is_empty() && !opts.demo {
+            Some(ingest::spawn_args_reader(
+                opts.inputs.clone(),
+                tuning.recurse,
+            ))
+        } else if opts.demo {
+            None
+        } else {
+            ingest::spawn_stdin_reader(tuning.recurse)
+        };
+        let demo = rx.is_none();
         let (slot_w, slot_h) = (
             tuning.thumb_width.clamp(64, 2048),
             tuning.thumb_height.clamp(36, 2048),
@@ -1007,10 +1028,21 @@ impl Switchblade {
             _ => return None,
         };
         let meta = sb_media::cached_meta(&path);
-        let (sw, sh) = meta
+        let (mut sw, mut sh) = meta
             .as_ref()
             .and_then(|m| Some((m.width? as f32, m.height? as f32)))
             .unwrap_or((tw as f32 * 4.0, th as f32 * 4.0));
+        // Phone footage stores portrait as landscape + a rotation tag;
+        // the decoder auto-rotates, so a 90°/270° clip comes out with
+        // width/height swapped versus the probed dims. Match that or
+        // the scale filter stretches portrait back to landscape.
+        if meta
+            .as_ref()
+            .and_then(|m| m.rotation)
+            .is_some_and(|r| ((r / 90.0).round() as i64) % 2 != 0)
+        {
+            std::mem::swap(&mut sw, &mut sh);
+        }
         let (bw, bh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
         let scale = (bw / sw).min(bh / sh).min(1.0);
         let (dw, dh) = (((sw * scale) as u32).max(2), ((sh * scale) as u32).max(2));

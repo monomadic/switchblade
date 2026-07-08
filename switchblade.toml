@@ -53,6 +53,11 @@ live_delay_ms = 100.0
 # runtime with 'p'.
 pause_unfocused = true
 
+# Directories given as inputs (CLI args or piped in) are walked for
+# video files when true, skipped entirely when false. Non-video files
+# never show either way. Startup-only.
+recurse = true
+
 # ── Media quality (read at startup — restart to apply) ─────────────────
 # Thumbnails are generated at exactly thumb_width x thumb_height — any
 # resolution works, nothing needs to be a multiple of anything. The GPU
