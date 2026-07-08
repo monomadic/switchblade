@@ -19,7 +19,7 @@ Built for VJs picking clips mid-set, creators sorting AI-generated footage, and 
 - **Cached thumbnails** — one frame per clip (ffmpeg) in a content-addressed sidecar cache; a relaunch over the same library is instant. Your media files are never written to.
 - **Animated thumbnails** — a sprite sheet of frames sampled across each clip; tiles cycle with per-clip phase offsets and shader crossfade. Toggle with `a`.
 - **Live playback in-tile** — the selected and hovered clips play real (silent, looping) video inside their tiles, seek-matched to the thumbnail's frame so nothing jumps.
-- **Quickview** — `Space` (or click the selection): the grid dims and the clip plays large and centered. Arrows keep browsing without closing it.
+- **Quickview** — `Space` (or click the selection): the grid dims and the clip plays large and centered at natural resolution (up to 1080p, configurable). Arrows keep browsing without closing it.
 - **Pinch zoom** — tile size scales, columns reflow with a crossfade. `-`/`=`/`0` on the keyboard.
 - **Keymap** — bind any non-movement key to internal actions or external commands with `{path}`/`{dir}`/`{name}` templates: open in mpv, reveal in Finder, run your renamer script, push to a VJ tool.
 - **Hot-tunable feel** — every motion constant (springs, gaps, scales, fades) lives in `switchblade.toml` and reloads within 250ms while the app runs.

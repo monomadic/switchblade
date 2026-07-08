@@ -5,7 +5,7 @@ GPU-rendered video clip picker: "fzf for videos". Pipe paths in on stdin, fly a 
 **[PLAN.md](PLAN.md) is the source of truth** for scope, milestones, and every design decision. Read the relevant section before structural changes; don't re-litigate settled decisions (torus deferral, filesystem cache over SQLite, animated thumbs as MVP v2, etc.) without the user.
 
 ## Status
-- **Done:** M0–M6 (see PLAN.md §14) plus the internal quickview (M5's "later" form): `Space` or clicking the selection opens a dimmed modal playing the clip; any click / Esc / Space closes; arrows browse without leaving it.
+- **Done:** M0–M6 (see PLAN.md §14) plus the internal quickview (M5's "later" form): `Space` or clicking the selection opens a dimmed modal playing the clip **at natural resolution** — a dedicated hires texture beside the atlas (`quickview_max_width/height`, default 1080p cap, never upscaling past the source), fed by its own decoder lane (`QvLive`, replaces the tile-size selected lane while open). Any click / Esc / Space closes; arrows browse without leaving it.
 - **Media pipeline:** ffmpeg/ffprobe workers behind a **two-priority queue** (visible statics always beat anim sheets) → sidecar cache under `~/Library/Caches/switchblade/v1/objects/<fp>/` (artifacts named by recipe, e.g. `thumb_fit_640x360_q5.jpg`, `anim_3x3_640x360_q5.jpg` + `meta.json`) → decoded to RGBA **via ffmpeg** (not the image crate — keeps thumb and live-video color math identical; the image crate is header-dims only) → runtime-sized GPU atlas (`AtlasCfg`, from `thumb_width/height` + `atlas_width/height` tuning, startup-only).
 - **Live playback:** two lanes (selected + hovered), each an ffmpeg child → raw RGBA → a never-evicted atlas slot; starts after `live_delay_ms` of target rest, seek-matched to the thumbnail's frame (10% duration via cached meta), killed on move.
 - **Slot budget & eviction classes:** statics claim budget center-out, anims get the remainder; eviction order = out-of-zone anims → out-of-zone statics → in-zone anims; never in-zone statics or live slots.
@@ -13,7 +13,7 @@ GPU-rendered video clip picker: "fzf for videos". Pipe paths in on stdin, fly a 
 - **Perf:** idle render throttling — app returns `Frame.animating`; the loop drops to a 100ms tick when false (~2% core), wakes on input. `a` / `--no-anim` toggles sheet animation (generation is skipped entirely when off).
 - **Emphasized tiles never show anim sheets** (tiny crop-fill frames zoom badly under the morph and live lands on different content) — static thumb until live arrives.
 - **Focus pause:** losing window focus stops live lanes + sheet cycling (grid stays, still) and lets the idle throttle engage; `pause_unfocused` config (default true), `p` toggles at runtime.
-- **Next:** M7 search/filter, full-resolution quickview (needs a dedicated texture beside the atlas), hardware decode for live lanes.
+- **Next:** M7 search/filter, hardware decode for live lanes (`-hwaccel videotoolbox`), quickview scrub/seek.
 
 ## Build & run
 ```sh

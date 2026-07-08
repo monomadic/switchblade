@@ -10,6 +10,7 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var hires: texture_2d<f32>;
 
 struct Inst {
     @location(0) pos: vec2<f32>,
@@ -22,6 +23,7 @@ struct Inst {
     @location(7) frame_fade: f32,
     @location(8) uv: vec4<f32>,
     @location(9) uv2: vec4<f32>,
+    @location(10) tex_source: f32,
 };
 
 struct VsOut {
@@ -36,6 +38,7 @@ struct VsOut {
     @location(7) frame_fade: f32,
     @location(8) uv: vec4<f32>,
     @location(9) uv2: vec4<f32>,
+    @location(10) tex_source: f32,
 };
 
 @vertex
@@ -63,6 +66,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     out.frame_fade = inst.frame_fade;
     out.uv = inst.uv;
     out.uv2 = inst.uv2;
+    out.tex_source = inst.tex_source;
     return out;
 }
 
@@ -78,7 +82,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Two taps let anim-sheet frames crossfade (frame_fade blends uv→uv2).
     let tex_a = textureSample(atlas, samp, in.uv.xy + frac * in.uv.zw);
     let tex_b = textureSample(atlas, samp, in.uv2.xy + frac * in.uv2.zw);
-    let tex = mix(tex_a, tex_b, clamp(in.frame_fade, 0.0, 1.0));
+    let tex_h = textureSample(hires, samp, in.uv.xy + frac * in.uv.zw);
+    let tex_lo = mix(tex_a, tex_b, clamp(in.frame_fade, 0.0, 1.0));
+    let tex = mix(tex_lo, tex_h, clamp(in.tex_source, 0.0, 1.0));
     let use_tex = select(0.0, clamp(in.tex_mix, 0.0, 1.0), in.uv.z > 0.0);
 
     let p = in.local - in.size * 0.5;

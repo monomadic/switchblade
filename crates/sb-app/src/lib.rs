@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use sb_media::{MediaService, Recipe, ThumbResult};
 use sb_window::{
-    App, AtlasCfg, Frame, InputEvent, Key, ThumbUpload, Tile, Viewport, WindowCommand,
+    App, AtlasCfg, Frame, HiresFrame, InputEvent, Key, ThumbUpload, Tile, Viewport,
+    WindowCommand,
 };
 
 use commands::{Action, KeyMap};
@@ -64,6 +65,14 @@ struct LiveState {
     first_frame: Option<Instant>,
 }
 
+/// Quickview's high-resolution decoder — frames go to the dedicated hires
+/// texture, not an atlas slot.
+struct QvLive {
+    clip: usize,
+    player: sb_media::LivePlayer,
+    first_frame: Option<Instant>,
+}
+
 struct Clip {
     path: PathBuf,
     readable: bool,
@@ -107,6 +116,9 @@ pub struct Switchblade {
     /// get one, started once their target settles for live_delay_ms.
     live_sel: Option<LiveState>,
     live_hover: Option<LiveState>,
+    qv_live: Option<QvLive>,
+    /// The newest hires frame this tick, routed to Frame.hires_upload.
+    hires_frame: Option<HiresFrame>,
     sel_changed_at: Instant,
     hover_changed_at: Instant,
     demo: bool,
@@ -183,6 +195,8 @@ impl Switchblade {
             slot_h,
             cols: (tuning.atlas_width.min(8192) / slot_w).max(1),
             rows: (tuning.atlas_height.min(8192) / slot_h).max(1),
+            hires_w: tuning.quickview_max_width.clamp(320, 4096),
+            hires_h: tuning.quickview_max_height.clamp(180, 4096),
         };
         log::info!(
             "atlas: {}x{} slots of {slot_w}x{slot_h} ({} MB)",
@@ -206,6 +220,8 @@ impl Switchblade {
             slots: vec![None; atlas_cfg.slots()],
             live_sel: None,
             live_hover: None,
+            qv_live: None,
+            hires_frame: None,
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
@@ -741,7 +757,10 @@ impl Switchblade {
     fn update_live(&mut self, lay: &Layout, uploads: &mut Vec<ThumbUpload>) {
         let enabled = self.tuning.live_preview && !self.demo && !self.paused();
         let delay_ms = self.tuning.live_delay_ms;
-        let sel_target = enabled.then_some(self.selected);
+        // During quickview the modal's hires decoder replaces the tile-size
+        // selected lane.
+        let sel_target = (enabled && !self.quickview).then_some(self.selected);
+        let qv_target = (enabled && self.quickview).then_some(self.selected);
         // The hover lane is suppressed during quickview (grid is hidden)
         // and when hover sits on the selected tile (that lane owns it).
         let hover_target = if enabled && !self.quickview {
@@ -797,6 +816,61 @@ impl Switchblade {
                 }
             }
         }
+
+        // Quickview hires lane: no settle delay (opening is deliberate),
+        // no atlas slot — frames go to the dedicated hires texture.
+        if let Some(q) = &self.qv_live {
+            if qv_target != Some(q.clip) {
+                self.qv_live = None;
+            }
+        }
+        if self.qv_live.is_none() {
+            if let Some(i) = qv_target {
+                self.qv_live = self.start_qv_live(i);
+            }
+        }
+        if let Some(q) = &mut self.qv_live {
+            if let Some(rgba) = q.player.take_frame() {
+                if q.first_frame.is_none() {
+                    q.first_frame = Some(Instant::now());
+                }
+                self.hires_frame = Some(HiresFrame {
+                    w: q.player.w,
+                    h: q.player.h,
+                    rgba,
+                });
+            }
+        }
+    }
+
+    /// Quickview decoder: natural resolution, capped at the hires texture
+    /// (and never upscaled past the source when its dimensions are known).
+    fn start_qv_live(&mut self, i: usize) -> Option<QvLive> {
+        let clip = self.clips.get(i)?;
+        let (tw, th, path) = match clip.thumb {
+            Thumb::Ready { tw, th, .. } if clip.readable && !clip.cloud => {
+                (tw, th, clip.path.clone())
+            }
+            _ => return None,
+        };
+        let meta = sb_media::cached_meta(&path);
+        let (sw, sh) = meta
+            .as_ref()
+            .and_then(|m| Some((m.width? as f32, m.height? as f32)))
+            .unwrap_or((tw as f32 * 4.0, th as f32 * 4.0));
+        let (bw, bh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
+        let scale = (bw / sw).min(bh / sh).min(1.0);
+        let (dw, dh) = (
+            ((sw * scale) as u32).max(2),
+            ((sh * scale) as u32).max(2),
+        );
+        let seek = meta
+            .and_then(|m| m.duration)
+            .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
+            .unwrap_or(0.0);
+        let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek)?;
+        log::debug!("quickview live {dw}x{dh}: {}", path.display());
+        Some(QvLive { clip: i, player, first_frame: None })
     }
 
     fn start_live(&mut self, lay: &Layout, i: usize) -> Option<LiveState> {
@@ -1058,6 +1132,7 @@ impl Switchblade {
                     uv2,
                     frame_fade,
                     tex_mix: mix,
+                    hires: false,
                 };
                 let out = if selected {
                     &mut selected_group
@@ -1112,6 +1187,7 @@ impl Switchblade {
                     uv2: [0.0; 4],
                     frame_fade: 0.0,
                     tex_mix: 0.0,
+                    hires: false,
                 };
                 tiles.push(bar(bx, bw, 0.10)); // track
                 tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
@@ -1166,19 +1242,38 @@ impl Switchblade {
                     uv2: [0.0; 4],
                     frame_fade: 0.0,
                     tex_mix: 0.0,
+                    hires: false,
                 };
                 tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 0.82 * fade]));
 
-                let mut src = match clip.thumb {
-                    Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
-                    _ => None,
-                };
-                if let Some(l) = &self.live_sel {
-                    if l.clip == self.selected && l.first_frame.is_some() {
-                        src = Some((l.slot, l.player.w as f32, l.player.h as f32));
+                // High-res video once the quickview decoder delivers;
+                // the static thumb stands in until then.
+                let qv = self
+                    .qv_live
+                    .as_ref()
+                    .filter(|q| q.clip == self.selected && q.first_frame.is_some());
+                let src = if let Some(q) = qv {
+                    let (w, h) = (q.player.w as f32, q.player.h as f32);
+                    let (hw, hh) =
+                        (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
+                    Some((
+                        [0.5 / hw, 0.5 / hh, (w - 1.0) / hw, (h - 1.0) / hh],
+                        w,
+                        h,
+                        true,
+                    ))
+                } else {
+                    match clip.thumb {
+                        Thumb::Ready { slot, tw, th, .. } => Some((
+                            self.atlas_cfg.uv(slot, 0.0, 0.0, tw as f32, th as f32),
+                            tw as f32,
+                            th as f32,
+                            false,
+                        )),
+                        _ => None,
                     }
-                }
-                if let Some((slot, tw, th)) = src {
+                };
+                if let Some((uv, tw, th, hires)) = src {
                     let a = tw / th.max(1.0);
                     let (mut w, mut h) = (vw * 0.86, vh * 0.86);
                     if a > w / h {
@@ -1195,10 +1290,11 @@ impl Switchblade {
                         border_color: [0.0; 4],
                         corner_radius: t.selection_corner_radius,
                         border_width: 0.0,
-                        uv: self.atlas_cfg.uv(slot, 0.0, 0.0, tw, th),
+                        uv,
                         uv2: [0.0; 4],
                         frame_fade: 0.0,
                         tex_mix: fade,
+                        hires,
                     });
                 } else {
                     // Nothing decoded yet: big dots in the middle.
@@ -1208,7 +1304,13 @@ impl Switchblade {
             }
         }
 
-        Frame { clear: t.background, tiles, uploads: Vec::new(), animating: true }
+        Frame {
+            clear: t.background,
+            tiles,
+            uploads: Vec::new(),
+            hires_upload: None,
+            animating: true,
+        }
     }
 }
 
@@ -1276,6 +1378,7 @@ impl App for Switchblade {
         self.update_title();
         let mut frame = self.build_frame();
         frame.uploads = uploads;
+        frame.hires_upload = self.hires_frame.take();
         // Idle throttling: with nothing in motion — springs settled, no
         // sheets cycling (e.g. animation toggled off), no live video, no
         // background jobs, stdin closed — the loop drops to a slow tick.
@@ -1284,6 +1387,7 @@ impl App for Switchblade {
             || self.transition.is_some()
             || self.live_sel.is_some()
             || self.live_hover.is_some()
+            || self.qv_live.is_some()
             || self.jobs_total > 0
             || self.rx.is_some()
             || Instant::now() < self.wake_until;
@@ -1314,6 +1418,7 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
         uv2: [0.0; 4],
         frame_fade: 0.0,
         tex_mix: 0.0,
+        hires: false,
     };
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
     out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
@@ -1353,6 +1458,7 @@ fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: b
             uv2: [0.0; 4],
             frame_fade: 0.0,
             tex_mix: 0.0,
+            hires: false,
         });
     }
 }

@@ -66,6 +66,10 @@ pub struct Tuning {
     /// Atlas texture dimensions (VRAM ≈ w×h×4 bytes). Clamped to 8192.
     pub atlas_width: u32,
     pub atlas_height: u32,
+    /// Quickview decodes at up to this size (capped at the source's own
+    /// resolution). Startup-only; higher = sharper modal, more decode CPU.
+    pub quickview_max_width: u32,
+    pub quickview_max_height: u32,
     /// Animated thumbnails in the grid (M6 sprite sheets).
     pub anim: bool,
     /// Seconds for one full pass through an anim sheet's frames.
@@ -119,6 +123,8 @@ impl Default for Tuning {
             anim_grid: 3,
             atlas_width: 7680,
             atlas_height: 4320,
+            quickview_max_width: 1920,
+            quickview_max_height: 1080,
             anim: true,
             anim_cycle_s: 2.8,
             anim_crossfade: 0.35,

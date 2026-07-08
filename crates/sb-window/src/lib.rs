@@ -66,6 +66,10 @@ pub struct AtlasCfg {
     pub slot_h: u32,
     pub cols: u32,
     pub rows: u32,
+    /// Dedicated high-resolution texture beside the atlas (quickview
+    /// playback); tiles opt into it via [`Tile::hires`].
+    pub hires_w: u32,
+    pub hires_h: u32,
 }
 
 impl AtlasCfg {
@@ -106,6 +110,14 @@ pub struct ThumbUpload {
     pub rgba: Vec<u8>,
 }
 
+/// Pixels for the high-res texture (top-left anchored, `w × h ≤ hires
+/// dims`). One producer at a time — the quickview player.
+pub struct HiresFrame {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
+
 /// One tile to draw. Position/size in logical pixels, origin top-left.
 /// Later tiles draw on top of earlier ones.
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +139,9 @@ pub struct Tile {
     pub frame_fade: f32,
     /// 0..1 crossfade from placeholder color to texture.
     pub tex_mix: f32,
+    /// Sample the high-res texture instead of the atlas (`uv` is then
+    /// normalized against the hires dims).
+    pub hires: bool,
 }
 
 /// Everything the renderer needs for one frame.
@@ -134,6 +149,7 @@ pub struct Frame {
     pub clear: [f32; 3],
     pub tiles: Vec<Tile>,
     pub uploads: Vec<ThumbUpload>,
+    pub hires_upload: Option<HiresFrame>,
     /// False when nothing on screen is in motion: the loop drops to a
     /// slow idle tick instead of redrawing every vsync.
     pub animating: bool,

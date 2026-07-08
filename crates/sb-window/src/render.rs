@@ -24,6 +24,8 @@ struct Instance {
     frame_fade: f32,
     uv: [f32; 4],
     uv2: [f32; 4],
+    tex_source: f32,
+    _pad: [f32; 3],
 }
 
 pub struct Gpu {
@@ -35,6 +37,7 @@ pub struct Gpu {
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     atlas: wgpu::Texture,
+    hires: wgpu::Texture,
     atlas_cfg: AtlasCfg,
     instances: wgpu::Buffer,
     instance_capacity: usize,
@@ -103,6 +106,22 @@ impl Gpu {
             view_formats: &[],
         });
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let hires = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("hires (quickview)"),
+            size: wgpu::Extent3d {
+                width: atlas_cfg.hires_w.max(2),
+                height: atlas_cfg.hires_h.max(2),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let hires_view = hires.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("thumb sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -141,6 +160,16 @@ impl Gpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -158,6 +187,10 @@ impl Gpu {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&hires_view),
                 },
             ],
         });
@@ -182,6 +215,7 @@ impl Gpu {
                 7 => Float32,
                 8 => Float32x4,
                 9 => Float32x4,
+                10 => Float32,
             ],
         };
 
@@ -223,6 +257,7 @@ impl Gpu {
             uniforms,
             bind_group,
             atlas,
+            hires,
             atlas_cfg,
             instances,
             instance_capacity,
@@ -282,6 +317,37 @@ impl Gpu {
         );
     }
 
+    fn upload_hires(&self, hf: &crate::HiresFrame) {
+        let ok = hf.w >= 1
+            && hf.w <= self.atlas_cfg.hires_w
+            && hf.h >= 1
+            && hf.h <= self.atlas_cfg.hires_h
+            && hf.rgba.len() == (hf.w * hf.h * 4) as usize;
+        if !ok {
+            log::warn!("bad hires upload: {}x{}, {} bytes", hf.w, hf.h, hf.rgba.len());
+            return;
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.hires,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &hf.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(hf.w * 4),
+                rows_per_image: Some(hf.h),
+            },
+            wgpu::Extent3d {
+                width: hf.w,
+                height: hf.h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -294,6 +360,9 @@ impl Gpu {
     pub fn render(&mut self, frame: &Frame, viewport: Viewport) {
         for up in &frame.uploads {
             self.upload_thumb(up);
+        }
+        if let Some(hf) = &frame.hires_upload {
+            self.upload_hires(hf);
         }
 
         let data: Vec<Instance> = frame
@@ -310,6 +379,8 @@ impl Gpu {
                 frame_fade: t.frame_fade,
                 uv: t.uv,
                 uv2: t.uv2,
+                tex_source: t.hires as u8 as f32,
+                _pad: [0.0; 3],
             })
             .collect();
 
