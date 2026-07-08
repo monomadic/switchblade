@@ -73,6 +73,10 @@ atlas_height = 4320
 # with zero skip. Higher = sharper + more decode CPU while selected.
 quickview_max_width = 1920
 quickview_max_height = 1080
+# Quickview filmstrip: chip height (16:9) and spacing. The strip slides
+# with the same chase curve as keyboard grid moves (key_snap_strength).
+strip_height = 92.0
+strip_gap = 10.0
 
 # Animated thumbnails (sprite sheets, 9 frames sampled across each clip).
 # One full cycle takes anim_cycle_s; frames crossfade into each other for

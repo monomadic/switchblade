@@ -132,6 +132,9 @@ pub struct Switchblade {
     /// Internal fullscreen-ish preview of the selected clip.
     quickview: bool,
     quickview_at: Instant,
+    /// Filmstrip slide position (in clip-index units), springing toward
+    /// the selected index with the keyboard chase curve.
+    strip_pos: f32,
     /// Background job counters for the progress indicator.
     jobs_total: u64,
     jobs_done: u64,
@@ -231,6 +234,7 @@ impl Switchblade {
             atlas_cfg,
             quickview: false,
             quickview_at: Instant::now(),
+            strip_pos: 0.0,
             jobs_total: 0,
             jobs_done: 0,
             jobs_finished_at: None,
@@ -422,6 +426,7 @@ impl Switchblade {
                 self.quickview = !self.quickview;
                 if self.quickview {
                     self.quickview_at = Instant::now();
+                    self.strip_pos = self.selected as f32;
                 }
             }
             Action::CopyPath => {
@@ -576,6 +581,40 @@ impl Switchblade {
             clip.emph += (e_target - clip.emph) * a;
         }
         self.motion = motion;
+
+        // Quickview filmstrip slides with the same curve as keyboard moves.
+        if self.quickview {
+            let target = self.selected as f32;
+            self.strip_pos += (target - self.strip_pos) * alpha(t.key_snap_strength, dt);
+            if (target - self.strip_pos).abs() > 0.001 {
+                self.motion = true;
+            }
+        }
+    }
+
+    /// Filmstrip geometry: chip width/height and the strip's top y.
+    fn strip_geom(&self) -> (f32, f32, f32) {
+        let ch = self.tuning.strip_height.max(24.0);
+        let cw = ch * 16.0 / 9.0;
+        (cw, ch, self.viewport.height - ch - 22.0)
+    }
+
+    /// Which filmstrip chip is under (x, y), if any.
+    fn strip_chip_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.quickview || self.clips.is_empty() {
+            return None;
+        }
+        let (cw, ch, sy) = self.strip_geom();
+        if y < sy - 8.0 || y > sy + ch + 8.0 {
+            return None;
+        }
+        let step = cw + self.tuning.strip_gap;
+        let rel = (x - self.viewport.width * 0.5) / step + self.strip_pos;
+        let i = rel.round();
+        if i < 0.0 || i as usize >= self.clips.len() {
+            return None;
+        }
+        ((rel - i).abs() * step <= cw * 0.5).then_some(i as usize)
     }
 
     /// Rows currently on screen, extended by `margin` prefetch rows.
@@ -662,8 +701,11 @@ impl Switchblade {
                 ThumbResult::Ready { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else { continue };
                     let Some(slot) = self.alloc_slot(lay, SlotKind::Static) else {
+                        // Atlas momentarily full: drop the pixels but stay
+                        // retryable — the disk cache makes the redo cheap.
+                        // (A Failed latch here permanently "lost" thumbs.)
                         log::debug!("static dropped, atlas full: {}", path.display());
-                        self.clips[i].thumb = Thumb::Failed;
+                        self.clips[i].thumb = Thumb::None;
                         continue;
                     };
                     log::debug!("static ready: clip {i} -> slot {slot} ({w}x{h})");
@@ -682,7 +724,7 @@ impl Switchblade {
                     let Some(&i) = self.index.get(&path) else { continue };
                     let Some(slot) = self.alloc_slot(lay, SlotKind::Anim) else {
                         log::debug!("anim dropped, atlas full: {}", path.display());
-                        self.clips[i].anim = Thumb::Failed;
+                        self.clips[i].anim = Thumb::None;
                         continue;
                     };
                     log::debug!("anim ready: clip {i} -> slot {slot} ({w}x{h})");
@@ -1286,9 +1328,12 @@ impl Switchblade {
                         _ => None,
                     }
                 };
+                // The video sits above the filmstrip.
+                let (chip_w, chip_h, strip_y) = self.strip_geom();
+                let avail_h = (strip_y - 18.0).max(60.0);
                 if let Some((uv, tw, th, hires)) = src {
                     let a = tw / th.max(1.0);
-                    let (mut w, mut h) = (vw * 0.86, vh * 0.86);
+                    let (mut w, mut h) = (vw * 0.88, avail_h * 0.92);
                     if a > w / h {
                         h = w / a;
                     } else {
@@ -1296,7 +1341,7 @@ impl Switchblade {
                     }
                     tiles.push(Tile {
                         x: (vw - w) * 0.5,
-                        y: (vh - h) * 0.5,
+                        y: (avail_h - h) * 0.5 + 6.0,
                         w,
                         h,
                         color: [0.0, 0.0, 0.0, fade],
@@ -1311,8 +1356,72 @@ impl Switchblade {
                     });
                 } else {
                     // Nothing decoded yet: big dots in the middle.
-                    let stage = full((vw - 300.0) * 0.5, (vh - 100.0) * 0.5, 300.0, 100.0, [0.0; 4]);
+                    let stage =
+                        full((vw - 300.0) * 0.5, (avail_h - 100.0) * 0.5, 300.0, 100.0, [0.0; 4]);
                     push_loading_dots(&mut tiles, &stage, fade, anim_t, true);
+                }
+
+                // Filmstrip: neighbors along the bottom, selected centered,
+                // sliding on the keyboard chase spring. Foreground layer —
+                // in quickview, actions live here; the grid is backdrop.
+                let step = chip_w + t.strip_gap;
+                let half = (vw / step) as i64 / 2 + 1;
+                let center = self.strip_pos;
+                for di in -half..=half {
+                    let idx = center.round() as i64 + di;
+                    if idx < 0 || idx as usize >= self.clips.len() {
+                        continue;
+                    }
+                    let i = idx as usize;
+                    let c = &self.clips[i];
+                    let sel = i == self.selected;
+                    let s = if sel { 1.10 } else { 1.0 };
+                    let (w, h) = (chip_w * s, chip_h * s);
+                    let cx = vw * 0.5 + (i as f32 - center) * step;
+                    let (uv, has_tex) = match c.thumb {
+                        Thumb::Ready { slot, tw, th, .. } => {
+                            let (tw, th) = (tw as f32, th as f32);
+                            let target_a = 16.0 / 9.0;
+                            let (mut cw, mut ch) = (tw, th);
+                            if tw / th > target_a {
+                                cw = th * target_a;
+                            } else {
+                                ch = tw / target_a;
+                            }
+                            (
+                                self.atlas_cfg.uv(
+                                    slot,
+                                    (tw - cw) * 0.5,
+                                    (th - ch) * 0.5,
+                                    cw,
+                                    ch,
+                                ),
+                                true,
+                            )
+                        }
+                        _ => ([0.0; 4], false),
+                    };
+                    let sb = t.selection_border;
+                    let (border_color, border_width) = if sel {
+                        ([sb[0], sb[1], sb[2], fade], t.border_width * 0.7)
+                    } else {
+                        ([0.30, 0.30, 0.34, 0.55 * fade], 1.0)
+                    };
+                    tiles.push(Tile {
+                        x: cx - w * 0.5,
+                        y: strip_y + (chip_h - h) * 0.5,
+                        w,
+                        h,
+                        color: [0.03, 0.03, 0.04, fade],
+                        border_color,
+                        corner_radius: t.corner_radius,
+                        border_width,
+                        uv,
+                        uv2: [0.0; 4],
+                        frame_fade: 0.0,
+                        tex_mix: if has_tex { fade } else { 0.0 },
+                        hires: false,
+                    });
                 }
             }
         }
@@ -1356,10 +1465,19 @@ impl App for Switchblade {
                 self.focused = focused;
             }
             InputEvent::MouseDown { x, y } => {
-                // Any click closes quickview; a click on the already-
-                // selected chip opens it.
+                // In quickview: clicking a filmstrip chip selects it;
+                // anywhere else closes. In the grid: click selects, click
+                // on the selection opens quickview.
                 if self.quickview {
-                    self.quickview = false;
+                    if let Some(i) = self.strip_chip_at(x, y) {
+                        if i != self.selected {
+                            self.selected = i;
+                            self.sel_changed_at = Instant::now();
+                            self.scroll_to_selected();
+                        }
+                    } else {
+                        self.quickview = false;
+                    }
                     return;
                 }
                 let lay = self.layout();
@@ -1367,6 +1485,7 @@ impl App for Switchblade {
                     if i == self.selected {
                         self.quickview = true;
                         self.quickview_at = Instant::now();
+                        self.strip_pos = self.selected as f32;
                     } else {
                         self.selected = i;
                         self.sel_changed_at = Instant::now();

@@ -147,6 +147,9 @@ fn media_cmd(bin: &str) -> Command {
 pub struct LivePlayer {
     child: std::process::Child,
     frame: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Tells the reader to restart its pacing clock (set on unpark, so a
+    /// resumed stream doesn't burst to catch up on frozen time).
+    reset_clock: Arc<std::sync::atomic::AtomicBool>,
     pub w: u32,
     pub h: u32,
 }
@@ -185,10 +188,13 @@ impl LivePlayer {
         let mut stdout = child.stdout.take()?;
         let frame = Arc::new(Mutex::new(None));
         let latest = frame.clone();
+        let reset_clock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reset = reset_clock.clone();
         let frame_bytes = (w * h * 4) as usize;
         let fps = if fps.is_finite() { fps.clamp(1.0, 240.0) } else { 30.0 };
         thread::spawn(move || {
             use std::io::Read;
+            use std::sync::atomic::Ordering;
             use std::time::{Duration, Instant};
             let mut buf = vec![0u8; frame_bytes];
             let mut t0: Option<Instant> = None;
@@ -196,6 +202,12 @@ impl LivePlayer {
             loop {
                 if stdout.read_exact(&mut buf).is_err() {
                     return; // EOF or killed
+                }
+                if reset.swap(false, Ordering::Relaxed) {
+                    // Resumed from a park: restart the pacing clock so we
+                    // don't fast-forward to catch up on frozen time.
+                    t0 = Some(Instant::now());
+                    n = 0;
                 }
                 // Publish frame n no earlier than t0 + n/fps. Decoding
                 // slower than realtime just publishes immediately.
@@ -208,7 +220,26 @@ impl LivePlayer {
                 *latest.lock().unwrap() = Some(buf.clone());
             }
         });
-        Some(Self { child, frame, w, h })
+        Some(Self { child, frame, reset_clock, w, h })
+    }
+
+    /// Freeze/resume the decoder in place (SIGSTOP/SIGCONT) — cheaper than
+    /// killing and respawning for short pauses, and playback resumes where
+    /// it left off. No-op on non-unix.
+    pub fn set_parked(&self, parked: bool) {
+        #[cfg(unix)]
+        {
+            let sig = if parked { libc::SIGSTOP } else { libc::SIGCONT };
+            unsafe {
+                libc::kill(self.child.id() as libc::pid_t, sig);
+            }
+            if !parked {
+                self.reset_clock
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = parked;
     }
 
     /// The newest decoded frame, if one arrived since the last call.

@@ -1638,6 +1638,7 @@ name = "sb-media"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "log",
  "serde",
  "serde_json",

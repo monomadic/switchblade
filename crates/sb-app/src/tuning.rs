@@ -70,6 +70,10 @@ pub struct Tuning {
     /// resolution). Startup-only; higher = sharper modal, more decode CPU.
     pub quickview_max_width: u32,
     pub quickview_max_height: u32,
+    /// Height of the quickview filmstrip chips (16:9); the strip slides
+    /// with the same chase curve as keyboard grid moves.
+    pub strip_height: f32,
+    pub strip_gap: f32,
     /// Animated thumbnails in the grid (M6 sprite sheets).
     pub anim: bool,
     /// Seconds for one full pass through an anim sheet's frames.
@@ -125,6 +129,8 @@ impl Default for Tuning {
             atlas_height: 4320,
             quickview_max_width: 1920,
             quickview_max_height: 1080,
+            strip_height: 92.0,
+            strip_gap: 10.0,
             anim: true,
             anim_cycle_s: 2.8,
             anim_crossfade: 0.35,
