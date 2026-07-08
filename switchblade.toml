@@ -67,8 +67,10 @@ thumb_quality = 5
 anim_grid = 3
 atlas_width = 7680
 atlas_height = 4320
-# Quickview decodes at up to this size (never above the source's own
-# resolution). Higher = sharper modal, more decode CPU while it's open.
+# The selected clip decodes ONCE at up to this size (never above the
+# source's own resolution): the tile shows it downscaled (mipmapped) and
+# quickview shows the same stream big — so quickview opens instantly
+# with zero skip. Higher = sharper + more decode CPU while selected.
 quickview_max_width = 1920
 quickview_max_height = 1080
 

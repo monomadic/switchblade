@@ -123,6 +123,20 @@ impl MediaService {
     }
 }
 
+/// Background jobs (probe, thumbs, sheets, cache decode) run niced so
+/// they never steal CPU from live playback or the UI — the user's
+/// attention has scheduling priority.
+fn media_cmd(bin: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let mut c = Command::new("nice");
+        c.arg("-n").arg("10").arg(bin);
+        c
+    }
+    #[cfg(not(unix))]
+    Command::new(bin)
+}
+
 /// Live playback for the selected clip (PLAN.md §6 level 3): an ffmpeg
 /// child decodes to raw RGBA on stdout at native pace (`-re`), looping
 /// forever; a reader thread keeps only the latest frame. One instance at a
@@ -302,7 +316,7 @@ fn make_anim(
             "fps={fps:.6},scale={fw}:{fh}:force_original_aspect_ratio=increase,\
              crop={fw}:{fh},tile={g}x{g}"
         );
-        let out = Command::new("ffmpeg")
+        let out = media_cmd("ffmpeg")
             .args(["-y", "-v", "error"])
             .arg("-i")
             .arg(src)
@@ -348,7 +362,7 @@ pub fn cached_meta(path: &Path) -> Option<Meta> {
 }
 
 fn probe(src: &Path) -> Option<Meta> {
-    let out = Command::new("ffprobe")
+    let out = media_cmd("ffprobe")
         .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
         .arg(src)
         .stdin(Stdio::null())
@@ -392,7 +406,7 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64, recipe: &Recipe) -> Option<(
     // must never spam the console (it becomes one debug line below).
     // `-strict unofficial` lets mjpeg accept full-range YUV sources
     // (common in phone and AI-generated footage; hard error in ffmpeg 8+).
-    let out = Command::new("ffmpeg")
+    let out = media_cmd("ffmpeg")
         .args(["-y", "-v", "error", "-ss", &format!("{seek:.3}")])
         .arg("-i")
         .arg(src)
@@ -432,7 +446,7 @@ fn decode_jpeg(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>
     if w == 0 || h == 0 {
         return None;
     }
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = media_cmd("ffmpeg");
     cmd.args(["-v", "error"]).arg("-i").arg(path);
     if w > max_w || h > max_h {
         // Oversized (foreign/stale artifact): scale down, keep aspect.
