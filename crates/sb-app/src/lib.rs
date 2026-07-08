@@ -76,6 +76,7 @@ struct LiveState {
 struct SelLive {
     clip: usize,
     player: sb_media::LivePlayer,
+    spawned: Instant,
     first_frame: Option<Instant>,
 }
 
@@ -610,7 +611,7 @@ impl Switchblade {
         // Quickview filmstrip slides with the same curve as keyboard moves.
         if self.quickview {
             let target = self.selected as f32;
-            self.strip_pos += (target - self.strip_pos) * alpha(t.key_snap_strength, dt);
+            self.strip_pos += (target - self.strip_pos) * alpha(t.strip_snap_strength, dt);
             if (target - self.strip_pos).abs() > 0.001 {
                 self.motion = true;
             }
@@ -877,7 +878,6 @@ impl Switchblade {
                 self.warm.push(l);
             }
         }
-        self.warm.retain(|w| warm_targets.contains(&w.clip));
         if let Some(l) = &self.live_hover {
             if hover_target != Some(l.clip) {
                 let slot = l.slot;
@@ -890,10 +890,20 @@ impl Switchblade {
         // delay — the user's explicit action goes to the forefront — and
         // promotes a pre-warmed neighbor when one is ready: its queue
         // already holds due frames, so the video shows this same tick.
+        // Promotion MUST happen before the warm pool is pruned: the pool
+        // is keyed by the new selection's neighbors, which never include
+        // the selection itself — pruning first would kill the very decoder
+        // that was warmed for this moment (the bug that made every advance
+        // pay full ffmpeg spawn latency).
         if self.live_sel.is_none() {
             if let Some(i) = sel_target {
                 if let Some(pos) = self.warm.iter().position(|w| w.clip == i) {
-                    self.live_sel = Some(self.warm.remove(pos));
+                    let l = self.warm.remove(pos);
+                    log::debug!(
+                        "promoted warm decoder for clip {i} ({} frames buffered)",
+                        l.player.buffered()
+                    );
+                    self.live_sel = Some(l);
                 } else if self.quickview
                     || self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
                 {
@@ -901,6 +911,7 @@ impl Switchblade {
                 }
             }
         }
+        self.warm.retain(|w| warm_targets.contains(&w.clip));
         for &i in &warm_targets {
             if self.warm.iter().all(|w| w.clip != i) {
                 if let Some(l) = self.start_sel_live(i) {
@@ -933,6 +944,11 @@ impl Switchblade {
             if let Some(rgba) = live.player.take_frame() {
                 if live.first_frame.is_none() {
                     live.first_frame = Some(Instant::now());
+                    log::debug!(
+                        "sel live clip {} first frame {:.0}ms after spawn",
+                        live.clip,
+                        live.spawned.elapsed().as_secs_f32() * 1000.0
+                    );
                 }
                 self.hires_frame = Some(HiresFrame {
                     w: live.player.w,
@@ -974,6 +990,7 @@ impl Switchblade {
         Some(SelLive {
             clip: i,
             player,
+            spawned: Instant::now(),
             first_frame: None,
         })
     }

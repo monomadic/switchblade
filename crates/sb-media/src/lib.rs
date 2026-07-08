@@ -285,6 +285,11 @@ impl LivePlayer {
         let _ = parked;
     }
 
+    /// Frames currently queued (decoded, waiting for their due times).
+    pub fn buffered(&self) -> usize {
+        self.queue.frames.lock().unwrap().len()
+    }
+
     /// The newest frame that's due for presentation, if any. Earlier
     /// overdue frames are dropped; frames still ahead of their time stay
     /// queued — calling this every render tick paces playback on the

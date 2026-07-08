@@ -70,10 +70,12 @@ pub struct Tuning {
     /// resolution). Startup-only; higher = sharper modal, more decode CPU.
     pub quickview_max_width: u32,
     pub quickview_max_height: u32,
-    /// Height of the quickview filmstrip chips (16:9); the strip slides
-    /// with the same chase curve as keyboard grid moves.
+    /// Height of the quickview filmstrip chips (16:9).
     pub strip_height: f32,
     pub strip_gap: f32,
+    /// 0..1, how hard the filmstrip chases the selection per 60fps frame
+    /// (same curve family as key_snap_strength; 0.99 ≈ instant snap).
+    pub strip_snap_strength: f32,
     /// Quickview backdrop: black-overlay strength (0..1) and frosted-glass
     /// blur level. The grid renders offscreen and is downsampled 2^level×
     /// before drawing back — a few tiny GPU passes, only while quickview
@@ -137,6 +139,7 @@ impl Default for Tuning {
             quickview_max_height: 1080,
             strip_height: 92.0,
             strip_gap: 10.0,
+            strip_snap_strength: 0.12,
             quickview_dim: 0.90,
             quickview_blur: 3.0,
             anim: true,
