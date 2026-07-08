@@ -12,6 +12,9 @@ KEYS (defaults; remappable via [keys]/[commands] in ./switchblade.toml):
     Enter / o       open selected clip (mpv)
     Space           quickview: in-app preview (Esc closes, arrows browse)
     c               copy path
+    r               reveal in Finder
+    a               toggle animated thumbnails
+    p               toggle pause-when-unfocused
     - / = / 0       zoom out / in / reset (also trackpad pinch)
     f               fullscreen
     q               quit

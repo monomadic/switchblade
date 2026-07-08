@@ -12,7 +12,8 @@ GPU-rendered video clip picker: "fzf for videos". Pipe paths in on stdin, fly a 
 - **Grid feel:** per-clip scale + emphasis springs (hover and keyboard ride the same morph: grid crop-fill → true-aspect cover, UV crop derives from live shape); anim sheets cycle by UV window with per-clip phase and shader crossfade (`anim_crossfade`, second UV per instance); reflow crossfade on zoom/resize; loading dots + cloud badges + background-jobs progress bar are all just extra tiles.
 - **Perf:** idle render throttling — app returns `Frame.animating`; the loop drops to a 100ms tick when false (~2% core), wakes on input. `a` / `--no-anim` toggles sheet animation (generation is skipped entirely when off).
 - **Emphasized tiles never show anim sheets** (tiny crop-fill frames zoom badly under the morph and live lands on different content) — static thumb until live arrives.
-- **Next:** M7 search/filter, full-resolution quickview (needs a dedicated texture beside the atlas), hardware decode for live lanes, pause-live-on-unfocus.
+- **Focus pause:** losing window focus stops live lanes + sheet cycling (grid stays, still) and lets the idle throttle engage; `pause_unfocused` config (default true), `p` toggles at runtime.
+- **Next:** M7 search/filter, full-resolution quickview (needs a dedicated texture beside the atlas), hardware decode for live lanes.
 
 ## Build & run
 ```sh
@@ -20,7 +21,7 @@ cargo run                          # demo mode: 480 fake tiles (stdin is a TTY)
 fd -e mp4 -e mov . ~/Clips | cargo run    # real paths, streamed
 RUST_LOG=debug cargo run           # more logging
 ```
-Keys: `hjkl`/arrows move selection (reserved, not remappable; horizontal moves are linear — row-end wraps to the next row) · `Enter`/`o` open in mpv · `Space` internal quickview · `c` copy path · `a` toggle anim · `f` fullscreen · `-`/`=`/`0` zoom · `q` quit. All non-movement keys remappable via `[keys]`/`[commands]` in `switchblade.toml` (external programs with `{path}`/`{dir}`/`{name}` templates, or internal actions — see `commands.rs` for the list). Trackpad pans without changing selection; pinch zooms; click selects; clicking the selection quickviews. iCloud placeholder files get a blue tile + cloud badge and are never read.
+Keys: `hjkl`/arrows move selection (reserved, not remappable; horizontal moves are linear — row-end wraps to the next row) · `Enter`/`o` open in mpv · `Space` internal quickview · `c` copy path · `r` reveal in Finder · `a` toggle anim · `p` toggle focus-pause · `f` fullscreen · `-`/`=`/`0` zoom · `q` quit. All non-movement keys remappable via `[keys]`/`[commands]` in `switchblade.toml` (external programs with `{path}`/`{dir}`/`{name}` templates, or internal actions — see `commands.rs` for the list). Trackpad pans without changing selection; pinch zooms; click selects; clicking the selection quickviews. iCloud placeholder files get a blue tile + cloud badge and are never read.
 
 ## Layout
 - `src/main.rs` — thin entrypoint.

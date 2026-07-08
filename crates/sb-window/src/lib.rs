@@ -39,6 +39,8 @@ pub enum InputEvent {
     Pinch { delta: f32 },
     CursorMoved { x: f32, y: f32 },
     MouseDown { x: f32, y: f32 },
+    /// Window gained/lost focus (drives pause-when-unfocused).
+    Focus { focused: bool },
 }
 
 /// Requests the app makes of the window layer.
@@ -231,6 +233,7 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 | WindowEvent::CursorMoved { .. }
                 | WindowEvent::MouseInput { .. }
                 | WindowEvent::Resized(_)
+                | WindowEvent::Focused(_)
         ) {
             self.animating = true;
         }
@@ -273,6 +276,9 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
             WindowEvent::PinchGesture { delta, .. } => {
                 self.app.event(InputEvent::Pinch { delta: delta as f32 });
+            }
+            WindowEvent::Focused(focused) => {
+                self.app.event(InputEvent::Focus { focused });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f32>(self.scale());

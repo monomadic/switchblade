@@ -37,6 +37,7 @@ pub enum Action {
     ZoomOut,
     ZoomReset,
     ToggleAnim,
+    ToggleFocusPause,
     Quickview,
 }
 
@@ -61,6 +62,8 @@ impl Default for KeyMap {
             ("+", "zoom_in"),
             ("0", "zoom_reset"),
             ("a", "toggle_anim"),
+            ("p", "toggle_focus_pause"),
+            ("r", "reveal"),
         ] {
             keys.insert(k.to_string(), v.to_string());
         }
@@ -89,6 +92,15 @@ impl Default for KeyMap {
                 ]
                 .map(String::from)
                 .to_vec(),
+            },
+        );
+        // Reveal in Finder — like "open", just another external command;
+        // remap or replace it freely (macOS default).
+        commands.insert(
+            "reveal".to_string(),
+            CommandSpec::External {
+                program: "open".to_string(),
+                args: vec!["-R".to_string(), "{path}".to_string()],
             },
         );
         Self { keys, commands }
@@ -141,6 +153,7 @@ fn internal_action(name: &str) -> Option<Action> {
         "zoom_out" => Action::ZoomOut,
         "zoom_reset" => Action::ZoomReset,
         "toggle_anim" => Action::ToggleAnim,
+        "toggle_focus_pause" => Action::ToggleFocusPause,
         "quickview" => Action::Quickview,
         other => {
             log::warn!("unknown command '{other}': no [commands.{other}] entry and not a built-in action");

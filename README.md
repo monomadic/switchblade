@@ -24,7 +24,7 @@ Built for VJs picking clips mid-set, creators sorting AI-generated footage, and 
 - **Keymap** — bind any non-movement key to internal actions or external commands with `{path}`/`{dir}`/`{name}` templates: open in mpv, reveal in Finder, run your renamer script, push to a VJ tool.
 - **Hot-tunable feel** — every motion constant (springs, gaps, scales, fades) lives in `switchblade.toml` and reloads within 250ms while the app runs.
 - **iCloud-aware** — placeholder (not-downloaded) files get a cloud badge and are never force-downloaded.
-- **Cheap when still** — the render loop idles at ~2% of a core when nothing is animating.
+- **Cheap when still** — the render loop idles at ~2% of a core when nothing is animating, and playback/animation pause automatically while the window is unfocused (configurable).
 
 ## Requirements
 
@@ -50,7 +50,9 @@ switchblade --help # options, including --no-anim
 | `Enter` / `o` | open in mpv |
 | `Space` | quickview (internal preview; `Esc`/`Space`/click closes, arrows browse) |
 | `c` | copy path |
+| `r` | reveal in Finder |
 | `a` | toggle animated thumbnails |
+| `p` | toggle pause-when-unfocused |
 | `-` / `=` / `0` | zoom out / in / reset (also trackpad pinch) |
 | `f` | fullscreen |
 | `q` | quit |

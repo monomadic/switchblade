@@ -112,6 +112,9 @@ pub struct Switchblade {
     demo: bool,
     /// Runtime animation toggle (`a` key / --no-anim), ANDed with tuning.anim.
     anim_on: bool,
+    /// Window focus state + the runtime toggle for pause-when-unfocused.
+    focused: bool,
+    focus_pause_on: bool,
     anim_grid: u32,
     atlas_cfg: AtlasCfg,
     /// Internal fullscreen-ish preview of the selected clip.
@@ -207,6 +210,8 @@ impl Switchblade {
             hover_changed_at: Instant::now(),
             demo,
             anim_on: opts.anim,
+            focused: true,
+            focus_pause_on: true,
             anim_grid,
             atlas_cfg,
             quickview: false,
@@ -391,6 +396,13 @@ impl Switchblade {
                     if self.anim_on { "on" } else { "off" }
                 );
             }
+            Action::ToggleFocusPause => {
+                self.focus_pause_on = !self.focus_pause_on;
+                log::info!(
+                    "pause-when-unfocused {}",
+                    if self.focus_pause_on { "on" } else { "off" }
+                );
+            }
             Action::Quickview => {
                 self.quickview = !self.quickview;
                 if self.quickview {
@@ -414,6 +426,12 @@ impl Switchblade {
                 }
             }
         }
+    }
+
+    /// True while animation/live playback should rest because the window
+    /// lost focus (default on; `p` toggles, `pause_unfocused` configures).
+    fn paused(&self) -> bool {
+        !self.focused && self.tuning.pause_unfocused && self.focus_pause_on
     }
 
     /// Keep the render loop awake for at least `secs` (covers fades and
@@ -721,7 +739,7 @@ impl Switchblade {
     /// starts once its target settles, stops the moment it moves, and
     /// pumps the newest decoded frame into a never-evicted atlas slot.
     fn update_live(&mut self, lay: &Layout, uploads: &mut Vec<ThumbUpload>) {
-        let enabled = self.tuning.live_preview && !self.demo;
+        let enabled = self.tuning.live_preview && !self.demo && !self.paused();
         let delay_ms = self.tuning.live_delay_ms;
         let sel_target = enabled.then_some(self.selected);
         // The hover lane is suppressed during quickview (grid is hidden)
@@ -921,7 +939,7 @@ impl Switchblade {
                 // true aspect, and live video (seek-matched to the static
                 // thumb's frame) would land on different content. The
                 // emphasis morph itself keeps the tile alive until then.
-                let anim_allowed = t.anim && self.anim_on && !emphasized;
+                let anim_allowed = t.anim && self.anim_on && !emphasized && !self.paused();
                 let anim = if anim_allowed {
                     match clip.anim {
                         Thumb::Ready { slot, at, tw, th } => {
@@ -1218,6 +1236,9 @@ impl App for Switchblade {
             }
             InputEvent::CursorMoved { x, y } => {
                 self.cursor = (x, y);
+            }
+            InputEvent::Focus { focused } => {
+                self.focused = focused;
             }
             InputEvent::MouseDown { x, y } => {
                 // Any click closes quickview; a click on the already-

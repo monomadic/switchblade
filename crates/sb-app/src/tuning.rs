@@ -46,6 +46,9 @@ pub struct Tuning {
     pub zoom_smoothing: f32,
     /// Crossfade duration when the column count reflows (Photos-style).
     pub zoom_fade_ms: f32,
+    /// Pause live playback and sheet animation while the window is
+    /// unfocused (the grid stays visible, just still — big CPU saver).
+    pub pause_unfocused: bool,
     /// Live video playback inside the selected tile.
     pub live_preview: bool,
     /// How long the selection must settle before live playback starts.
@@ -107,6 +110,7 @@ impl Default for Tuning {
             zoom_max: 3.0,
             zoom_smoothing: 0.35,
             zoom_fade_ms: 180.0,
+            pause_unfocused: true,
             live_preview: true,
             live_delay_ms: 100.0,
             thumb_width: 640,
