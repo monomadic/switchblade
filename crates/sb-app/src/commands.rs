@@ -156,7 +156,9 @@ fn internal_action(name: &str) -> Option<Action> {
         "toggle_focus_pause" => Action::ToggleFocusPause,
         "quickview" => Action::Quickview,
         other => {
-            log::warn!("unknown command '{other}': no [commands.{other}] entry and not a built-in action");
+            log::warn!(
+                "unknown command '{other}': no [commands.{other}] entry and not a built-in action"
+            );
             return None;
         }
     })
@@ -210,7 +212,10 @@ pub fn copy_path(path: &Path) {
         }
     }
     #[cfg(not(target_os = "macos"))]
-    log::warn!("copy_path is not implemented on this platform ({})", path.display());
+    log::warn!(
+        "copy_path is not implemented on this platform ({})",
+        path.display()
+    );
 }
 
 fn expand_template(arg: &str, path: &Path) -> String {
@@ -246,13 +251,19 @@ mod tests {
         let p = PathBuf::from("/clips/sub/take one.mp4");
         assert_eq!(expand_template("{path}", &p), "/clips/sub/take one.mp4");
         assert_eq!(expand_template("{dir}", &p), "/clips/sub");
-        assert_eq!(expand_template("--title={name}", &p), "--title=take one.mp4");
+        assert_eq!(
+            expand_template("--title={name}", &p),
+            "--title=take one.mp4"
+        );
     }
 
     #[test]
     fn defaults_resolve() {
         let map = KeyMap::default();
-        assert!(matches!(map.action_for(&Key::Char('q')), Some(Action::Quit)));
+        assert!(matches!(
+            map.action_for(&Key::Char('q')),
+            Some(Action::Quit)
+        ));
         assert!(matches!(
             map.action_for(&Key::Enter),
             Some(Action::Spawn { ref program, .. }) if program == "mpv"
@@ -277,6 +288,9 @@ mod tests {
             Some(Action::Spawn { ref program, .. }) if program == "open"
         ));
         // Untouched defaults survive the merge.
-        assert!(matches!(map.action_for(&Key::Char('q')), Some(Action::Quit)));
+        assert!(matches!(
+            map.action_for(&Key::Char('q')),
+            Some(Action::Quit)
+        ));
     }
 }

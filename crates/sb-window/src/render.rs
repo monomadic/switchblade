@@ -73,6 +73,87 @@ pub struct Gpu {
     atlas_cfg: AtlasCfg,
     instances: wgpu::Buffer,
     instance_capacity: usize,
+    sampler: wgpu::Sampler,
+    blit_bgl: wgpu::BindGroupLayout,
+    /// Downsample blit targeting the surface format (backdrop mips).
+    backdrop_pipeline: wgpu::RenderPipeline,
+    /// Fullscreen draw of a backdrop mip, faded in via the blend constant.
+    present_pipeline: wgpu::RenderPipeline,
+    backdrop: Backdrop,
+}
+
+/// Offscreen copy of the grid layer plus its downsample chain — mip N is
+/// the frosted image the quickview backdrop samples. Window-sized;
+/// rebuilt on resize.
+struct Backdrop {
+    views: Vec<wgpu::TextureView>,
+    /// Sample mip i-1 while rendering mip i.
+    down_bgs: Vec<wgpu::BindGroup>,
+    /// Sample mip i for the fullscreen blurred layer.
+    present_bgs: Vec<wgpu::BindGroup>,
+}
+
+/// Deepest backdrop downsample (level 4 = 1/16 resolution).
+const BACKDROP_MIP_LEVELS: u32 = 5;
+
+impl Backdrop {
+    fn new(
+        device: &wgpu::Device,
+        blit_bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let (w, h) = (width.max(2), height.max(2));
+        let mips = (32 - w.max(h).leading_zeros()).min(BACKDROP_MIP_LEVELS);
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("quickview backdrop"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let views: Vec<wgpu::TextureView> = (0..mips)
+            .map(|i| {
+                tex.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: i,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let bg = |view: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("backdrop mip"),
+                layout: blit_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            })
+        };
+        let down_bgs = (1..mips as usize).map(|i| bg(&views[i - 1])).collect();
+        let present_bgs = (0..mips as usize).map(|i| bg(&views[i])).collect();
+        Self {
+            views,
+            down_bgs,
+            present_bgs,
+        }
+    }
 }
 
 impl Gpu {
@@ -139,8 +220,13 @@ impl Gpu {
         });
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let hires_mips = (32 - atlas_cfg.hires_w.max(atlas_cfg.hires_h).max(2).leading_zeros())
-            .min(HIRES_MIP_LEVELS);
+        let hires_mips = (32
+            - atlas_cfg
+                .hires_w
+                .max(atlas_cfg.hires_h)
+                .max(2)
+                .leading_zeros())
+        .min(HIRES_MIP_LEVELS);
         let hires = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("hires (selected stream / quickview)"),
             size: wgpu::Extent3d {
@@ -367,6 +453,77 @@ impl Gpu {
             })
             .collect();
 
+        // Backdrop blur: the same blit shader as the hires mips, but
+        // targeting the surface format — one pipeline to fill the
+        // downsample chain, one (blend-constant faded) to draw the blurred
+        // layer back fullscreen.
+        let backdrop_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("backdrop mip blit"),
+            layout: Some(&blit_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let fade_blend = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Constant,
+            dst_factor: wgpu::BlendFactor::OneMinusConstant,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let present_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("backdrop present"),
+            layout: Some(&blit_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: fade_blend,
+                        alpha: fade_blend,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let backdrop = Backdrop::new(
+            &device,
+            &blit_bgl,
+            &sampler,
+            config.format,
+            config.width,
+            config.height,
+        );
+
         let instance_capacity = 1024;
         let instances = Self::make_instance_buffer(&device, instance_capacity);
 
@@ -386,6 +543,11 @@ impl Gpu {
             atlas_cfg,
             instances,
             instance_capacity,
+            sampler,
+            blit_bgl,
+            backdrop_pipeline,
+            present_pipeline,
+            backdrop,
         })
     }
 
@@ -449,7 +611,12 @@ impl Gpu {
             && hf.h <= self.atlas_cfg.hires_h
             && hf.rgba.len() == (hf.w * hf.h * 4) as usize;
         if !ok {
-            log::warn!("bad hires upload: {}x{}, {} bytes", hf.w, hf.h, hf.rgba.len());
+            log::warn!(
+                "bad hires upload: {}x{}, {} bytes",
+                hf.w,
+                hf.h,
+                hf.rgba.len()
+            );
             return false;
         }
         self.queue.write_texture(
@@ -481,6 +648,14 @@ impl Gpu {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.backdrop = Backdrop::new(
+            &self.device,
+            &self.blit_bgl,
+            &self.sampler,
+            self.config.format,
+            width,
+            height,
+        );
     }
 
     pub fn render(&mut self, frame: &Frame, viewport: Viewport) {
@@ -545,7 +720,9 @@ impl Gpu {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         // Refresh the hires mip chain after a video-frame upload (queued
         // writes land before this command buffer executes).
         if hires_dirty {
@@ -566,6 +743,62 @@ impl Gpu {
                 });
                 pass.set_pipeline(&self.blit_pipeline);
                 pass.set_bind_group(0, &self.hires_mip_bgs[i - 1], &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        // Frosted backdrop: render the grid layer offscreen, walk it down
+        // the mip chain, then (in the main pass) draw the blurred mip back
+        // fullscreen between the grid and the overlay tiles.
+        let blur = frame
+            .blur
+            .filter(|b| b.split > 0 && b.split <= data.len() && b.levels > 0 && b.fade > 0.0);
+        let blur = blur.map(|b| {
+            let level = (b.levels as usize).min(self.backdrop.views.len() - 1);
+            (b.split as u32, level, b.fade.min(1.0) as f64)
+        });
+        if let Some((split, level, _)) = blur {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("backdrop grid"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.backdrop.views[0],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: frame.clear[0] as f64,
+                                g: frame.clear[1] as f64,
+                                b: frame.clear[2] as f64,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.instances.slice(..));
+                pass.draw(0..6, 0..split);
+            }
+            for i in 1..=level {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("backdrop mip"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.backdrop.views[i],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.backdrop_pipeline);
+                pass.set_bind_group(0, &self.backdrop.down_bgs[i - 1], &[]);
                 pass.draw(0..3, 0..1);
             }
         }
@@ -592,7 +825,26 @@ impl Gpu {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..));
-            pass.draw(0..6, 0..data.len() as u32);
+            match blur {
+                Some((split, level, fade)) => {
+                    // Sharp grid (visible while the blur fades in), the
+                    // blurred layer over it, then the overlay tiles.
+                    pass.draw(0..6, 0..split);
+                    pass.set_pipeline(&self.present_pipeline);
+                    pass.set_bind_group(0, &self.backdrop.present_bgs[level], &[]);
+                    pass.set_blend_constant(wgpu::Color {
+                        r: fade,
+                        g: fade,
+                        b: fade,
+                        a: fade,
+                    });
+                    pass.draw(0..3, 0..1);
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.draw(0..6, split..data.len() as u32);
+                }
+                None => pass.draw(0..6, 0..data.len() as u32),
+            }
         }
         self.queue.submit([encoder.finish()]);
         surface_tex.present();

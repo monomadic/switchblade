@@ -32,15 +32,31 @@ pub enum Key {
 /// Normalized input events. Coordinates and deltas are in logical pixels.
 #[derive(Debug, Clone, Copy)]
 pub enum InputEvent {
-    Key { key: Key, repeat: bool },
+    Key {
+        key: Key,
+        repeat: bool,
+    },
     /// Trackpad / mouse wheel scroll.
-    Scroll { dx: f32, dy: f32 },
+    Scroll {
+        dx: f32,
+        dy: f32,
+    },
     /// Trackpad pinch; positive delta = fingers spreading (zoom in).
-    Pinch { delta: f32 },
-    CursorMoved { x: f32, y: f32 },
-    MouseDown { x: f32, y: f32 },
+    Pinch {
+        delta: f32,
+    },
+    CursorMoved {
+        x: f32,
+        y: f32,
+    },
+    MouseDown {
+        x: f32,
+        y: f32,
+    },
     /// Window gained/lost focus (drives pause-when-unfocused).
-    Focus { focused: bool },
+    Focus {
+        focused: bool,
+    },
 }
 
 /// Requests the app makes of the window layer.
@@ -95,7 +111,12 @@ impl AtlasCfg {
         let (aw, ah) = (self.tex_w() as f32, self.tex_h() as f32);
         let x = col * self.slot_w as f32 + ox + 0.5;
         let y = row * self.slot_h as f32 + oy + 0.5;
-        [x / aw, y / ah, (tw - 1.0).max(0.0) / aw, (th - 1.0).max(0.0) / ah]
+        [
+            x / aw,
+            y / ah,
+            (tw - 1.0).max(0.0) / aw,
+            (th - 1.0).max(0.0) / ah,
+        ]
     }
 }
 
@@ -144,12 +165,26 @@ pub struct Tile {
     pub hires: bool,
 }
 
+/// Frosted-glass backdrop: `tiles[..split]` also render offscreen, get
+/// downsampled `levels` times, and the blurred result draws fullscreen
+/// (blended in at `fade`) beneath `tiles[split..]`.
+#[derive(Debug, Clone, Copy)]
+pub struct Blur {
+    pub split: usize,
+    /// Downsample count: each level halves the resolution (softer blur).
+    pub levels: u32,
+    /// 0..1 blend of the blurred layer over the sharp one.
+    pub fade: f32,
+}
+
 /// Everything the renderer needs for one frame.
 pub struct Frame {
     pub clear: [f32; 3],
     pub tiles: Vec<Tile>,
     pub uploads: Vec<ThumbUpload>,
     pub hires_upload: Option<HiresFrame>,
+    /// Blur the tiles below `split` (quickview's grid backdrop).
+    pub blur: Option<Blur>,
     /// False when nothing on screen is in motion: the loop drops to a
     /// slow idle tick instead of redrawing every vsync.
     pub animating: bool,
@@ -276,7 +311,10 @@ impl<A: App> ApplicationHandler for Runner<A> {
                     _ => None,
                 };
                 if let Some(key) = key {
-                    self.app.event(InputEvent::Key { key, repeat: event.repeat });
+                    self.app.event(InputEvent::Key {
+                        key,
+                        repeat: event.repeat,
+                    });
                     self.apply_commands(event_loop);
                 }
             }
@@ -291,7 +329,9 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 self.app.event(InputEvent::Scroll { dx, dy });
             }
             WindowEvent::PinchGesture { delta, .. } => {
-                self.app.event(InputEvent::Pinch { delta: delta as f32 });
+                self.app.event(InputEvent::Pinch {
+                    delta: delta as f32,
+                });
             }
             WindowEvent::Focused(focused) => {
                 self.app.event(InputEvent::Focus { focused });

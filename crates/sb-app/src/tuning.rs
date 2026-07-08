@@ -74,6 +74,12 @@ pub struct Tuning {
     /// with the same chase curve as keyboard grid moves.
     pub strip_height: f32,
     pub strip_gap: f32,
+    /// Quickview backdrop: black-overlay strength (0..1) and frosted-glass
+    /// blur level. The grid renders offscreen and is downsampled 2^level×
+    /// before drawing back — a few tiny GPU passes, only while quickview
+    /// is open. 0 = no blur, 1..4 = progressively softer.
+    pub quickview_dim: f32,
+    pub quickview_blur: f32,
     /// Animated thumbnails in the grid (M6 sprite sheets).
     pub anim: bool,
     /// Seconds for one full pass through an anim sheet's frames.
@@ -131,6 +137,8 @@ impl Default for Tuning {
             quickview_max_height: 1080,
             strip_height: 92.0,
             strip_gap: 10.0,
+            quickview_dim: 0.90,
+            quickview_blur: 3.0,
             anim: true,
             anim_cycle_s: 2.8,
             anim_crossfade: 0.35,
@@ -183,7 +191,9 @@ impl TuningFile {
             return None;
         }
         self.last_check = Instant::now();
-        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
         if mtime == self.last_mtime {
             return None;
         }

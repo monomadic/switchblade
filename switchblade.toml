@@ -8,10 +8,10 @@
 # Width:height sets the aspect ratio (240:135 = 16:9).
 tile_width = 240.0
 tile_height = 135.0
-gap = 2.0
+gap = 0.5
 
 # Scroll delta multiplier; negative flips direction if pan feels inverted.
-pan_sensitivity = 1.0
+pan_sensitivity = 2.0
 # Extra inertia (0 = off). macOS trackpads already send momentum events,
 # so leave at 0 there or flicks will double-glide.
 pan_inertia = 0.0
@@ -36,10 +36,10 @@ selection_scale = 1.15
 selection_zoom_boost = 0.35
 hover_scale = 1.06
 
-corner_radius = 5.0
-selection_corner_radius = 10.0
-border_width = 6.0
-fade_in_ms = 220.0
+corner_radius = 0.0
+selection_corner_radius = 20.0
+border_width = 2.0
+fade_in_ms = 20.0
 
 # Live video inside the selected/hovered tiles, starting after the
 # target settles for live_delay_ms (so flying across the grid doesn't
@@ -77,6 +77,12 @@ quickview_max_height = 1080
 # with the same chase curve as keyboard grid moves (key_snap_strength).
 strip_height = 92.0
 strip_gap = 10.0
+# Quickview backdrop: black dim strength (0..1) and frosted-glass blur
+# level — the grid is downsampled 2^level before drawing back, so
+# 1 = subtle, 4 = heavy frost, 0 = no blur. GPU-cheap either way.
+# (Both hot-reload.)
+quickview_dim = 0.90
+quickview_blur = 3.0
 
 # Animated thumbnails (sprite sheets, 9 frames sampled across each clip).
 # One full cycle takes anim_cycle_s; frames crossfade into each other for
@@ -92,7 +98,7 @@ anim_min_tile_w = 140.0
 # sides. 1.5 also gently crops 16:9; set 1.78 to leave landscape untouched.
 max_display_aspect = 1.5
 selection_border = [0.0, 0.0, 0.0]
-hover_border = [1.0, 1.0, 1.0]
+hover_border = [0.0, 0.0, 0.0]
 # Thin outline for tiles that have no thumbnail yet (fill is transparent).
 empty_border = [0.10, 0.10, 0.13]
 background = [0.004, 0.004, 0.006]

@@ -75,7 +75,11 @@ fn send_path(
     let meta = std::fs::metadata(&path);
     let cloud = is_cloud_placeholder(&path, meta.as_ref().ok());
     let readable = meta.is_ok();
-    tx.send(Ingested { path, readable, cloud })
+    tx.send(Ingested {
+        path,
+        readable,
+        cloud,
+    })
 }
 
 /// Detect iCloud placeholders: APFS dataless files (evicted by

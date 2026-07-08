@@ -33,11 +33,17 @@ pub struct Recipe {
 
 impl Recipe {
     fn thumb_file(&self) -> String {
-        format!("thumb_fit_{}x{}_q{}.jpg", self.thumb_w, self.thumb_h, self.quality)
+        format!(
+            "thumb_fit_{}x{}_q{}.jpg",
+            self.thumb_w, self.thumb_h, self.quality
+        )
     }
     fn anim_file(&self) -> String {
         let g = self.anim_grid;
-        format!("anim_{g}x{g}_{}x{}_q{}.jpg", self.thumb_w, self.thumb_h, self.quality)
+        format!(
+            "anim_{g}x{g}_{}x{}_q{}.jpg",
+            self.thumb_w, self.thumb_h, self.quality
+        )
     }
     fn anim_frame(&self) -> (u32, u32) {
         let g = self.anim_grid.max(1);
@@ -68,12 +74,26 @@ type SharedQueue = Arc<(Mutex<Queues>, Condvar)>;
 pub enum ThumbResult {
     /// `rgba` is `w × h × 4` bytes, fitting the recipe's thumb box with
     /// the clip's original aspect ratio.
-    Ready { path: PathBuf, w: u32, h: u32, rgba: Vec<u8> },
-    Failed { path: PathBuf },
+    Ready {
+        path: PathBuf,
+        w: u32,
+        h: u32,
+        rgba: Vec<u8>,
+    },
+    Failed {
+        path: PathBuf,
+    },
     /// A sprite sheet of ANIM_FRAMES crop-filled frames; `w × h` are the
     /// sheet dimensions (frame size = w/ANIM_COLS × h/ANIM_ROWS).
-    AnimReady { path: PathBuf, w: u32, h: u32, rgba: Vec<u8> },
-    AnimFailed { path: PathBuf },
+    AnimReady {
+        path: PathBuf,
+        w: u32,
+        h: u32,
+        rgba: Vec<u8>,
+    },
+    AnimFailed {
+        path: PathBuf,
+    },
 }
 
 /// Async thumbnail service. `request` from the UI thread, results arrive
@@ -138,21 +158,35 @@ fn media_cmd(bin: &str) -> Command {
 }
 
 /// Live playback (PLAN.md §6 level 3): an ffmpeg child decodes to raw
-/// RGBA on stdout, looping forever; the reader thread paces frames to the
-/// clip's fps and keeps only the newest. Pacing is deliberately on OUR
-/// side, not ffmpeg's `-re`: input-side readrate lets the decode pipeline
-/// burst several seconds of frames at startup (a visible fast-forward),
-/// while a sleeping reader plus pipe backpressure throttles ffmpeg
-/// exactly. Killed on drop.
+/// RGBA on stdout, looping forever; the reader thread stamps every frame
+/// with its presentation time and queues a few ahead. Pacing happens on
+/// the CONSUMER's clock — `take_frame` surfaces a frame only once it's
+/// due — so presentation stays smooth against vsync, and the small
+/// read-ahead absorbs decode spikes (keyframes, cold caches) that used
+/// to land on screen as stutter. When a frame decodes late the schedule
+/// re-anchors instead of piling up debt: owed frames would otherwise all
+/// come due at once and play as a fast-forward burst (the old
+/// stutter-then-skip at startup). The queue is bounded, so a player
+/// nobody drains — e.g. a pre-warmed filmstrip neighbor — stalls its
+/// reader, pipe backpressure stalls ffmpeg, and warmth costs nothing
+/// after a few frames. Killed on drop.
 pub struct LivePlayer {
     child: std::process::Child,
-    frame: Arc<Mutex<Option<Vec<u8>>>>,
-    /// Tells the reader to restart its pacing clock (set on unpark, so a
-    /// resumed stream doesn't burst to catch up on frozen time).
-    reset_clock: Arc<std::sync::atomic::AtomicBool>,
+    queue: Arc<PacedQueue>,
     pub w: u32,
     pub h: u32,
 }
+
+/// Decoded frames waiting for their presentation times.
+struct PacedQueue {
+    frames: Mutex<VecDeque<(std::time::Instant, Vec<u8>)>>,
+    /// Signalled when the consumer pops; the reader waits on it when full.
+    space: Condvar,
+}
+
+/// Read-ahead depth: enough to ride out a slow frame, small enough that
+/// an unwatched player stalls (and stops burning CPU) almost immediately.
+const LIVE_QUEUE_DEPTH: usize = 3;
 
 impl LivePlayer {
     /// `seek` starts playback that many seconds in — pass the thumbnail's
@@ -163,6 +197,11 @@ impl LivePlayer {
         let (w, h) = (w.max(2), h.max(2));
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-stream_loop", "-1"]);
+        // Hardware decode where available (falls back to software with a
+        // warning for codecs VideoToolbox doesn't cover) — keeps 4K HEVC
+        // ahead of realtime, which software decode can't guarantee.
+        #[cfg(target_os = "macos")]
+        cmd.args(["-hwaccel", "videotoolbox"]);
         if seek > 0.05 {
             cmd.args(["-ss", &format!("{seek:.3}")]);
         }
@@ -186,46 +225,54 @@ impl LivePlayer {
             .spawn()
             .ok()?;
         let mut stdout = child.stdout.take()?;
-        let frame = Arc::new(Mutex::new(None));
-        let latest = frame.clone();
-        let reset_clock = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let reset = reset_clock.clone();
+        let queue = Arc::new(PacedQueue {
+            frames: Mutex::new(VecDeque::new()),
+            space: Condvar::new(),
+        });
+        let shared = queue.clone();
         let frame_bytes = (w * h * 4) as usize;
-        let fps = if fps.is_finite() { fps.clamp(1.0, 240.0) } else { 30.0 };
+        let fps = if fps.is_finite() {
+            fps.clamp(1.0, 240.0)
+        } else {
+            30.0
+        };
         thread::spawn(move || {
             use std::io::Read;
-            use std::sync::atomic::Ordering;
             use std::time::{Duration, Instant};
             let mut buf = vec![0u8; frame_bytes];
-            let mut t0: Option<Instant> = None;
-            let mut n: u64 = 0;
+            let interval = Duration::from_secs_f64(1.0 / fps);
+            let mut next_due: Option<Instant> = None;
             loop {
+                // Bounded read-ahead: block until the consumer makes room.
+                {
+                    let mut q = shared.frames.lock().unwrap();
+                    while q.len() >= LIVE_QUEUE_DEPTH {
+                        q = shared.space.wait(q).unwrap();
+                    }
+                }
                 if stdout.read_exact(&mut buf).is_err() {
                     return; // EOF or killed
                 }
-                if reset.swap(false, Ordering::Relaxed) {
-                    // Resumed from a park: restart the pacing clock so we
-                    // don't fast-forward to catch up on frozen time.
-                    t0 = Some(Instant::now());
-                    n = 0;
-                }
-                // Publish frame n no earlier than t0 + n/fps. Decoding
-                // slower than realtime just publishes immediately.
-                let start = *t0.get_or_insert_with(Instant::now);
-                let due = start + Duration::from_secs_f64(n as f64 / fps);
-                if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                    thread::sleep(wait);
-                }
-                n += 1;
-                *latest.lock().unwrap() = Some(buf.clone());
+                // Frame decoded late (cold start, slow keyframe, resumed
+                // from a park): re-anchor the schedule to now rather than
+                // keeping the debt — otherwise every owed frame comes due
+                // at once and plays as a fast-forward burst.
+                let now = Instant::now();
+                let due = match next_due {
+                    Some(d) if now <= d + interval / 2 => d,
+                    _ => now,
+                };
+                next_due = Some(due + interval);
+                shared.frames.lock().unwrap().push_back((due, buf.clone()));
             }
         });
-        Some(Self { child, frame, reset_clock, w, h })
+        Some(Self { child, queue, w, h })
     }
 
     /// Freeze/resume the decoder in place (SIGSTOP/SIGCONT) — cheaper than
     /// killing and respawning for short pauses, and playback resumes where
-    /// it left off. No-op on non-unix.
+    /// it left off. The pacer's lateness re-anchor keeps resumed frames
+    /// from fast-forwarding over frozen time. No-op on non-unix.
     pub fn set_parked(&self, parked: bool) {
         #[cfg(unix)]
         {
@@ -233,18 +280,26 @@ impl LivePlayer {
             unsafe {
                 libc::kill(self.child.id() as libc::pid_t, sig);
             }
-            if !parked {
-                self.reset_clock
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
         }
         #[cfg(not(unix))]
         let _ = parked;
     }
 
-    /// The newest decoded frame, if one arrived since the last call.
+    /// The newest frame that's due for presentation, if any. Earlier
+    /// overdue frames are dropped; frames still ahead of their time stay
+    /// queued — calling this every render tick paces playback on the
+    /// render clock.
     pub fn take_frame(&self) -> Option<Vec<u8>> {
-        self.frame.lock().unwrap().take()
+        let now = std::time::Instant::now();
+        let mut q = self.queue.frames.lock().unwrap();
+        let mut out = None;
+        while q.front().is_some_and(|(due, _)| *due <= now) {
+            out = q.pop_front().map(|(_, rgba)| rgba);
+        }
+        if out.is_some() {
+            self.queue.space.notify_one();
+        }
+        out
     }
 }
 
@@ -367,7 +422,18 @@ fn make_anim(
             .args(["-y", "-v", "error"])
             .arg("-i")
             .arg(src)
-            .args(["-frames:v", "1", "-vf", &vf, "-q:v", &q, "-strict", "unofficial", "-f", "mjpeg"])
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &vf,
+                "-q:v",
+                &q,
+                "-strict",
+                "unofficial",
+                "-f",
+                "mjpeg",
+            ])
             .arg(&tmp)
             .stdin(Stdio::null())
             .output()
@@ -410,7 +476,14 @@ pub fn cached_meta(path: &Path) -> Option<Meta> {
 
 fn probe(src: &Path) -> Option<Meta> {
     let out = media_cmd("ffprobe")
-        .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
         .arg(src)
         .stdin(Stdio::null())
         .output()
@@ -459,7 +532,16 @@ fn extract_frame(src: &Path, dst: &Path, seek: f64, recipe: &Recipe) -> Option<(
         .arg(src)
         .args([
             // the mjpeg default quality is very blocky; 2 ≈ visually lossless
-            "-frames:v", "1", "-vf", &vf, "-q:v", &q, "-strict", "unofficial", "-f", "mjpeg",
+            "-frames:v",
+            "1",
+            "-vf",
+            &vf,
+            "-q:v",
+            &q,
+            "-strict",
+            "unofficial",
+            "-f",
+            "mjpeg",
         ])
         .arg(&tmp)
         .stdin(Stdio::null())
@@ -583,7 +665,14 @@ mod tests {
             let ok = Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
                 .arg("testsrc2=duration=4:size=320x180:rate=30")
-                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
                 .arg(&clip)
                 .status()
                 .map(|s| s.success())
@@ -614,6 +703,53 @@ mod tests {
         assert!(
             (20..=45).contains(&frames),
             "expected ~30 paced frames in 1s, got {frames}"
+        );
+    }
+
+    /// The pre-warm contract: a player nobody drains fills its bounded
+    /// queue and stalls (near-zero CPU), then hands over a frame the
+    /// instant it's finally asked — that's what makes filmstrip h/l show
+    /// video the same tick.
+    #[test]
+    fn unwatched_player_stalls_then_serves_instantly() {
+        if !have_binary("ffmpeg") {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_pace_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("pace_warm.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0).expect("spawn");
+        // Warm without watching: the queue caps at LIVE_QUEUE_DEPTH and
+        // the decoder stalls behind it.
+        thread::sleep(std::time::Duration::from_millis(800));
+        assert!(
+            player.queue.frames.lock().unwrap().len() <= LIVE_QUEUE_DEPTH,
+            "queue must stay bounded while unwatched"
+        );
+        // Promotion: the queued (long-overdue) frames surface immediately.
+        assert!(
+            player.take_frame().is_some(),
+            "a warmed player must serve a frame on the first take"
         );
     }
 }

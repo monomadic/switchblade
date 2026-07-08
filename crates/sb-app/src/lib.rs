@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use sb_media::{MediaService, Recipe, ThumbResult};
 use sb_window::{
-    App, AtlasCfg, Frame, HiresFrame, InputEvent, Key, ThumbUpload, Tile, Viewport,
+    App, AtlasCfg, Blur, Frame, HiresFrame, InputEvent, Key, ThumbUpload, Tile, Viewport,
     WindowCommand,
 };
 
@@ -43,7 +43,12 @@ enum Thumb {
     Pending,
     /// `tw × th` = pixels within the slot (static thumb: original aspect;
     /// anim: sprite-sheet dimensions).
-    Ready { slot: usize, at: Instant, tw: u32, th: u32 },
+    Ready {
+        slot: usize,
+        at: Instant,
+        tw: u32,
+        th: u32,
+    },
     Failed,
 }
 
@@ -117,6 +122,11 @@ pub struct Switchblade {
     /// tile's atlas-slot lane, each started once its target settles.
     live_sel: Option<SelLive>,
     live_hover: Option<LiveState>,
+    /// Pre-warmed decoders for the filmstrip neighbors (quickview only),
+    /// spawned ahead of need so h/l shows video the same tick. An
+    /// unwatched player's bounded frame queue fills and stalls ffmpeg
+    /// after a few frames, so warmth is all but free.
+    warm: Vec<SelLive>,
     /// The newest hires frame this tick, routed to Frame.hires_upload.
     hires_frame: Option<HiresFrame>,
     sel_changed_at: Instant,
@@ -192,7 +202,10 @@ impl Switchblade {
             Some(cfg) => (cfg.tuning, cfg.keymap),
             None => (Tuning::default(), KeyMap::default()),
         };
-        let (slot_w, slot_h) = (tuning.thumb_width.clamp(64, 2048), tuning.thumb_height.clamp(36, 2048));
+        let (slot_w, slot_h) = (
+            tuning.thumb_width.clamp(64, 2048),
+            tuning.thumb_height.clamp(36, 2048),
+        );
         let atlas_cfg = AtlasCfg {
             slot_w,
             slot_h,
@@ -223,6 +236,7 @@ impl Switchblade {
             slots: vec![None; atlas_cfg.slots()],
             live_sel: None,
             live_hover: None,
+            warm: Vec::new(),
             hires_frame: None,
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
@@ -258,7 +272,10 @@ impl Switchblade {
             anim_rendered: false,
             wake_until: Instant::now() + Duration::from_secs(1),
             last_scroll_event: Instant::now(),
-            viewport: Viewport { width: 1280.0, height: 800.0 },
+            viewport: Viewport {
+                width: 1280.0,
+                height: 800.0,
+            },
             cmds: Vec::new(),
             title: String::new(),
         };
@@ -295,10 +312,8 @@ impl Switchblade {
     fn layout_with(&self, zoom: f32) -> Layout {
         let t = &self.tuning;
         let ideal = (t.tile_width * zoom).max(40.0);
-        let cols =
-            (((self.viewport.width - t.gap) / (ideal + t.gap)).floor() as usize).max(1);
-        let tile_w =
-            ((self.viewport.width - t.gap * (cols as f32 + 1.0)) / cols as f32).max(1.0);
+        let cols = (((self.viewport.width - t.gap) / (ideal + t.gap)).floor() as usize).max(1);
+        let tile_w = ((self.viewport.width - t.gap * (cols as f32 + 1.0)) / cols as f32).max(1.0);
         let tile_h = tile_w * t.tile_height / t.tile_width.max(1.0);
         Layout {
             cols,
@@ -475,12 +490,17 @@ impl Switchblade {
             match rx.try_recv() {
                 Ok(item) => {
                     // spawn fade-in (field update: `rx` is borrowed here)
-                    self.wake_until =
-                        self.wake_until.max(Instant::now() + Duration::from_millis(600));
+                    self.wake_until = self
+                        .wake_until
+                        .max(Instant::now() + Duration::from_millis(600));
                     self.index.insert(item.path.clone(), self.clips.len());
                     // Cloud placeholders never request a thumbnail: reading
                     // the file would force iCloud to download it.
-                    let thumb = if item.cloud { Thumb::Failed } else { Thumb::None };
+                    let thumb = if item.cloud {
+                        Thumb::Failed
+                    } else {
+                        Thumb::None
+                    };
                     self.clips.push(Clip {
                         path: item.path,
                         readable: item.readable,
@@ -489,7 +509,11 @@ impl Switchblade {
                         scale: 1.0,
                         emph: 0.0,
                         thumb,
-                        anim: if item.cloud { Thumb::Failed } else { Thumb::None },
+                        anim: if item.cloud {
+                            Thumb::Failed
+                        } else {
+                            Thumb::None
+                        },
                     });
                 }
                 Err(TryRecvError::Empty) => break,
@@ -536,7 +560,8 @@ impl Switchblade {
             }
             self.scroll_vel = 0.0;
         } else if self.scroll_target > max {
-            self.scroll_target = max + (self.scroll_target - max) * (1.0 - alpha(t.rubber_band, dt));
+            self.scroll_target =
+                max + (self.scroll_target - max) * (1.0 - alpha(t.rubber_band, dt));
             if self.scroll_target - max < 0.5 {
                 self.scroll_target = max;
             }
@@ -648,7 +673,9 @@ impl Switchblade {
         'statics: for &row in &rows {
             for col in 0..lay.cols {
                 let i = row * lay.cols + col;
-                let Some(clip) = self.clips.get_mut(i) else { break };
+                let Some(clip) = self.clips.get_mut(i) else {
+                    break;
+                };
                 if !clip.readable || matches!(clip.thumb, Thumb::Failed) {
                     continue;
                 }
@@ -670,7 +697,9 @@ impl Switchblade {
         'anims: for &row in &rows {
             for col in 0..lay.cols {
                 let i = row * lay.cols + col;
-                let Some(clip) = self.clips.get_mut(i) else { break };
+                let Some(clip) = self.clips.get_mut(i) else {
+                    break;
+                };
                 if !clip.readable || matches!(clip.anim, Thumb::Failed) {
                     continue;
                 }
@@ -699,7 +728,9 @@ impl Switchblade {
             self.wake(0.6); // thumb crossfade + progress bar linger
             match result {
                 ThumbResult::Ready { path, w, h, rgba } => {
-                    let Some(&i) = self.index.get(&path) else { continue };
+                    let Some(&i) = self.index.get(&path) else {
+                        continue;
+                    };
                     let Some(slot) = self.alloc_slot(lay, SlotKind::Static) else {
                         // Atlas momentarily full: drop the pixels but stay
                         // retryable — the disk cache makes the redo cheap.
@@ -710,8 +741,12 @@ impl Switchblade {
                     };
                     log::debug!("static ready: clip {i} -> slot {slot} ({w}x{h})");
                     self.slots[slot] = Some((i, SlotKind::Static));
-                    self.clips[i].thumb =
-                        Thumb::Ready { slot, at: Instant::now(), tw: w, th: h };
+                    self.clips[i].thumb = Thumb::Ready {
+                        slot,
+                        at: Instant::now(),
+                        tw: w,
+                        th: h,
+                    };
                     uploads.push(ThumbUpload { slot, w, h, rgba });
                 }
                 ThumbResult::Failed { path } => {
@@ -721,7 +756,9 @@ impl Switchblade {
                     }
                 }
                 ThumbResult::AnimReady { path, w, h, rgba } => {
-                    let Some(&i) = self.index.get(&path) else { continue };
+                    let Some(&i) = self.index.get(&path) else {
+                        continue;
+                    };
                     let Some(slot) = self.alloc_slot(lay, SlotKind::Anim) else {
                         log::debug!("anim dropped, atlas full: {}", path.display());
                         self.clips[i].anim = Thumb::None;
@@ -729,8 +766,12 @@ impl Switchblade {
                     };
                     log::debug!("anim ready: clip {i} -> slot {slot} ({w}x{h})");
                     self.slots[slot] = Some((i, SlotKind::Anim));
-                    self.clips[i].anim =
-                        Thumb::Ready { slot, at: Instant::now(), tw: w, th: h };
+                    self.clips[i].anim = Thumb::Ready {
+                        slot,
+                        at: Instant::now(),
+                        tw: w,
+                        th: h,
+                    };
                     uploads.push(ThumbUpload { slot, w, h, rgba });
                 }
                 ThumbResult::AnimFailed { path } => {
@@ -811,12 +852,32 @@ impl Switchblade {
             None
         };
 
-        // Stop lanes whose target moved away.
-        if let Some(l) = &self.live_sel {
-            if sel_target != Some(l.clip) {
-                self.live_sel = None;
+        // Filmstrip pre-warm (quickview only): the neighbors' decoders run
+        // ahead of need so advancing shows video instantly.
+        let mut warm_targets: Vec<usize> = Vec::new();
+        if base && self.quickview {
+            if self.selected > 0 {
+                warm_targets.push(self.selected - 1);
+            }
+            if self.selected + 1 < self.clips.len() {
+                warm_targets.push(self.selected + 1);
             }
         }
+
+        // Stop lanes whose target moved away. In quickview the selected
+        // stream demotes to a warm neighbor instead of dying — reversing
+        // direction picks it right back up, still on its timeline.
+        if self
+            .live_sel
+            .as_ref()
+            .is_some_and(|l| sel_target != Some(l.clip))
+        {
+            let l = self.live_sel.take().unwrap();
+            if warm_targets.contains(&l.clip) {
+                self.warm.push(l);
+            }
+        }
+        self.warm.retain(|w| warm_targets.contains(&w.clip));
         if let Some(l) = &self.live_hover {
             if hover_target != Some(l.clip) {
                 let slot = l.slot;
@@ -826,13 +887,24 @@ impl Switchblade {
         }
 
         // Start lanes whose target has settled. Quickview skips the settle
-        // delay — the user's explicit action goes to the forefront.
+        // delay — the user's explicit action goes to the forefront — and
+        // promotes a pre-warmed neighbor when one is ready: its queue
+        // already holds due frames, so the video shows this same tick.
         if self.live_sel.is_none() {
             if let Some(i) = sel_target {
-                if self.quickview
+                if let Some(pos) = self.warm.iter().position(|w| w.clip == i) {
+                    self.live_sel = Some(self.warm.remove(pos));
+                } else if self.quickview
                     || self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
                 {
                     self.live_sel = self.start_sel_live(i);
+                }
+            }
+        }
+        for &i in &warm_targets {
+            if self.warm.iter().all(|w| w.clip != i) {
+                if let Some(l) = self.start_sel_live(i) {
+                    self.warm.push(l);
                 }
             }
         }
@@ -888,10 +960,7 @@ impl Switchblade {
             .unwrap_or((tw as f32 * 4.0, th as f32 * 4.0));
         let (bw, bh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
         let scale = (bw / sw).min(bh / sh).min(1.0);
-        let (dw, dh) = (
-            ((sw * scale) as u32).max(2),
-            ((sh * scale) as u32).max(2),
-        );
+        let (dw, dh) = (((sw * scale) as u32).max(2), ((sh * scale) as u32).max(2));
         // Start where the thumbnail was taken, so video continues from the
         // frame the tile already shows instead of jolting to 0:00.
         let seek = meta
@@ -902,7 +971,11 @@ impl Switchblade {
         let fps = meta.and_then(|m| m.fps).unwrap_or(30.0);
         let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek, fps)?;
         log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
-        Some(SelLive { clip: i, player, first_frame: None })
+        Some(SelLive {
+            clip: i,
+            player,
+            first_frame: None,
+        })
     }
 
     fn start_live(&mut self, lay: &Layout, i: usize) -> Option<LiveState> {
@@ -931,7 +1004,12 @@ impl Switchblade {
         };
         log::debug!("hover live: {}", path.display());
         self.slots[slot] = Some((i, SlotKind::Live));
-        Some(LiveState { clip: i, player, slot, first_frame: None })
+        Some(LiveState {
+            clip: i,
+            player,
+            slot,
+            first_frame: None,
+        })
     }
 
     fn update_title(&mut self) {
@@ -989,7 +1067,10 @@ impl Switchblade {
                     Thumb::Ready { slot, at, tw, th } => {
                         let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
                             .min(1.0);
-                        (Some((slot, tw as f32, th as f32)), 1.0 - (1.0 - m) * (1.0 - m))
+                        (
+                            Some((slot, tw as f32, th as f32)),
+                            1.0 - (1.0 - m) * (1.0 - m),
+                        )
                     }
                     _ => (None, 0.0),
                 };
@@ -1005,8 +1086,7 @@ impl Switchblade {
                 } else if hovered {
                     if let Some(live) = &self.live_hover {
                         if live.clip == i && live.first_frame.is_some() {
-                            thumb =
-                                Some((live.slot, live.player.w as f32, live.player.h as f32));
+                            thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
                         }
                     }
                 }
@@ -1049,9 +1129,7 @@ impl Switchblade {
                 let anim_allowed = t.anim && self.anim_on && !emphasized && !self.paused();
                 let anim = if anim_allowed {
                     match clip.anim {
-                        Thumb::Ready { slot, at, tw, th } => {
-                            Some((slot, at, tw as f32, th as f32))
-                        }
+                        Thumb::Ready { slot, at, tw, th } => Some((slot, at, tw as f32, th as f32)),
                         _ => None,
                     }
                 } else {
@@ -1074,8 +1152,7 @@ impl Switchblade {
                     } else {
                         ch = lw / target_a;
                     }
-                    let (hw, hh) =
-                        (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
+                    let (hw, hh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
                     [
                         ((lw - cw) * 0.5 + 0.5) / hw,
                         ((lh - ch) * 0.5 + 0.5) / hh,
@@ -1126,7 +1203,11 @@ impl Switchblade {
                     };
                     // If the static thumb is already showing, swap without
                     // re-fading (no dip to background).
-                    mix = if thumb.is_some() { mix.max(anim_fade) } else { anim_fade };
+                    mix = if thumb.is_some() {
+                        mix.max(anim_fade)
+                    } else {
+                        anim_fade
+                    };
                     frame_uv(k)
                 } else {
                     // UV window into the static thumb, cropped to the tile's
@@ -1141,7 +1222,8 @@ impl Switchblade {
                             } else {
                                 ch = tw / target_a;
                             }
-                            self.atlas_cfg.uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
+                            self.atlas_cfg
+                                .uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
                         }
                         None => [0.0; 4],
                     }
@@ -1164,7 +1246,11 @@ impl Switchblade {
 
                 let (sb, hb, eb) = (t.selection_border, t.hover_border, t.empty_border);
                 let (border_color, border_width, radius) = if selected {
-                    ([sb[0], sb[1], sb[2], ease], t.border_width, t.selection_corner_radius)
+                    (
+                        [sb[0], sb[1], sb[2], ease],
+                        t.border_width,
+                        t.selection_corner_radius,
+                    )
                 } else if hovered {
                     ([hb[0], hb[1], hb[2], 0.35 * ease], 1.0, t.corner_radius)
                 } else if thumb.is_none() && clip.readable && !clip.cloud {
@@ -1208,46 +1294,6 @@ impl Switchblade {
         tiles.extend(hovered_group);
         tiles.extend(selected_group);
 
-        // Background-jobs indicator: a hairline progress bar, bottom-right.
-        // Lingers full for a moment when the batch finishes, then fades.
-        let pending = self.jobs_total.saturating_sub(self.jobs_done);
-        if self.jobs_total > 0 {
-            let fade = if pending > 0 {
-                self.jobs_finished_at = None;
-                1.0
-            } else {
-                let at = *self.jobs_finished_at.get_or_insert(now);
-                1.0 - (now.saturating_duration_since(at).as_secs_f32() / 0.7).min(1.0)
-            };
-            if fade <= 0.0 {
-                self.jobs_total = 0;
-                self.jobs_done = 0;
-                self.jobs_finished_at = None;
-            } else {
-                let progress = self.jobs_done as f32 / self.jobs_total as f32;
-                let (bw, bh) = (110.0, 3.0);
-                let bx = self.viewport.width - bw - 14.0;
-                let by = self.viewport.height - bh - 12.0;
-                let bar = |x: f32, w: f32, a: f32| Tile {
-                    x,
-                    y: by,
-                    w,
-                    h: bh,
-                    color: [0.85, 0.85, 0.9, a * fade],
-                    border_color: [0.0; 4],
-                    corner_radius: bh * 0.5,
-                    border_width: 0.0,
-                    uv: [0.0; 4],
-                    uv2: [0.0; 4],
-                    frame_fade: 0.0,
-                    tex_mix: 0.0,
-                    hires: false,
-                };
-                tiles.push(bar(bx, bw, 0.10)); // track
-                tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
-            }
-        }
-
         // Photos-style reflow: when the column count changes (zoom/resize),
         // the previous layout fades out on top of the new one.
         if lay.cols != self.last_cols && !self.last_tiles.is_empty() {
@@ -1276,13 +1322,21 @@ impl Switchblade {
             self.transition = None;
         }
 
-        // Quickview (PLAN.md §6 level 3, internal): dim everything and show
-        // the selected clip large, centered, playing via the live slot.
-        // Arrows keep working — the modal follows the selection.
+        // Quickview (PLAN.md §6 level 3, internal): blur + dim everything
+        // and show the selected clip large, centered, playing via the live
+        // slot. Arrows keep working — the modal follows the selection.
+        let mut blur = None;
         if self.quickview {
             if let Some(clip) = self.clips.get(self.selected) {
                 let fade = (self.quickview_at.elapsed().as_secs_f32() / 0.15).min(1.0);
                 let (vw, vh) = (self.viewport.width, self.viewport.height);
+                if t.quickview_blur >= 0.5 {
+                    blur = Some(Blur {
+                        split: tiles.len(),
+                        levels: t.quickview_blur.round() as u32,
+                        fade,
+                    });
+                }
                 let full = |x, y, w, h, color| Tile {
                     x,
                     y,
@@ -1298,7 +1352,13 @@ impl Switchblade {
                     tex_mix: 0.0,
                     hires: false,
                 };
-                tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 0.82 * fade]));
+                tiles.push(full(
+                    0.0,
+                    0.0,
+                    vw,
+                    vh,
+                    [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0) * fade],
+                ));
 
                 // The modal shows the same hires stream the tile plays —
                 // already running, already sharp, no handoff. Static thumb
@@ -1309,8 +1369,7 @@ impl Switchblade {
                     .filter(|l| l.clip == self.selected && l.first_frame.is_some());
                 let src = if let Some(l) = live {
                     let (w, h) = (l.player.w as f32, l.player.h as f32);
-                    let (hw, hh) =
-                        (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
+                    let (hw, hh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
                     Some((
                         [0.5 / hw, 0.5 / hh, (w - 1.0) / hw, (h - 1.0) / hh],
                         w,
@@ -1356,8 +1415,13 @@ impl Switchblade {
                     });
                 } else {
                     // Nothing decoded yet: big dots in the middle.
-                    let stage =
-                        full((vw - 300.0) * 0.5, (avail_h - 100.0) * 0.5, 300.0, 100.0, [0.0; 4]);
+                    let stage = full(
+                        (vw - 300.0) * 0.5,
+                        (avail_h - 100.0) * 0.5,
+                        300.0,
+                        100.0,
+                        [0.0; 4],
+                    );
                     push_loading_dots(&mut tiles, &stage, fade, anim_t, true);
                 }
 
@@ -1389,13 +1453,8 @@ impl Switchblade {
                                 ch = tw / target_a;
                             }
                             (
-                                self.atlas_cfg.uv(
-                                    slot,
-                                    (tw - cw) * 0.5,
-                                    (th - ch) * 0.5,
-                                    cw,
-                                    ch,
-                                ),
+                                self.atlas_cfg
+                                    .uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch),
                                 true,
                             )
                         }
@@ -1426,11 +1485,54 @@ impl Switchblade {
             }
         }
 
+        // Background-jobs indicator: a hairline progress bar, bottom-right.
+        // Drawn last — above the quickview dim — so "still working" stays
+        // visible whenever it's true. Lingers a moment when the batch
+        // finishes, then fades.
+        let pending = self.jobs_total.saturating_sub(self.jobs_done);
+        if self.jobs_total > 0 {
+            let fade = if pending > 0 {
+                self.jobs_finished_at = None;
+                1.0
+            } else {
+                let at = *self.jobs_finished_at.get_or_insert(now);
+                1.0 - (now.saturating_duration_since(at).as_secs_f32() / 0.7).min(1.0)
+            };
+            if fade <= 0.0 {
+                self.jobs_total = 0;
+                self.jobs_done = 0;
+                self.jobs_finished_at = None;
+            } else {
+                let progress = self.jobs_done as f32 / self.jobs_total as f32;
+                let (bw, bh) = (110.0, 3.0);
+                let bx = self.viewport.width - bw - 14.0;
+                let by = self.viewport.height - bh - 12.0;
+                let bar = |x: f32, w: f32, a: f32| Tile {
+                    x,
+                    y: by,
+                    w,
+                    h: bh,
+                    color: [0.85, 0.85, 0.9, a * fade],
+                    border_color: [0.0; 4],
+                    corner_radius: bh * 0.5,
+                    border_width: 0.0,
+                    uv: [0.0; 4],
+                    uv2: [0.0; 4],
+                    frame_fade: 0.0,
+                    tex_mix: 0.0,
+                    hires: false,
+                };
+                tiles.push(bar(bx, bw, 0.10)); // track
+                tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
+            }
+        }
+
         Frame {
             clear: t.background,
             tiles,
             uploads: Vec::new(),
             hires_upload: None,
+            blur,
             animating: true,
         }
     }
@@ -1568,10 +1670,7 @@ fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: b
             tile.y + (tile.h - d) * 0.5,
         )
     } else {
-        (
-            tile.x + tile.w - total_w - 10.0,
-            tile.y + tile.h - d - 10.0,
-        )
+        (tile.x + tile.w - total_w - 10.0, tile.y + tile.h - d - 10.0)
     };
     for k in 0..3 {
         let wave = 0.5 + 0.5 * (t * 4.5 - k as f32 * 0.9).sin();
