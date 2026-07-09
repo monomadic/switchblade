@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <clipPath id="sq"><rect x="100" y="100" width="824" height="824" rx="186"/></clipPath>
+
+    <linearGradient id="b-pop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd23a"/><stop offset=".45" stop-color="#ff9a3d"/><stop offset="1" stop-color="#ff2d78"/>
+    </linearGradient>
+    <linearGradient id="g-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12204a"/><stop offset="1" stop-color="#060a18"/>
+    </linearGradient>
+    <linearGradient id="glass-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#46699f"/><stop offset="1" stop-color="#263b66"/>
+    </linearGradient>
+    <radialGradient id="spill2" gradientUnits="userSpaceOnUse" cx="512" cy="512" r="470">
+      <stop offset="0" stop-color="#ff9a3d" stop-opacity=".34"/>
+      <stop offset=".45" stop-color="#ff2d78" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#ff2d78" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="b-glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+    <filter id="tint-cyan"><feFlood flood-color="#35e0ff" result="f"/><feComposite in="f" in2="SourceAlpha" operator="in"/></filter>
+    <filter id="tint-mag"><feFlood flood-color="#ff2d78" result="f"/><feComposite in="f" in2="SourceAlpha" operator="in"/></filter>
+
+    <mask id="sunmask-r">
+      <circle cx="170" cy="110" r="78" fill="white"/>
+      <rect x="70" y="122" width="200" height="10" fill="black"/>
+      <rect x="70" y="142" width="200" height="12" fill="black"/>
+      <rect x="70" y="164" width="200" height="14" fill="black"/>
+    </mask>
+
+    <!-- the photo, local coords 0..464 x 0..280 -->
+    <g id="scene-art-r">
+      <rect width="464" height="280" fill="url(#b-pop)"/>
+      <circle cx="170" cy="110" r="78" fill="#fff3c4" mask="url(#sunmask-r)"/>
+      <g stroke="#38102c" stroke-width="4" fill="none" stroke-linecap="round" opacity=".85">
+        <path d="M 84 58 q 9 -9 18 0"/><path d="M 106 66 q 8 -8 16 0"/>
+      </g>
+      <rect x="0" y="186" width="464" height="94" fill="#e0176b"/>
+      <g stroke="#ff8ab8" stroke-width="3.5" opacity=".7">
+        <line x1="232" y1="186" x2="60" y2="280"/>
+        <line x1="232" y1="186" x2="232" y2="280"/>
+        <line x1="232" y1="186" x2="404" y2="280"/>
+      </g>
+      <g stroke="#ff8ab8" stroke-width="3" opacity=".45">
+        <line x1="0" y1="210" x2="464" y2="210"/>
+        <line x1="0" y1="240" x2="464" y2="240"/>
+      </g>
+      <line x1="0" y1="186" x2="464" y2="186" stroke="#ff5c9d" stroke-width="5"/>
+      <g stroke="#38102c" fill="none" stroke-linecap="round">
+        <path d="M 396 282 C 388 220 392 180 404 148" stroke-width="11"/>
+        <g stroke-width="9">
+          <path d="M 404 148 Q 360 118 322 128"/>
+          <path d="M 404 148 Q 372 106 336 100"/>
+          <path d="M 404 148 Q 404 96 434 84"/>
+          <path d="M 404 148 Q 448 112 484 126"/>
+          <path d="M 404 148 Q 444 140 472 164"/>
+          <path d="M 404 148 Q 356 140 330 168"/>
+        </g>
+      </g>
+    </g>
+
+    <clipPath id="pop-clip-r"><rect x="0" y="0" width="464" height="280" rx="30"/></clipPath>
+    <clipPath id="band-r1"><rect x="0" y="0" width="464" height="110"/></clipPath>
+    <clipPath id="band-r2"><rect x="0" y="110" width="464" height="55"/></clipPath>
+    <clipPath id="band-r3"><rect x="0" y="165" width="464" height="40"/></clipPath>
+    <clipPath id="band-r4"><rect x="0" y="205" width="464" height="75"/></clipPath>
+
+    <!-- glitched composition of the photo, local 0..464 x 0..280 -->
+    <g id="glitch-r">
+      <g clip-path="url(#pop-clip-r)">
+        <rect width="464" height="280" fill="#e0176b"/>
+        <use href="#scene-art-r" xlink:href="#scene-art-r" transform="translate(-13,0)" filter="url(#tint-cyan)" opacity=".6"/>
+        <use href="#scene-art-r" xlink:href="#scene-art-r" transform="translate(13,6)" filter="url(#tint-mag)" opacity=".6"/>
+        <g clip-path="url(#band-r1)"><use href="#scene-art-r" xlink:href="#scene-art-r"/></g>
+        <g clip-path="url(#band-r2)"><use href="#scene-art-r" xlink:href="#scene-art-r" transform="translate(-16,0)"/></g>
+        <g clip-path="url(#band-r3)"><use href="#scene-art-r" xlink:href="#scene-art-r" transform="translate(12,0)"/></g>
+        <g clip-path="url(#band-r4)"><use href="#scene-art-r" xlink:href="#scene-art-r"/></g>
+        <rect x="0" y="108" width="464" height="3" fill="#ffffff" opacity=".3"/>
+        <rect x="0" y="163" width="464" height="3" fill="#35e0ff" opacity=".4"/>
+        <g fill="#ffffff" opacity=".08">
+          <rect x="0" y="40" width="464" height="3"/>
+          <rect x="0" y="86" width="464" height="3"/>
+          <rect x="0" y="222" width="464" height="3"/>
+          <rect x="0" y="254" width="464" height="3"/>
+        </g>
+      </g>
+    </g>
+
+    <!-- glass pane, local 0..260 x 0..260 -->
+    <g id="tile-glass-sq">
+      <rect x="2" y="2" width="256" height="256" rx="26" fill="url(#glass-fill)" stroke="#8ab6ff" stroke-opacity=".55" stroke-width="3.5"/>
+      <rect x="12" y="12" width="236" height="96" rx="18" fill="#ffffff" opacity=".13"/>
+    </g>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#g-bg)"/>
+  <g clip-path="url(#sq)">
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(100,100)"/>
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(382,100)"/>
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(664,100)"/>
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(100,382)"/>
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(664,382)"/>
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(100,664)"/>
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(382,664)"/>
+    <use href="#tile-glass-sq" xlink:href="#tile-glass-sq" transform="translate(664,664)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#spill2)"/>
+  </g>
+  <g transform="rotate(-2.5 512 512)">
+    <rect x="280" y="372" width="464" height="280" rx="30" fill="#ff2d78" filter="url(#b-glow)" opacity=".9"/>
+    <rect x="280" y="372" width="464" height="280" rx="30" fill="none" stroke="#35e0ff" stroke-width="8" opacity=".85" transform="translate(-9,-6)"/>
+    <rect x="280" y="372" width="464" height="280" rx="30" fill="none" stroke="#ff2d78" stroke-width="8" opacity=".85" transform="translate(9,6)"/>
+    <use href="#glitch-r" xlink:href="#glitch-r" transform="translate(280,372)"/>
+    <rect x="280" y="372" width="464" height="280" rx="30" fill="none" stroke="#ffffff" stroke-width="12"/>
+  </g>
+</svg>
