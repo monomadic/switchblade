@@ -223,7 +223,6 @@ fn set_dock_icon() {}
 
 pub fn run(app: impl App) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
-    set_dock_icon();
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut runner = Runner {
         app,
@@ -284,6 +283,10 @@ impl<A: App> ApplicationHandler for Runner<A> {
         if self.window.is_some() {
             return;
         }
+        // Must run after the app finishes launching: winit applies the
+        // Regular activation policy during launch, which resets any icon
+        // set before the event loop starts.
+        set_dock_icon();
         let attrs = Window::default_attributes()
             .with_title("switchblade")
             .with_inner_size(LogicalSize::new(1280.0, 800.0));
