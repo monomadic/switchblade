@@ -41,11 +41,16 @@ selection_corner_radius = 20.0
 border_width = 2.0
 fade_in_ms = 20.0
 
-# Live video inside the selected/hovered tiles, starting after the
-# target settles for live_delay_ms (so flying across the grid doesn't
-# spawn a decoder per keypress). Quickview plays regardless — this only
-# controls the passive in-tile playback.
-live_preview = true
+# How much moves — each level includes everything below it:
+#   none    snap everything: no tweens, no live video, no sheets
+#   minimal UI tweens back on; still no video
+#   normal  + live video (quickview, selected + hovered tiles)  [default]
+#   full    + background sprite-sheet animation in the grid
+# CLI --animation overrides this. 'a' still toggles sheets at full.
+animation = "normal"
+
+# Live playback starts after the target settles for live_delay_ms (so
+# flying across the grid doesn't spawn a decoder per keypress).
 live_delay_ms = 100.0
 
 # Pause live playback + sheet animation while the window is unfocused
@@ -92,6 +97,11 @@ strip_gap = 10.0
 strip_snap_strength = 0.5
 strip_corner_radius = 5.0
 strip_border_width = 4.0
+# Selected / hovered chips scale up and overlap their neighbors (drawn
+# on top, like the grid). Hovered chips also play video at animation
+# level "normal"+.
+strip_selection_scale = 1.35
+strip_hover_scale = 1.15
 # Quickview backdrop: black dim strength (0..1) and frosted-glass blur
 # level — the grid is downsampled 2^level before drawing back, so
 # 1 = subtle, 4 = heavy frost, 0 = no blur. GPU-cheap either way.
@@ -99,11 +109,11 @@ strip_border_width = 4.0
 quickview_dim = 0.90
 quickview_blur = 3.0
 
-# Animated thumbnails (sprite sheets, 9 frames sampled across each clip).
-# One full cycle takes anim_cycle_s; frames crossfade into each other for
-# anim_crossfade of each interval (0 = hard cuts). Tiles narrower than
-# anim_min_tile_w stay static. Toggle live with 'a' or start --no-anim.
-anim = false
+# Animated thumbnails (sprite sheets, 9 frames sampled across each clip)
+# — these only run at animation = "full". One full cycle takes
+# anim_cycle_s; frames crossfade into each other for anim_crossfade of
+# each interval (0 = hard cuts). Tiles narrower than anim_min_tile_w
+# stay static. Sheets generate strictly AFTER every file has a thumbnail.
 anim_cycle_s = 10.8
 anim_crossfade = 1.0
 anim_min_tile_w = 140.0

@@ -5,7 +5,7 @@ mod commands;
 mod ingest;
 mod tuning;
 
-pub use tuning::Tuning;
+pub use tuning::{AnimLevel, Tuning};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,24 +99,15 @@ struct Clip {
 }
 
 /// Startup options from the CLI (config handles everything else).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Options {
-    pub anim: bool,
+    /// `--animation <level>`: overrides the config's `animation`.
+    pub animation: Option<AnimLevel>,
     /// Paths from the CLI; when non-empty they are the input source and
     /// stdin is ignored.
     pub inputs: Vec<PathBuf>,
     /// Force the fake-tile demo grid.
     pub demo: bool,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            anim: true,
-            inputs: Vec::new(),
-            demo: false,
-        }
-    }
 }
 
 pub struct Switchblade {
@@ -142,7 +133,9 @@ pub struct Switchblade {
     sel_changed_at: Instant,
     hover_changed_at: Instant,
     demo: bool,
-    /// Runtime animation toggle (`a` key / --no-anim), ANDed with tuning.anim.
+    /// CLI `--animation` override; beats the config's level when set.
+    cli_animation: Option<AnimLevel>,
+    /// Runtime sheet toggle (`a` key), ANDed with the level's sheets().
     anim_on: bool,
     /// Window focus state + the runtime toggle for pause-when-unfocused.
     focused: bool,
@@ -155,6 +148,9 @@ pub struct Switchblade {
     /// Filmstrip slide position (in clip-index units), springing toward
     /// the selected index with the keyboard chase curve.
     strip_pos: f32,
+    /// Filmstrip chip under the cursor (quickview only) — scales up and
+    /// gets the hover video lane, like grid hover.
+    strip_hover: Option<usize>,
     /// Background job counters for the progress indicator.
     jobs_total: u64,
     jobs_done: u64,
@@ -266,7 +262,8 @@ impl Switchblade {
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
-            anim_on: opts.anim,
+            cli_animation: opts.animation,
+            anim_on: true,
             focused: true,
             focus_pause_on: true,
             anim_grid,
@@ -274,6 +271,7 @@ impl Switchblade {
             quickview: false,
             quickview_at: Instant::now(),
             strip_pos: 0.0,
+            strip_hover: None,
             jobs_total: 0,
             jobs_done: 0,
             jobs_finished_at: None,
@@ -494,6 +492,17 @@ impl Switchblade {
         !self.focused && self.tuning.pause_unfocused && self.focus_pause_on
     }
 
+    /// Effective animation level: CLI `--animation` beats the config.
+    fn level(&self) -> AnimLevel {
+        self.cli_animation.unwrap_or(self.tuning.animation)
+    }
+
+    /// Sprite sheets cycle (and generate) only at level `full`, further
+    /// gated by the runtime `a` toggle.
+    fn sheets_on(&self) -> bool {
+        self.level().sheets() && self.anim_on
+    }
+
     /// Keep the render loop awake for at least `secs` (covers fades and
     /// settle timers that plain spring-residual checks can't see).
     fn wake(&mut self, secs: f32) {
@@ -526,6 +535,13 @@ impl Switchblade {
                     } else {
                         Thumb::None
                     };
+                    // Background gen sweep: every discovered file gets its
+                    // thumbnail generated (disk cache only) — behind any
+                    // visible-thumb request, ahead of all anim sheets.
+                    if item.readable && !item.cloud {
+                        self.media.request_gen(item.path.clone());
+                        self.jobs_total += 1;
+                    }
                     self.clips.push(Clip {
                         path: item.path,
                         readable: item.readable,
@@ -553,11 +569,15 @@ impl Switchblade {
 
     fn step(&mut self, dt: f32) {
         let t = self.tuning.clone();
+        // Animation level "none": every chase/spring covers its full
+        // distance in one frame — the UI snaps instead of tweening.
+        let ui = self.level().ui();
+        let a_of = |k: f32| if ui { alpha(k, dt) } else { 1.0 };
 
         // Zoom spring, anchored so the content at the viewport center stays
         // put while tile size (and column count) reflows around it.
         let old_zoom = self.zoom;
-        self.zoom += (self.zoom_target - self.zoom) * alpha(t.zoom_smoothing, dt);
+        self.zoom += (self.zoom_target - self.zoom) * a_of(t.zoom_smoothing);
         if (self.zoom - old_zoom).abs() > 1e-5 {
             let old_h = self.content_height(&self.layout_with(old_zoom));
             let new_h = self.content_height(&self.layout_with(self.zoom));
@@ -594,11 +614,20 @@ impl Switchblade {
         }
 
         // Camera chases its target (key moves use a gentler chase).
-        self.scroll += (self.scroll_target - self.scroll) * alpha(self.chase, dt);
+        self.scroll += (self.scroll_target - self.scroll) * a_of(self.chase);
 
         let hover_now = self.tile_at(&lay, self.cursor.0, self.cursor.1);
         if hover_now != self.hovered {
             self.hovered = hover_now;
+            self.hover_changed_at = Instant::now();
+        }
+        let strip_hover_now = if self.quickview {
+            self.strip_chip_at(self.cursor.0, self.cursor.1)
+        } else {
+            None
+        };
+        if strip_hover_now != self.strip_hover {
+            self.strip_hover = strip_hover_now;
             self.hover_changed_at = Instant::now();
         }
 
@@ -613,7 +642,7 @@ impl Switchblade {
         // spring is still in flight for idle throttling.
         let mut motion = (self.scroll_target - self.scroll).abs() > 0.3
             || (self.zoom_target - self.zoom).abs() > 1e-3;
-        let a = alpha(t.scale_smoothing, dt);
+        let a = a_of(t.scale_smoothing);
         for (i, clip) in self.clips.iter_mut().enumerate() {
             let emphasized = i == self.selected || Some(i) == self.hovered;
             let target = if i == self.selected {
@@ -635,7 +664,7 @@ impl Switchblade {
         // Quickview filmstrip slides with the same curve as keyboard moves.
         if self.quickview {
             let target = self.selected as f32;
-            self.strip_pos += (target - self.strip_pos) * alpha(t.strip_snap_strength, dt);
+            self.strip_pos += (target - self.strip_pos) * a_of(t.strip_snap_strength);
             if (target - self.strip_pos).abs() > 0.001 {
                 self.motion = true;
             }
@@ -716,7 +745,7 @@ impl Switchblade {
             }
         }
 
-        if !(self.tuning.anim && self.anim_on) || lay.tile_w < self.tuning.anim_min_tile_w {
+        if !self.sheets_on() || lay.tile_w < self.tuning.anim_min_tile_w {
             return;
         }
         'anims: for &row in &rows {
@@ -805,6 +834,10 @@ impl Switchblade {
                         self.clips[i].anim = Thumb::Failed;
                     }
                 }
+                ThumbResult::GenDone { .. } => {
+                    self.jobs_done += 1;
+                    self.wake(0.3); // progress bar tick
+                }
             }
         }
         uploads
@@ -862,27 +895,27 @@ impl Switchblade {
     /// starts once its target settles, stops the moment it moves, and
     /// pumps the newest decoded frame into a never-evicted atlas slot.
     fn update_live(&mut self, lay: &Layout, uploads: &mut Vec<ThumbUpload>) {
-        let base = !self.demo && !self.paused();
-        let lanes = base && self.tuning.live_preview;
+        // Live video exists at animation level `normal` and up: the
+        // selected stream (tile + quickview modal) and the hover lane.
+        let live_on = !self.demo && !self.paused() && self.level().live();
         let delay_ms = self.tuning.live_delay_ms;
-        // One selected stream feeds both the tile and the quickview modal.
-        // It runs while browsing (live_preview) and always during quickview
-        // — quickview is an explicit "play this".
-        let sel_target = (lanes || (base && self.quickview)).then_some(self.selected);
-        // The hover lane is suppressed during quickview (grid is hidden)
-        // and when hover sits on the selected tile (that stream owns it).
-        let hover_target = if lanes && !self.quickview {
-            self.hovered.filter(|h| *h != self.selected)
-        } else {
+        let sel_target = live_on.then_some(self.selected);
+        // The hover lane: in the grid, the hovered tile; in quickview,
+        // the hovered filmstrip chip. Never the selected clip (its
+        // stream owns that).
+        let hover_target = if !live_on {
             None
+        } else if self.quickview {
+            self.strip_hover.filter(|h| *h != self.selected)
+        } else {
+            self.hovered.filter(|h| *h != self.selected)
         };
 
         // Pre-warm decoders for the four movement destinations (±1 and
         // ±row) so a selection move shows video instantly instead of
-        // paying a cold ffmpeg spawn (~1s on 4K sources). Active in
-        // quickview and — when live_preview is on — in the grid.
+        // paying a cold ffmpeg spawn (~1s on 4K sources).
         let mut warm_targets: Vec<usize> = Vec::new();
-        if base && (self.quickview || lanes) {
+        if live_on {
             let s = self.selected;
             let cols = lay.cols.max(1);
             let n = self.clips.len();
@@ -1119,6 +1152,8 @@ impl Switchblade {
         let t = self.tuning.clone();
         let lay = self.layout();
         let (first_row, last_row) = self.visible_rows(&lay, 0);
+        // Animation level "none": fades/crossfades complete instantly.
+        let ui = self.level().ui();
 
         let now = Instant::now();
         let anim_t = now.saturating_duration_since(self.t0).as_secs_f32();
@@ -1138,9 +1173,13 @@ impl Switchblade {
                 let clip = &self.clips[i];
 
                 // Spawn fade/scale-in.
-                let fade = match now.checked_duration_since(clip.spawned) {
-                    Some(el) => (el.as_secs_f32() * 1000.0 / t.fade_in_ms.max(1.0)).min(1.0),
-                    None => 0.0,
+                let fade = if !ui {
+                    1.0
+                } else {
+                    match now.checked_duration_since(clip.spawned) {
+                        Some(el) => (el.as_secs_f32() * 1000.0 / t.fade_in_ms.max(1.0)).min(1.0),
+                        None => 0.0,
+                    }
                 };
                 if fade <= 0.0 {
                     continue;
@@ -1153,8 +1192,12 @@ impl Switchblade {
 
                 let (mut thumb, tex_mix) = match clip.thumb {
                     Thumb::Ready { slot, at, tw, th } => {
-                        let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
-                            .min(1.0);
+                        let m = if !ui {
+                            1.0
+                        } else {
+                            (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
+                                .min(1.0)
+                        };
                         (
                             Some((slot, tw as f32, th as f32)),
                             1.0 - (1.0 - m) * (1.0 - m),
@@ -1214,7 +1257,7 @@ impl Switchblade {
                 // true aspect, and live video (seek-matched to the static
                 // thumb's frame) would land on different content. The
                 // emphasis morph itself keeps the tile alive until then.
-                let anim_allowed = t.anim && self.anim_on && !emphasized && !self.paused();
+                let anim_allowed = self.sheets_on() && !emphasized && !self.paused();
                 let anim = if anim_allowed {
                     match clip.anim {
                         Thumb::Ready { slot, at, tw, th } => Some((slot, at, tw as f32, th as f32)),
@@ -1384,7 +1427,7 @@ impl Switchblade {
 
         // Photos-style reflow: when the column count changes (zoom/resize),
         // the previous layout fades out on top of the new one.
-        if lay.cols != self.last_cols && !self.last_tiles.is_empty() {
+        if ui && lay.cols != self.last_cols && !self.last_tiles.is_empty() {
             self.transition = Some((std::mem::take(&mut self.last_tiles), now));
         }
         self.last_cols = lay.cols;
@@ -1416,7 +1459,11 @@ impl Switchblade {
         let mut blur = None;
         if self.quickview {
             if let Some(clip) = self.clips.get(self.selected) {
-                let fade = (self.quickview_at.elapsed().as_secs_f32() / 0.15).min(1.0);
+                let fade = if !ui {
+                    1.0
+                } else {
+                    (self.quickview_at.elapsed().as_secs_f32() / 0.15).min(1.0)
+                };
                 let (vw, vh) = (self.viewport.width, self.viewport.height);
                 if t.quickview_blur >= 0.5 {
                     blur = Some(Blur {
@@ -1516,9 +1563,13 @@ impl Switchblade {
                 // Filmstrip: neighbors along the bottom, selected centered,
                 // sliding on the keyboard chase spring. Foreground layer —
                 // in quickview, actions live here; the grid is backdrop.
+                // Z-order like the grid: hovered chip above its neighbors,
+                // selected chip on top (both scale up and overlap).
                 let step = chip_w + t.strip_gap;
                 let half = (vw / step) as i64 / 2 + 1;
                 let center = self.strip_pos;
+                let mut sel_chip: Option<Tile> = None;
+                let mut hover_chip: Option<Tile> = None;
                 for di in -half..=half {
                     let idx = center.round() as i64 + di;
                     if idx < 0 || idx as usize >= self.clips.len() {
@@ -1527,12 +1578,30 @@ impl Switchblade {
                     let i = idx as usize;
                     let c = &self.clips[i];
                     let sel = i == self.selected;
-                    let s = if sel { 1.10 } else { 1.0 };
+                    let hov = !sel && self.strip_hover == Some(i);
+                    let s = if sel {
+                        t.strip_selection_scale
+                    } else if hov {
+                        t.strip_hover_scale
+                    } else {
+                        1.0
+                    };
                     let (w, h) = (chip_w * s, chip_h * s);
                     let cx = vw * 0.5 + (i as f32 - center) * step;
-                    let (uv, has_tex) = match c.thumb {
-                        Thumb::Ready { slot, tw, th, .. } => {
-                            let (tw, th) = (tw as f32, th as f32);
+                    // The hovered chip plays its lane's video (tile-size,
+                    // in the atlas Live slot); everything else shows its
+                    // thumb, crop-filled to 16:9.
+                    let live = self
+                        .live_hover
+                        .as_ref()
+                        .filter(|l| hov && l.clip == i && l.first_frame.is_some())
+                        .map(|l| (l.slot, l.player.w as f32, l.player.h as f32));
+                    let src = live.or(match c.thumb {
+                        Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
+                        _ => None,
+                    });
+                    let (uv, has_tex) = match src {
+                        Some((slot, tw, th)) => {
                             let target_a = 16.0 / 9.0;
                             let (mut cw, mut ch) = (tw, th);
                             if tw / th > target_a {
@@ -1546,15 +1615,21 @@ impl Switchblade {
                                 true,
                             )
                         }
-                        _ => ([0.0; 4], false),
+                        None => ([0.0; 4], false),
                     };
                     let sb = t.selection_border;
+                    let hb = t.hover_border;
                     let (border_color, border_width) = if sel {
                         ([sb[0], sb[1], sb[2], fade], t.strip_border_width)
+                    } else if hov {
+                        (
+                            [hb[0], hb[1], hb[2], fade],
+                            (t.strip_border_width * 0.5).max(1.0),
+                        )
                     } else {
                         ([0.30, 0.30, 0.34, 0.55 * fade], 1.0)
                     };
-                    tiles.push(Tile {
+                    let tile = Tile {
                         x: cx - w * 0.5,
                         y: strip_y + (chip_h - h) * 0.5,
                         w,
@@ -1568,8 +1643,17 @@ impl Switchblade {
                         frame_fade: 0.0,
                         tex_mix: if has_tex { fade } else { 0.0 },
                         hires: false,
-                    });
+                    };
+                    if sel {
+                        sel_chip = Some(tile);
+                    } else if hov {
+                        hover_chip = Some(tile);
+                    } else {
+                        tiles.push(tile);
+                    }
                 }
+                tiles.extend(hover_chip);
+                tiles.extend(sel_chip);
             }
         }
 

@@ -6,11 +6,51 @@ use serde::Deserialize;
 
 use crate::commands::{CommandSpec, KeyMap};
 
+/// How much moves. Each level includes everything below it:
+/// `none` = snap-everything, no tweens, no video, no sheets;
+/// `minimal` = UI tweens back on; `normal` (default) = live video for
+/// quickview + selected/hovered; `full` = background sheet animation too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnimLevel {
+    None,
+    Minimal,
+    Normal,
+    Full,
+}
+
+impl AnimLevel {
+    /// UI tweens: camera glides, springs, fades. Off = snap.
+    pub fn ui(self) -> bool {
+        self >= AnimLevel::Minimal
+    }
+    /// Live video: quickview stream + selected/hovered tiles.
+    pub fn live(self) -> bool {
+        self >= AnimLevel::Normal
+    }
+    /// Background sprite-sheet cycling in the grid.
+    pub fn sheets(self) -> bool {
+        self == AnimLevel::Full
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" => AnimLevel::None,
+            "minimal" => AnimLevel::Minimal,
+            "normal" => AnimLevel::Normal,
+            "full" => AnimLevel::Full,
+            _ => return None,
+        })
+    }
+}
+
 /// Every feel-related constant lives here and hot-reloads from
 /// `switchblade.toml` (PLAN.md §10). Don't hardcode feel values elsewhere.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Tuning {
+    /// Animation level: "none" | "minimal" | "normal" | "full".
+    /// CLI `--animation` overrides this.
+    pub animation: AnimLevel,
     pub tile_width: f32,
     pub tile_height: f32,
     pub gap: f32,
@@ -52,8 +92,6 @@ pub struct Tuning {
     /// Walk directories given as inputs (CLI args or stdin) for video
     /// files. Off: directories are skipped entirely. Startup-only.
     pub recurse: bool,
-    /// Live video playback inside the selected tile.
-    pub live_preview: bool,
     /// How long the selection must settle before live playback starts.
     pub live_delay_ms: f32,
     /// Media quality — read once at startup (restart to apply).
@@ -86,14 +124,16 @@ pub struct Tuning {
     /// chip (color comes from selection_border).
     pub strip_corner_radius: f32,
     pub strip_border_width: f32,
+    /// Scale of the selected / hovered filmstrip chip (overlap is fine —
+    /// they draw above their neighbors, like the grid).
+    pub strip_selection_scale: f32,
+    pub strip_hover_scale: f32,
     /// Quickview backdrop: black-overlay strength (0..1) and frosted-glass
     /// blur level. The grid renders offscreen and is downsampled 2^level×
     /// before drawing back — a few tiny GPU passes, only while quickview
     /// is open. 0 = no blur, 1..4 = progressively softer.
     pub quickview_dim: f32,
     pub quickview_blur: f32,
-    /// Animated thumbnails in the grid (M6 sprite sheets).
-    pub anim: bool,
     /// Seconds for one full pass through an anim sheet's frames.
     pub anim_cycle_s: f32,
     /// Portion (0..1) of each frame interval spent crossfading into the
@@ -115,6 +155,7 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Self {
+            animation: AnimLevel::Normal,
             tile_width: 240.0,
             tile_height: 135.0,
             gap: 2.0,
@@ -138,7 +179,6 @@ impl Default for Tuning {
             zoom_fade_ms: 180.0,
             pause_unfocused: true,
             recurse: true,
-            live_preview: true,
             live_delay_ms: 100.0,
             thumb_width: 640,
             thumb_height: 360,
@@ -153,9 +193,10 @@ impl Default for Tuning {
             strip_snap_strength: 0.12,
             strip_corner_radius: 5.0,
             strip_border_width: 4.0,
+            strip_selection_scale: 1.35,
+            strip_hover_scale: 1.15,
             quickview_dim: 0.90,
             quickview_blur: 3.0,
-            anim: true,
             anim_cycle_s: 2.8,
             anim_crossfade: 0.35,
             anim_min_tile_w: 140.0,

@@ -58,14 +58,25 @@ pub const SEEK_FRACTION: f64 = 0.10;
 
 enum Request {
     Thumb(PathBuf),
+    /// Generate the thumb (+ meta) on disk without decoding/uploading —
+    /// the library-wide background sweep.
+    Gen(PathBuf),
     Anim(PathBuf),
 }
 
-/// Two-priority work queue: static thumbs always dispatch before anim
-/// sheets, so scrolling into fresh territory never waits on animations.
+/// Strict-priority work queue, popped top to bottom — a lower tier never
+/// runs while a higher one has work:
+///   1. `thumbs` — visible thumbnails (something on screen needs pixels)
+///   2. `gen`    — background thumb generation for the whole library
+///   3. `anims`  — sprite sheets, always last: every file gets a
+///      thumbnail before any animation work starts, and newly discovered
+///      files (streaming stdin, dir walks) jump ahead of sheets too.
+/// (Live video never queues here at all — it has its own unniced ffmpeg
+/// processes; these workers are niced below it.)
 #[derive(Default)]
 struct Queues {
     thumbs: VecDeque<PathBuf>,
+    gen: VecDeque<PathBuf>,
     anims: VecDeque<PathBuf>,
 }
 
@@ -92,6 +103,11 @@ pub enum ThumbResult {
         rgba: Vec<u8>,
     },
     AnimFailed {
+        path: PathBuf,
+    },
+    /// A background gen-sweep item finished (cache written or already
+    /// present; failures count too — they'd fail again on demand anyway).
+    GenDone {
         path: PathBuf,
     },
 }
@@ -129,6 +145,13 @@ impl MediaService {
     pub fn request(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
         lock.lock().unwrap().thumbs.push_back(path);
+        cv.notify_one();
+    }
+
+    /// Queue background thumb generation (disk cache only, no upload).
+    pub fn request_gen(&self, path: PathBuf) {
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().gen.push_back(path);
         cv.notify_one();
     }
 
@@ -337,13 +360,17 @@ fn worker(
     recipe: Recipe,
 ) {
     loop {
-        // Thumbs always beat anims; the lock drops before any work starts.
+        // Strict priority: visible thumbs, then the gen sweep, then anims.
+        // The lock drops before any work starts.
         let req = {
             let (lock, cv) = &*queue;
             let mut q = lock.lock().unwrap();
             loop {
                 if let Some(p) = q.thumbs.pop_front() {
                     break Request::Thumb(p);
+                }
+                if let Some(p) = q.gen.pop_front() {
+                    break Request::Gen(p);
                 }
                 if let Some(p) = q.anims.pop_front() {
                     break Request::Anim(p);
@@ -356,6 +383,10 @@ fn worker(
                 Some((w, h, rgba)) => ThumbResult::Ready { path, w, h, rgba },
                 None => ThumbResult::Failed { path },
             },
+            Request::Gen(path) => {
+                ensure_thumb_file(&path, &root, have_ffmpeg, &recipe);
+                ThumbResult::GenDone { path }
+            }
             Request::Anim(path) => match make_anim(&path, &root, have_ffmpeg, &recipe) {
                 Some((w, h, rgba)) => ThumbResult::AnimReady { path, w, h, rgba },
                 None => ThumbResult::AnimFailed { path },
@@ -374,6 +405,19 @@ fn make_thumb(
     have_ffmpeg: bool,
     recipe: &Recipe,
 ) -> Option<(u32, u32, Vec<u8>)> {
+    let jpg = ensure_thumb_file(src, root, have_ffmpeg, recipe)?;
+    decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
+}
+
+/// Make sure the thumb jpg (+ meta.json) exists on disk, returning its
+/// path — the decode/upload-free half of `make_thumb`, also used by the
+/// background gen sweep.
+fn ensure_thumb_file(
+    src: &Path,
+    root: &Path,
+    have_ffmpeg: bool,
+    recipe: &Recipe,
+) -> Option<PathBuf> {
     let meta = std::fs::metadata(src).ok()?;
     if !meta.is_file() {
         return None;
@@ -402,7 +446,7 @@ fn make_thumb(
         extract_frame(src, &jpg, seek, recipe, codec.as_deref())?;
         log::debug!("thumb generated: {}", src.display());
     }
-    decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
+    Some(jpg)
 }
 
 /// Generate/serve the animated sprite sheet: ANIM_FRAMES frames sampled
