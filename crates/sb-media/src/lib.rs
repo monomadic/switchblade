@@ -214,6 +214,13 @@ struct PacedQueue {
     frames: Mutex<VecDeque<(std::time::Instant, Vec<u8>)>>,
     /// Signalled when the consumer pops; the reader waits on it when full.
     space: Condvar,
+    /// Raised on drop. A stalled player's reader is parked on `space`
+    /// with a FULL queue (that's every warm player's steady state) — the
+    /// child's death can't wake it there, and without this flag the
+    /// thread would block forever, pinning ~30MB of frame buffers per
+    /// dropped player. That leak compounded into the "live video
+    /// throttles after browsing a while" bug.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// Read-ahead depth: enough to ride out a slow frame, small enough that
@@ -265,6 +272,7 @@ impl LivePlayer {
         let queue = Arc::new(PacedQueue {
             frames: Mutex::new(VecDeque::new()),
             space: Condvar::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
         });
         let shared = queue.clone();
         let frame_bytes = (w * h * 4) as usize;
@@ -275,17 +283,25 @@ impl LivePlayer {
         };
         thread::spawn(move || {
             use std::io::Read;
+            use std::sync::atomic::Ordering;
             use std::time::{Duration, Instant};
             let mut buf = vec![0u8; frame_bytes];
             let interval = Duration::from_secs_f64(1.0 / fps);
             let mut next_due: Option<Instant> = None;
             loop {
-                // Bounded read-ahead: block until the consumer makes room.
+                // Bounded read-ahead: block until the consumer makes room
+                // — or the player is dropped (`closed` + notify_all).
                 {
                     let mut q = shared.frames.lock().unwrap();
                     while q.len() >= LIVE_QUEUE_DEPTH {
+                        if shared.closed.load(Ordering::Relaxed) {
+                            return;
+                        }
                         q = shared.space.wait(q).unwrap();
                     }
+                }
+                if shared.closed.load(Ordering::Relaxed) {
+                    return;
                 }
                 if stdout.read_exact(&mut buf).is_err() {
                     return; // EOF or killed
@@ -347,6 +363,12 @@ impl LivePlayer {
 
 impl Drop for LivePlayer {
     fn drop(&mut self) {
+        // Wake a reader parked on the full-queue condvar so it exits
+        // (killing the child only unblocks a reader stuck in read_exact).
+        self.queue
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.queue.space.notify_all();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -899,6 +921,53 @@ mod tests {
         // sub-second work; a full-decode regression would still pass
         // here, but the per-frame command shape is what this pins.
         assert!(elapsed.as_secs() < 30, "sheet took {elapsed:?}");
+    }
+
+    /// Dropping a player must release its reader thread even when that
+    /// reader is parked on the full-queue condvar (every warm player's
+    /// steady state). The leak: kill() only unblocks read_exact, so
+    /// parked readers pinned ~30MB each, forever, per selection change —
+    /// live video degraded after browsing a while.
+    #[test]
+    fn dropped_player_releases_its_reader() {
+        if !have_binary("ffmpeg") {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_pace_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("pace_drop.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0, Some("h264")).expect("spawn");
+        // Never drain: the queue fills and the reader parks on `space`.
+        thread::sleep(std::time::Duration::from_millis(700));
+        // The reader holds the only other strong ref to the queue; if the
+        // weak ref dies after drop, the thread exited.
+        let queue = Arc::downgrade(&player.queue);
+        drop(player);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while queue.upgrade().is_some() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(queue.upgrade().is_none(), "reader thread leaked after drop");
     }
 
     /// The pre-warm contract: a player nobody drains fills its bounded

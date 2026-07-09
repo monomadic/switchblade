@@ -924,14 +924,16 @@ impl Switchblade {
                     warm_targets.push(i);
                 }
             };
+            // Warm-ups run one at a time, so this order is a priority:
+            // browsing flows right/down far more than left/up.
+            push(s + 1);
+            push(s + cols);
             if s > 0 {
                 push(s - 1);
             }
-            push(s + 1);
             if s >= cols {
                 push(s - cols);
             }
-            push(s + cols);
         }
 
         // Stop lanes whose target moved away. In quickview the selected
