@@ -37,10 +37,10 @@ Keys: `hjkl`/arrows move selection (reserved, not remappable; horizontal moves a
 - **stdin is sacred:** streaming, newline + NUL delimited, never block the UI on a slow producer. File stats happen on the ingest thread, not the render path. CLI path args take priority over stdin; non-video extensions are skipped; dirs walk when `recurse` (default true). Probe meta records display rotation — consumers must swap decode dims for ±90° clips or portrait phone footage stretches.
 - **No text stack until M7.** Labels are window-title or bitmap-font debug quality only.
 - **Filesystem cache, no SQLite** (until profiling proves otherwise — PLAN.md §8).
-- **Feel constants live in `Tuning`** (`crates/sb-app/src/tuning.rs`), hot-reloaded from `./switchblade.toml` (mtime poll, 250ms). Never hardcode a motion/feel value elsewhere — add a field.
+- **Feel constants live in `Tuning`** (`crates/sb-app/src/tuning.rs`), hot-reloaded (mtime poll, 250ms) from the first existing of `./switchblade.toml` → `~/.config/switchblade.toml` → `~/.config/switchblade/config.toml` (`config_path()`; `--init` writes the user copy). Never hardcode a motion/feel value elsewhere — add a field.
 - Motion must stay frame-rate independent: use `tuning::alpha(k, dt)` for smoothing, never raw per-frame lerps.
 - Keep dependencies lean; ask before adding one.
 
 ## Conventions
 - rustfmt defaults, edition 2021.
-- `cargo build` from repo root builds everything; the app reads `switchblade.toml` from the cwd, so run from repo root during development.
+- `cargo build` from repo root builds everything; a cwd `switchblade.toml` beats the ~/.config ones, so running from repo root during development uses the repo config (which is also the `--init` template, embedded via include_str!).

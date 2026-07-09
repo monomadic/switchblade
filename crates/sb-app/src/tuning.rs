@@ -225,6 +225,32 @@ pub struct Config {
     pub keymap: KeyMap,
 }
 
+/// Config search order: `./switchblade.toml` (dev/per-project override),
+/// then `~/.config/switchblade.toml`, then
+/// `~/.config/switchblade/config.toml` (XDG_CONFIG_HOME respected).
+/// First existing file wins; if none exist we still watch the cwd path,
+/// so creating it hot-loads. `switchblade --init` writes the user one.
+pub fn config_path() -> PathBuf {
+    let cwd = PathBuf::from("switchblade.toml");
+    if cwd.exists() {
+        return cwd;
+    }
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    if let Some(dir) = config_dir {
+        for p in [
+            dir.join("switchblade.toml"),
+            dir.join("switchblade/config.toml"),
+        ] {
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    cwd
+}
+
 /// Watches the tuning file by polling its mtime (at most every 250ms).
 pub struct TuningFile {
     path: PathBuf,

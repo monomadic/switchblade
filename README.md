@@ -62,7 +62,7 @@ Trackpad pans without changing the selection. Click selects; clicking the select
 
 ## Configuration
 
-`switchblade.toml` in the working directory. Motion and style values hot-reload while the app runs; media quality (`thumb_width/height/quality`, `anim_grid`, atlas size) applies on restart. Keys and commands:
+`switchblade --init` writes the annotated default config to `~/.config/switchblade.toml`; a `switchblade.toml` in the working directory (or `~/.config/switchblade/config.toml`) is also picked up, first match wins. Motion and style values hot-reload while the app runs; media quality (`thumb_width/height/quality`, `anim_grid`, atlas size) applies on restart. Keys and commands:
 
 ```toml
 [keys]

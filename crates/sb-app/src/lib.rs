@@ -5,7 +5,7 @@ mod commands;
 mod ingest;
 mod tuning;
 
-pub use tuning::{AnimLevel, Tuning};
+pub use tuning::{config_path, AnimLevel, Tuning};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -201,7 +201,7 @@ impl Switchblade {
         // Load config up front: atlas geometry, the media recipe, and the
         // ingest recurse flag are startup-only (the rest keeps
         // hot-reloading per frame).
-        let mut tuning_file = TuningFile::new(PathBuf::from("switchblade.toml"));
+        let mut tuning_file = TuningFile::new(tuning::config_path());
         let (tuning, keymap) = match tuning_file.poll() {
             Some(cfg) => (cfg.tuning, cfg.keymap),
             None => (Tuning::default(), KeyMap::default()),

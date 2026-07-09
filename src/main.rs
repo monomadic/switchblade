@@ -23,8 +23,13 @@ KEYS (defaults; remappable via [keys]/[commands] in ./switchblade.toml):
     q               quit
 
 CONFIG:
-    ./switchblade.toml — feel constants, keys, and commands; hot-reloads
-    while the app runs.
+    Feel constants, keys, and commands; hot-reloads while the app runs.
+    Search order (first existing wins):
+        ./switchblade.toml
+        ~/.config/switchblade.toml
+        ~/.config/switchblade/config.toml
+    `switchblade --init` writes the annotated default config to
+    ~/.config/switchblade.toml.
 
 OPTIONS:
     --animation <none|minimal|normal|full>
@@ -34,6 +39,7 @@ OPTIONS:
                     quickview/selected/hovered; full = + background
                     sheet animation
     --no-anim       legacy alias for --animation normal
+    --init          write the default config to ~/.config/switchblade.toml
     --demo          fake-tile demo grid (no media needed)
     -h, --help      print this help
     -V, --version   print version
@@ -64,6 +70,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             "--no-anim" => opts.animation = Some(sb_app::AnimLevel::Normal),
+            "--init" => return init_config(),
             "--demo" => opts.demo = true,
             "--help" | "-h" => {
                 print!("{HELP}");
@@ -88,4 +95,28 @@ fn main() -> anyhow::Result<()> {
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     sb_window::run(sb_app::Switchblade::with_options(opts))
+}
+
+/// `--init`: write the annotated example config (embedded at build time)
+/// to ~/.config/switchblade.toml. Refuses to overwrite an existing file.
+fn init_config() -> anyhow::Result<()> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    let Some(base) = base else {
+        eprintln!("switchblade: cannot resolve a config directory (no HOME)");
+        std::process::exit(1);
+    };
+    let dst = base.join("switchblade.toml");
+    if dst.exists() {
+        eprintln!(
+            "switchblade: {} already exists — not overwriting",
+            dst.display()
+        );
+        std::process::exit(1);
+    }
+    std::fs::create_dir_all(&base)?;
+    std::fs::write(&dst, include_str!("../switchblade.toml"))?;
+    println!("wrote {}", dst.display());
+    Ok(())
 }
