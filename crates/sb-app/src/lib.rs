@@ -227,8 +227,8 @@ impl Switchblade {
         let atlas_cfg = AtlasCfg {
             slot_w,
             slot_h,
-            cols: (tuning.atlas_width.min(8192) / slot_w).max(1),
-            rows: (tuning.atlas_height.min(8192) / slot_h).max(1),
+            cols: (tuning.atlas_width.min(16384) / slot_w).max(1),
+            rows: (tuning.atlas_height.min(16384) / slot_h).max(1),
             hires_w: tuning.quickview_max_width.clamp(320, 4096),
             hires_h: tuning.quickview_max_height.clamp(180, 4096),
         };
@@ -924,15 +924,16 @@ impl Switchblade {
                     warm_targets.push(i);
                 }
             };
-            // Warm-ups run one at a time, so this order is a priority:
-            // browsing flows right/down far more than left/up.
+            // Warm-ups run one at a time, so this order is a priority.
+            // Browsing overwhelmingly flows right (often repeatedly),
+            // then down; 'up' is rare enough to stay cold — its slot
+            // goes to the SECOND clip to the right instead, so a double
+            // right-tap is instant too.
             push(s + 1);
+            push(s + 2);
             push(s + cols);
             if s > 0 {
                 push(s - 1);
-            }
-            if s >= cols {
-                push(s - cols);
             }
         }
 

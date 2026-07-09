@@ -169,8 +169,20 @@ impl Gpu {
             })
             .await
             .ok_or_else(|| anyhow::anyhow!("no suitable gpu adapter"))?;
+        // wgpu's default limits cap textures at 8192² — half the slot
+        // count the atlas can use on modern GPUs (Apple silicon and
+        // desktop GPUs all do 16384²). Ask for what the adapter has.
+        let mut limits = wgpu::Limits::default();
+        limits.max_texture_dimension_2d =
+            adapter.limits().max_texture_dimension_2d.clamp(8192, 16384);
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_limits: limits,
+                    ..Default::default()
+                },
+                None,
+            )
             .await?;
 
         let caps = surface.get_capabilities(&adapter);
