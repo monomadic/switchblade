@@ -200,8 +200,30 @@ pub trait App {
     fn commands(&mut self) -> Vec<WindowCommand>;
 }
 
+/// Give the bare binary a real Dock / cmd-tab icon. Any process whose
+/// NSApplication activation policy is Regular gets a Dock tile (winit
+/// arranges that); the icon itself is set at runtime, mpv-style — no
+/// .app bundle required.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/icon.png"));
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe { app.setApplicationIconImage(Some(&image)) };
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
+
 pub fn run(app: impl App) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
+    set_dock_icon();
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut runner = Runner {
         app,

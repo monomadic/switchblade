@@ -10,3 +10,14 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 anyhow = { workspace = true }
 log = { workspace = true }
+
+# Dock icon for the bare (unbundled) binary — same versions winit
+# already pulls in transitively, so this adds no new compilation.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSData"] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSImage",
+    "NSResponder",
+] }

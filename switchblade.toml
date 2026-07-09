@@ -92,8 +92,8 @@ atlas_height = 8640
 # source's own resolution): the tile shows it downscaled (mipmapped) and
 # quickview shows the same stream big — so quickview opens instantly
 # with zero skip. Higher = sharper + more decode CPU while selected.
-quickview_max_width = 1920
-quickview_max_height = 1080
+quickview_max_width = 2560
+quickview_max_height = 1440
 # Quickview filmstrip: chip height (16:9), spacing, and how hard the
 # strip chases the selection per 60fps frame (same curve family as
 # key_snap_strength; 0.99 ≈ instant snap). The selected chip's border
