@@ -231,6 +231,7 @@ pub fn run(app: impl App) -> anyhow::Result<()> {
         last_frame: Instant::now(),
         cursor: (0.0, 0.0),
         animating: true,
+        occluded: false,
     };
     event_loop.run_app(&mut runner)?;
     Ok(())
@@ -240,6 +241,14 @@ pub fn run(app: impl App) -> anyhow::Result<()> {
 /// ticking without burning CPU on a static grid.
 const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Floor on the continuous-redraw interval. Pacing normally comes from
+/// the blocking vsync present inside `render()`, but any path where the
+/// present is skipped (occluded surface, lost surface) would otherwise
+/// let the Poll loop free-run `frame()` and peg a core. 4ms caps the
+/// runaway at 250fps while staying under every real refresh interval
+/// (240Hz = 4.16ms), so it never throttles a visible window.
+const MIN_FRAME: std::time::Duration = std::time::Duration::from_millis(4);
+
 struct Runner<A: App> {
     app: A,
     window: Option<Arc<Window>>,
@@ -247,6 +256,10 @@ struct Runner<A: App> {
     last_frame: Instant,
     cursor: (f32, f32),
     animating: bool,
+    /// Window fully hidden (minimized / covered / other Space). The
+    /// surface won't present, so the continuous-redraw path must not
+    /// run — see `about_to_wait`.
+    occluded: bool,
 }
 
 impl<A: App> Runner<A> {
@@ -361,6 +374,14 @@ impl<A: App> ApplicationHandler for Runner<A> {
             WindowEvent::Focused(focused) => {
                 self.app.event(InputEvent::Focus { focused });
             }
+            WindowEvent::Occluded(occluded) => {
+                log::debug!("window occluded: {occluded}");
+                self.occluded = occluded;
+                if !occluded {
+                    // Repaint promptly when the window comes back.
+                    self.animating = true;
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f32>(self.scale());
                 self.cursor = (p.x, p.y);
@@ -400,10 +421,26 @@ impl<A: App> ApplicationHandler for Runner<A> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Game-style continuous redraw while anything moves; a slow idle
         // tick otherwise. The app's motion is dt-scaled either way.
+        //
+        // An occluded window never presents (`render()` early-returns
+        // before the blocking vsync wait), so the continuous path has no
+        // pacing there — it would spin `frame()` as fast as the CPU
+        // allows, pegging a core the whole time the app is backgrounded
+        // and leaving the machine saturated by the time it resumes.
+        // Occluded always takes the idle tick, which still keeps stdin
+        // ingest, config reload, and job draining alive at 10Hz.
         let Some(w) = &self.window else { return };
-        if self.animating {
-            event_loop.set_control_flow(ControlFlow::Poll);
-            w.request_redraw();
+        if self.animating && !self.occluded {
+            // Even here, never trust the present to block: floor the
+            // interval at MIN_FRAME so a skipped present (surface lost,
+            // occlusion the OS didn't report) can't free-run the loop.
+            let next = self.last_frame + MIN_FRAME;
+            if Instant::now() >= next {
+                event_loop.set_control_flow(ControlFlow::Poll);
+                w.request_redraw();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
         } else if self.last_frame.elapsed() >= IDLE_TICK {
             w.request_redraw();
         } else {
