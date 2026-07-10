@@ -198,6 +198,30 @@ impl Default for Switchblade {
     }
 }
 
+/// One-shot config load (same search order as the app) for CLI verbs
+/// that need the current tuning without starting the app.
+pub fn load_tuning() -> Tuning {
+    TuningFile::new(tuning::config_path())
+        .poll()
+        .map(|cfg| cfg.tuning)
+        .unwrap_or_default()
+}
+
+/// The media recipe the given tuning produces — the SAME clamps as app
+/// startup, so cache maintenance agrees with the app about which
+/// artifacts the current configuration serves.
+pub fn recipe_from(tuning: &Tuning) -> Recipe {
+    Recipe {
+        thumb_w: tuning.thumb_width.clamp(64, 2048),
+        thumb_h: tuning.thumb_height.clamp(36, 2048),
+        // Config quality is 1..10 (10 = best); ffmpeg -q:v wants
+        // 2..31 (2 = best). 12 - q spans 2..11 — even quality 1
+        // avoids the hideous end of the scale.
+        quality: 12 - tuning.thumb_quality.clamp(1, 10),
+        anim_grid: tuning.anim_grid.clamp(1, 4),
+    }
+}
+
 impl Switchblade {
     pub fn new() -> Self {
         Self::with_options(Options::default())
@@ -226,10 +250,8 @@ impl Switchblade {
             ingest::spawn_stdin_reader(tuning.recurse)
         };
         let demo = rx.is_none();
-        let (slot_w, slot_h) = (
-            tuning.thumb_width.clamp(64, 2048),
-            tuning.thumb_height.clamp(36, 2048),
-        );
+        let recipe = recipe_from(&tuning);
+        let (slot_w, slot_h) = (recipe.thumb_w, recipe.thumb_h);
         let atlas_cfg = AtlasCfg {
             slot_w,
             slot_h,
@@ -244,17 +266,6 @@ impl Switchblade {
             atlas_cfg.rows,
             atlas_cfg.tex_w() as u64 * atlas_cfg.tex_h() as u64 * 4 / (1024 * 1024)
         );
-        let anim_grid = tuning.anim_grid.clamp(1, 4);
-        let recipe = Recipe {
-            thumb_w: slot_w,
-            thumb_h: slot_h,
-            // Config quality is 1..10 (10 = best); ffmpeg -q:v wants
-            // 2..31 (2 = best). 12 - q spans 2..11 — even quality 1
-            // avoids the hideous end of the scale.
-            quality: 12 - tuning.thumb_quality.clamp(1, 10),
-            anim_grid,
-        };
-
         let mut app = Self {
             clips: Vec::new(),
             index: HashMap::new(),
@@ -273,7 +284,7 @@ impl Switchblade {
             anim_on: true,
             focused: true,
             focus_pause_on: true,
-            anim_grid,
+            anim_grid: recipe.anim_grid,
             atlas_cfg,
             quickview: false,
             quickview_at: Instant::now(),

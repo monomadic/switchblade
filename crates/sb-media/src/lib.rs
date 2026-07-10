@@ -7,6 +7,8 @@
 //! `ffmpeg` CLI into a content-addressed sidecar cache, then decodes it to
 //! RGBA for the renderer's atlas. The render thread never blocks on this.
 
+pub mod maintenance;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -691,7 +693,7 @@ fn make_anim(
 }
 
 /// Cached probe results — a snapshot for humans and future features.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Meta {
     pub src: PathBuf,
     pub duration: Option<f64>,

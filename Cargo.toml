@@ -13,6 +13,7 @@ description = "A GPU-rendered video clip picker. fzf for videos."
 
 [dependencies]
 sb-app = { path = "crates/sb-app" }
+sb-media = { path = "crates/sb-media" }
 sb-window = { path = "crates/sb-window" }
 anyhow = { workspace = true }
 env_logger = "0.11"
