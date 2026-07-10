@@ -413,10 +413,11 @@ impl LivePlayer {
                 if stdout.read_exact(&mut buf).is_err() {
                     return; // EOF or killed
                 }
-                // Frame decoded late (cold start, slow keyframe, resumed
-                // from a park): re-anchor the schedule to now rather than
-                // keeping the debt — otherwise every owed frame comes due
-                // at once and plays as a fast-forward burst.
+                // Frame decoded late (cold start, slow keyframe, long
+                // backpressure stall): re-anchor the schedule to now
+                // rather than keeping the debt — otherwise every owed
+                // frame comes due at once and plays as a fast-forward
+                // burst.
                 let now = Instant::now();
                 let due = match next_due {
                     Some(d) if now <= d + interval / 2 => d,
@@ -432,22 +433,6 @@ impl LivePlayer {
             }
         });
         Some(Self { child, queue, w, h })
-    }
-
-    /// Freeze/resume the decoder in place (SIGSTOP/SIGCONT) — cheaper than
-    /// killing and respawning for short pauses, and playback resumes where
-    /// it left off. The pacer's lateness re-anchor keeps resumed frames
-    /// from fast-forwarding over frozen time. No-op on non-unix.
-    pub fn set_parked(&self, parked: bool) {
-        #[cfg(unix)]
-        {
-            let sig = if parked { libc::SIGSTOP } else { libc::SIGCONT };
-            unsafe {
-                libc::kill(self.child.id() as libc::pid_t, sig);
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = parked;
     }
 
     /// Frames currently queued (decoded, waiting for their due times).

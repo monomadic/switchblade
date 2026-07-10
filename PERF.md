@@ -245,7 +245,20 @@ pacebench numbers unchanged or better; a deliberately-wrong-fps spawn
 (pass 30 for a 60fps clip) plays at correct wall-clock speed (verify by
 eye or by frame-content timestamps in testsrc2's burned-in counter).
 
-## Phase 4 — contention & churn re-measurement ☐
+## Phase 4 — contention & churn re-measurement ☑ (2026-07-10)
+
+**Verdict: no tuning needed.** User-validated in-app after Phases 1–3:
+selection-move bursts "work 100% perfectly" browsing the real 4K60-heavy
+library, and no thumb→live color pop. Synthetic evidence agrees: the
+selection-move condition (paced stream + one flat-out hw chain) runs
+59.75fps with 1 gap/12s. A deliberate overload (paced stream + THREE
+flat-out hw chains) collapses to 40fps / 10 gaps/s — the VT media engine
+saturates at ~2 concurrent flat-out 4K60 chains, which is precisely why
+the settled warm-pool design (serialized fills, backpressure-stalled
+parking) must stay: it keeps concurrent active decode ≤2 chains by
+construction. Warm pool, settle delay, and drop-reaping all left
+untouched per measure-first. `set_parked` was still unused → deleted
+(with sb-media's `libc` dependency, which existed only for it).
 
 Goal: decide with fresh data whether warm-pool behavior needs tuning
 after Phase 1. **Measure first — no speculative changes.** The warm
@@ -309,5 +322,6 @@ BT.601/BT.709/full-range clip matrix test before shipping.
   `dropped_player_releases_its_reader`, `anim_sheet_generates_and_tiles`).
 - The pacing invariants from CLAUDE.md still bind: promotion before
   pruning; bounded queue = free warmth; drop must wake the condvar.
-- `set_parked` currently has no call sites (focus-pause kills lanes
-  instead). If it stays unused after Phase 4, delete it.
+- ~~`set_parked` currently has no call sites (focus-pause kills lanes
+  instead). If it stays unused after Phase 4, delete it.~~ Deleted with
+  Phase 4 (2026-07-10).
