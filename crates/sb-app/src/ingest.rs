@@ -80,6 +80,17 @@ pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool) -> Receiver<Ingeste
     rx
 }
 
+/// One directory's own video files, no recursion — the "browse parent
+/// dir" (siblings) view. Streams like every other source; iCloud stubs
+/// in the directory still resolve to placeholders.
+pub fn spawn_dir_reader(dir: PathBuf) -> Receiver<Ingested> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = walk_dir(&tx, &dir, 0, 0);
+    });
+    rx
+}
+
 fn send_path(
     tx: &Sender<Ingested>,
     mut bytes: &[u8],
@@ -113,7 +124,7 @@ fn handle_path(
     let meta = std::fs::metadata(&path);
     if meta.as_ref().is_ok_and(|m| m.is_dir()) {
         if recurse {
-            walk_dir(tx, &path, 0)?;
+            walk_dir(tx, &path, 0, 24)?;
         }
         return Ok(());
     }
@@ -131,8 +142,14 @@ fn handle_path(
 /// Streaming recursive walk (depth-capped; hidden entries and symlinked
 /// directories are skipped — no cycles). `.name.icloud` download stubs
 /// resolve back to their original video name as cloud placeholders.
-fn walk_dir(tx: &Sender<Ingested>, dir: &Path, depth: usize) -> Result<(), SendError<Ingested>> {
-    if depth > 24 {
+/// `max_depth` 0 lists only the directory's own files (siblings view).
+fn walk_dir(
+    tx: &Sender<Ingested>,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+) -> Result<(), SendError<Ingested>> {
+    if depth > max_depth {
         return Ok(());
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -168,7 +185,7 @@ fn walk_dir(tx: &Sender<Ingested>, dir: &Path, depth: usize) -> Result<(), SendE
         }
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            walk_dir(tx, &e.path(), depth + 1)?;
+            walk_dir(tx, &e.path(), depth + 1, max_depth)?;
         } else if ft.is_file() && is_video(&e.path()) {
             let p = e.path();
             let meta = std::fs::metadata(&p);
@@ -181,6 +198,33 @@ fn walk_dir(tx: &Sender<Ingested>, dir: &Path, depth: usize) -> Result<(), SendE
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The siblings view must list the directory's own videos only — no
+    /// recursion into subdirectories, no non-video files.
+    #[test]
+    fn dir_reader_lists_only_siblings() {
+        let dir = std::env::temp_dir().join("sb_ingest_siblings_test");
+        let sub = dir.join("sub");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in ["a.mp4", "b.mov", "note.txt"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        std::fs::write(sub.join("c.mp4"), b"").unwrap();
+
+        let rx = spawn_dir_reader(dir.clone());
+        let mut names: Vec<String> = rx
+            .iter()
+            .map(|i| i.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.mp4", "b.mov"]);
+    }
 }
 
 /// Detect iCloud placeholders: APFS dataless files (evicted by

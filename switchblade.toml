@@ -53,6 +53,10 @@ animation = "normal"
 # flying across the grid doesn't spawn a decoder per keypress).
 live_delay_ms = 100.0
 
+# [ / ] jump the playing clip by this fraction of its duration (wraps at
+# the ends). A binding can override the amount per key — see [keys] below.
+skip_fraction = 0.10
+
 # Pause live playback + sheet animation while the window is unfocused
 # (the grid stays visible, just still — big CPU saver). Toggle at
 # runtime with 'p'.
@@ -137,12 +141,15 @@ empty_border = [0.10, 0.10, 0.13]
 background = [0.004, 0.004, 0.006]
 
 # ── Keys & commands (PLAN.md §11) ────────────────────────────────────────
-# Built-in defaults: enter/o = open (mpv) · space = preview (looping mpv)
-# · c = copy_path · q = quit · f = fullscreen · -/=/0 = zoom.
+# Built-in defaults: enter/o = open (mpv) · space = quickview · c =
+# copy_path · q = quit · f = fullscreen · -/=/0 = zoom · [ / ] = skip
+# back/fwd through the playing clip · D = browse the selected clip's
+# parent dir (siblings; the playing clip keeps playing and stays selected).
 # hjkl/arrows are reserved for movement. Entries here override defaults.
 # {path}, {dir}, {name} expand against the selected clip.
-# Built-in internal actions: quit, fullscreen, copy_path,
-# zoom_in, zoom_out, zoom_reset.
+# Built-in internal actions: quit, fullscreen, copy_path, zoom_in,
+# zoom_out, zoom_reset, toggle_anim, toggle_focus_pause, quickview,
+# skip_forward, skip_back, open_parent.
 
 [keys]
 enter = "open"
@@ -153,7 +160,11 @@ c = "copy_path"
 a = "toggle_anim"       # background tile animation on/off
 p = "toggle_focus_pause" # pause-when-unfocused on/off
 r = "reveal"            # reveal in Finder (open -R)
+"[" = "skip_back"       # jump by skip_fraction; wraps at the ends
+"]" = "skip_forward"
+D = "open_parent"       # re-ingest from the selected clip's parent dir
 # n = "rename_script"   # any key -> any launched program; see below
+# "{" = "skip_back_big" # a skip with its own amount; see below
 
 # "open" is just a command like any other — swap mpv for whatever you
 # like, or add more commands and bind keys to them.
@@ -187,3 +198,10 @@ args = [
 # type = "launch"
 # program = "~/bin/rename-media"
 # args = ["{path}"]
+
+# Internal actions take parameters too — a skip command with `amount`
+# jumps by that fraction instead of skip_fraction:
+# [commands.skip_back_big]
+# type = "internal"
+# action = "skip_back"
+# amount = 0.25

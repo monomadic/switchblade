@@ -25,6 +25,10 @@ pub enum CommandSpec {
     },
     Internal {
         action: String,
+        /// Action parameter — today only the skip actions read it (the
+        /// fraction of the clip to jump, overriding `skip_fraction`).
+        #[serde(default)]
+        amount: Option<f32>,
     },
 }
 
@@ -42,6 +46,11 @@ pub enum Action {
     ToggleAnim,
     ToggleFocusPause,
     Quickview,
+    /// Jump the playing clip by a fraction of its duration; `None` falls
+    /// back to the tuning `skip_fraction`.
+    Skip { forward: bool, amount: Option<f32> },
+    /// Re-ingest from the selected clip's parent directory (siblings view).
+    OpenParent,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +76,9 @@ impl Default for KeyMap {
             ("a", "toggle_anim"),
             ("p", "toggle_focus_pause"),
             ("r", "reveal"),
+            ("[", "skip_back"),
+            ("]", "skip_forward"),
+            ("D", "open_parent"),
         ] {
             keys.insert(k.to_string(), v.to_string());
         }
@@ -129,9 +141,9 @@ impl KeyMap {
                 program: program.clone(),
                 args: args.clone(),
             }),
-            Some(CommandSpec::Internal { action }) => internal_action(action),
+            Some(CommandSpec::Internal { action, amount }) => internal_action(action, *amount),
             // A command name with no [commands] entry is an internal action.
-            None => internal_action(name),
+            None => internal_action(name, None),
         }
     }
 }
@@ -147,7 +159,7 @@ fn key_name(key: &Key) -> Option<String> {
     })
 }
 
-fn internal_action(name: &str) -> Option<Action> {
+fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
     Some(match name {
         "quit" => Action::Quit,
         "fullscreen" | "toggle_fullscreen" => Action::ToggleFullscreen,
@@ -158,6 +170,15 @@ fn internal_action(name: &str) -> Option<Action> {
         "toggle_anim" => Action::ToggleAnim,
         "toggle_focus_pause" => Action::ToggleFocusPause,
         "quickview" => Action::Quickview,
+        "skip_forward" => Action::Skip {
+            forward: true,
+            amount,
+        },
+        "skip_back" | "skip_backward" => Action::Skip {
+            forward: false,
+            amount,
+        },
+        "open_parent" | "browse_parent" => Action::OpenParent,
         other => {
             log::warn!(
                 "unknown command '{other}': no [commands.{other}] entry and not a built-in action"
@@ -273,6 +294,46 @@ mod tests {
         ));
         assert!(map.action_for(&Key::Char('x')).is_none());
         assert!(map.action_for(&Key::Left).is_none());
+    }
+
+    #[test]
+    fn skip_and_parent_defaults_resolve() {
+        let map = KeyMap::default();
+        assert!(matches!(
+            map.action_for(&Key::Char('[')),
+            Some(Action::Skip {
+                forward: false,
+                amount: None
+            })
+        ));
+        assert!(matches!(
+            map.action_for(&Key::Char(']')),
+            Some(Action::Skip {
+                forward: true,
+                amount: None
+            })
+        ));
+        assert!(matches!(
+            map.action_for(&Key::Char('D')),
+            Some(Action::OpenParent)
+        ));
+    }
+
+    #[test]
+    fn internal_amount_reaches_the_action() {
+        let spec: CommandSpec =
+            toml::from_str("type = \"internal\"\naction = \"skip_forward\"\namount = 0.25")
+                .unwrap();
+        let keys = HashMap::from([("s".to_string(), "big_skip".to_string())]);
+        let commands = HashMap::from([("big_skip".to_string(), spec)]);
+        let map = KeyMap::merged(keys, commands);
+        match map.action_for(&Key::Char('s')) {
+            Some(Action::Skip {
+                forward: true,
+                amount: Some(a),
+            }) => assert!((a - 0.25).abs() < 1e-6),
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[test]

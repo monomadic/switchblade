@@ -25,6 +25,9 @@ use tuning::{alpha, TuningFile};
 const PREFETCH_ROWS: usize = 2;
 /// Thumbnail crossfade duration once pixels arrive.
 const THUMB_FADE_S: f32 = 0.3;
+/// Skip flash bar: hold after a `[`/`]` skip, then a quick fade-out.
+const SKIP_BAR_HOLD_S: f32 = 1.0;
+const SKIP_BAR_FADE_S: f32 = 0.25;
 
 const DEMO_TILES: usize = 480;
 
@@ -75,9 +78,29 @@ struct LiveState {
 /// quickview modal shows it big — one decoder, one timeline, no handoffs.
 struct SelLive {
     clip: usize,
+    /// The clip's path — survives index churn (the D siblings swap
+    /// renumbers every clip while this stream keeps playing).
+    path: PathBuf,
     player: sb_media::LivePlayer,
     spawned: Instant,
     first_frame: Option<Instant>,
+    /// Seconds into the clip where this stream started decoding.
+    seek: f64,
+    /// Cached probe duration, for skip targets and the skip flash bar.
+    duration: Option<f64>,
+}
+
+impl SelLive {
+    /// Estimated playback position in seconds (unwrapped — callers mod by
+    /// duration for looping sources). Wall-clock from the first frame is
+    /// accurate enough: output is CFR-forced, so the stream tracks it.
+    fn position(&self) -> f64 {
+        self.seek
+            + self
+                .first_frame
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0)
+    }
 }
 
 struct Clip {
@@ -130,6 +153,17 @@ pub struct Switchblade {
     warm: Vec<SelLive>,
     /// The newest hires frame this tick, routed to Frame.hires_upload.
     hires_frame: Option<HiresFrame>,
+    /// Which clip's pixels the hires texture currently holds. Lets a
+    /// skip-respawned stream keep showing its last frame (the texture
+    /// still has it) instead of flashing back to the thumbnail while the
+    /// new decoder warms up.
+    hires_shown: Option<PathBuf>,
+    /// The D (siblings) swap in flight: the selected clip's path, kept
+    /// playing while the parent-dir listing streams in; when it arrives
+    /// it becomes the selection again.
+    pending_reselect: Option<PathBuf>,
+    /// Set on `[`/`]` — the skip flash bar shows for a moment after.
+    skip_flash_at: Option<Instant>,
     /// Clips already queued for meta.json healing this session (old
     /// cache entries lack pix_fmt, so live spawns fall back to the
     /// software chain until a background reprobe rewrites them — see
@@ -276,6 +310,9 @@ impl Switchblade {
             live_hover: None,
             warm: Vec::new(),
             hires_frame: None,
+            hires_shown: None,
+            pending_reselect: None,
+            skip_flash_at: None,
             reprobed: std::collections::HashSet::new(),
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
@@ -424,6 +461,8 @@ impl Switchblade {
         if idx != self.selected {
             self.selected = idx;
             self.sel_changed_at = Instant::now();
+            // An explicit move outranks the D swap's pending reselect.
+            self.pending_reselect = None;
         }
         self.scroll_to_selected();
     }
@@ -485,6 +524,8 @@ impl Switchblade {
                     self.strip_pos = self.selected as f32;
                 }
             }
+            Action::Skip { forward, amount } => self.skip(forward, amount),
+            Action::OpenParent => self.open_parent(),
             Action::CopyPath => {
                 if let Some(clip) = self.clips.get(self.selected) {
                     commands::copy_path(&clip.path);
@@ -502,6 +543,94 @@ impl Switchblade {
                 }
             }
         }
+    }
+
+    /// `[`/`]`: jump the playing clip by a fraction of its duration.
+    /// A "seek" is a decoder respawn at the new offset (the ffmpeg stream
+    /// has no seek channel); the last frame stays on screen via
+    /// `hires_shown` until the new stream delivers, so it reads as a
+    /// jump, not a reload. Wraps at the ends — playback loops anyway.
+    fn skip(&mut self, forward: bool, amount: Option<f32>) {
+        let Some(path) = self.clips.get(self.selected).map(|c| c.path.clone()) else {
+            return;
+        };
+        let target = {
+            let Some(l) = &self.live_sel else { return };
+            if l.path != path {
+                return; // stream not on the selected clip (e.g. mid-swap)
+            }
+            let Some(d) = l.duration.filter(|d| *d > 0.05) else {
+                return; // duration unknown: no meaningful fraction to jump
+            };
+            let frac = amount.unwrap_or(self.tuning.skip_fraction).clamp(0.001, 1.0) as f64;
+            (l.position() + if forward { frac * d } else { -frac * d }).rem_euclid(d)
+        };
+        if let Some(l) = self.start_sel_live(self.selected, Some(target)) {
+            self.live_sel = Some(l); // old player drops (reader wakes + exits)
+            self.skip_flash_at = Some(Instant::now());
+            self.wake(1.5); // outlive the flash bar's hold + fade
+        }
+    }
+
+    /// The post-skip flash bar: `Some((played fraction, alpha))` while
+    /// it's visible — holds a second after a skip, then fades out fast.
+    fn skip_bar(&self) -> Option<(f32, f32)> {
+        let t = self.skip_flash_at?.elapsed().as_secs_f32();
+        if t >= SKIP_BAR_HOLD_S + SKIP_BAR_FADE_S {
+            return None;
+        }
+        let l = self.live_sel.as_ref()?;
+        // Only over the clip that was skipped (selection may have moved).
+        if self.clips.get(self.selected).is_none_or(|c| c.path != l.path) {
+            return None;
+        }
+        let d = l.duration.filter(|d| *d > 0.05)?;
+        // Level "none": fades complete in one frame — show, then vanish.
+        let alpha = if self.level().ui() {
+            ((SKIP_BAR_HOLD_S + SKIP_BAR_FADE_S - t) / SKIP_BAR_FADE_S).min(1.0)
+        } else if t < SKIP_BAR_HOLD_S {
+            1.0
+        } else {
+            return None;
+        };
+        let pos = (l.position().rem_euclid(d) / d) as f32;
+        Some((pos.clamp(0.0, 1.0), alpha))
+    }
+
+    /// `D`: rebuild the library from the selected clip's parent directory
+    /// (its siblings, non-recursive), streaming in the background like any
+    /// other source. The selected clip's live stream survives the swap —
+    /// `pending_reselect` shields it until its path streams back in and
+    /// becomes the selection again.
+    fn open_parent(&mut self) {
+        if self.demo || self.pending_reselect.is_some() {
+            return;
+        }
+        let Some(clip) = self.clips.get(self.selected) else {
+            return;
+        };
+        let path = clip.path.clone();
+        let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+            return;
+        };
+        log::info!("browsing siblings of {}", path.display());
+        self.rx = Some(ingest::spawn_dir_reader(dir.to_path_buf()));
+        // All per-clip state is index-keyed; drop it and let the new
+        // listing stream in (thumbs re-serve from the disk cache).
+        self.clips.clear();
+        self.index.clear();
+        self.slots.fill(None);
+        self.live_hover = None;
+        self.warm.clear();
+        self.hovered = None;
+        self.strip_hover = None;
+        self.selected = 0;
+        self.pending_reselect = Some(path);
+        // Fade the old grid out over the new one, like the zoom reflow.
+        if !self.last_tiles.is_empty() {
+            self.transition = Some((std::mem::take(&mut self.last_tiles), Instant::now()));
+        }
+        self.wake(1.0);
     }
 
     /// True while animation/live playback should rest because the window
@@ -538,6 +667,10 @@ impl Switchblade {
 
     fn drain_ingest(&mut self) {
         let Some(rx) = &self.rx else { return };
+        // The D swap's clip found its new index this drain (only field
+        // updates are legal while `rx` borrows self; the selection move
+        // happens after the loop).
+        let mut reselect: Option<usize> = None;
         loop {
             match rx.try_recv() {
                 Ok(item) => {
@@ -545,6 +678,10 @@ impl Switchblade {
                     self.wake_until = self
                         .wake_until
                         .max(Instant::now() + Duration::from_millis(600));
+                    if self.pending_reselect.as_deref() == Some(item.path.as_path()) {
+                        self.pending_reselect = None;
+                        reselect = Some(self.clips.len());
+                    }
                     self.index.insert(item.path.clone(), self.clips.len());
                     // Cloud placeholders never request a thumbnail: reading
                     // the file would force iCloud to download it.
@@ -579,8 +716,24 @@ impl Switchblade {
                 Err(TryRecvError::Disconnected) => {
                     log::info!("stdin closed — {} clips ingested", self.clips.len());
                     self.rx = None;
+                    // The awaited clip never showed up (deleted/moved):
+                    // stop shielding its stream; update_live reaps it.
+                    self.pending_reselect = None;
                     break;
                 }
+            }
+        }
+        if let Some(i) = reselect {
+            self.selected = i;
+            self.sel_changed_at = Instant::now();
+            if let Some(l) = &mut self.live_sel {
+                if l.path == self.clips[i].path {
+                    l.clip = i; // the surviving stream, renumbered
+                }
+            }
+            self.scroll_to_selected();
+            if self.quickview {
+                self.strip_pos = i as f32; // snap; don't slide across the dir
             }
         }
     }
@@ -853,7 +1006,8 @@ impl Switchblade {
                     }
                 }
                 ThumbResult::GenDone { .. } => {
-                    self.jobs_done += 1;
+                    // Counted once at the top of the loop like every other
+                    // result — a second increment here overran jobs_total.
                     self.wake(0.3); // progress bar tick
                 }
             }
@@ -929,11 +1083,16 @@ impl Switchblade {
             self.hovered.filter(|h| *h != self.selected)
         };
 
+        // A D swap in flight: clip indices are churning, so don't warm,
+        // spawn or reap by index — just keep the shielded stream playing
+        // until its path streams back in and the selection re-lands.
+        let pending = self.pending_reselect.is_some();
+
         // Pre-warm decoders for the four movement destinations (±1 and
         // ±row) so a selection move shows video instantly instead of
         // paying a cold ffmpeg spawn (~1s on 4K sources).
         let mut warm_targets: Vec<usize> = Vec::new();
-        if live_on {
+        if live_on && !pending {
             let s = self.selected;
             let cols = lay.cols.max(1);
             let n = self.clips.len();
@@ -958,11 +1117,10 @@ impl Switchblade {
         // Stop lanes whose target moved away. In quickview the selected
         // stream demotes to a warm neighbor instead of dying — reversing
         // direction picks it right back up, still on its timeline.
-        if self
-            .live_sel
-            .as_ref()
-            .is_some_and(|l| sel_target != Some(l.clip))
-        {
+        if self.live_sel.as_ref().is_some_and(|l| {
+            sel_target != Some(l.clip)
+                && self.pending_reselect.as_deref() != Some(l.path.as_path())
+        }) {
             let l = self.live_sel.take().unwrap();
             if warm_targets.contains(&l.clip) {
                 self.warm.push(l);
@@ -985,7 +1143,7 @@ impl Switchblade {
         // the selection itself — pruning first would kill the very decoder
         // that was warmed for this moment (the bug that made every advance
         // pay full ffmpeg spawn latency).
-        if self.live_sel.is_none() {
+        if self.live_sel.is_none() && !pending {
             if let Some(i) = sel_target {
                 if let Some(pos) = self.warm.iter().position(|w| w.clip == i) {
                     let l = self.warm.remove(pos);
@@ -997,7 +1155,7 @@ impl Switchblade {
                 } else if self.quickview
                     || self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
                 {
-                    self.live_sel = self.start_sel_live(i);
+                    self.live_sel = self.start_sel_live(i, None);
                 }
             }
         }
@@ -1026,7 +1184,7 @@ impl Switchblade {
                 .iter()
                 .find(|&&i| self.warm.iter().all(|w| w.clip != i))
             {
-                if let Some(l) = self.start_sel_live(i) {
+                if let Some(l) = self.start_sel_live(i, None) {
                     self.warm.push(l);
                 }
             }
@@ -1062,6 +1220,9 @@ impl Switchblade {
                         live.spawned.elapsed().as_secs_f32() * 1000.0
                     );
                 }
+                if self.hires_shown.as_ref() != Some(&live.path) {
+                    self.hires_shown = Some(live.path.clone());
+                }
                 self.hires_frame = Some(HiresFrame {
                     w: live.player.w,
                     h: live.player.h,
@@ -1083,7 +1244,9 @@ impl Switchblade {
 
     /// The selected clip's decoder: natural resolution, capped at the hires
     /// texture (never upscaled past the source when its dims are known).
-    fn start_sel_live(&mut self, i: usize) -> Option<SelLive> {
+    /// `seek_override` (seconds) starts elsewhere than the thumbnail's
+    /// frame — the skip commands' respawn-seek.
+    fn start_sel_live(&mut self, i: usize, seek_override: Option<f64>) -> Option<SelLive> {
         let clip = self.clips.get(i)?;
         let (tw, th, path) = match clip.thumb {
             Thumb::Ready { tw, th, .. } if clip.readable && !clip.cloud => {
@@ -1112,19 +1275,21 @@ impl Switchblade {
         let (dw, dh) = (((sw * scale) as u32).max(2), ((sh * scale) as u32).max(2));
         // Start where the thumbnail was taken, so video continues from the
         // frame the tile already shows instead of jolting to 0:00.
-        let seek = meta
-            .as_ref()
-            .and_then(|m| m.duration)
-            .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
+        let duration = meta.as_ref().and_then(|m| m.duration);
+        let seek = seek_override
+            .or_else(|| duration.map(|d| (d * sb_media::SEEK_FRACTION).max(0.0)))
             .unwrap_or(0.0);
         self.heal_meta(meta.as_ref(), &path);
         let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek, meta.as_ref())?;
         log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
         Some(SelLive {
             clip: i,
+            path,
             player,
             spawned: Instant::now(),
             first_frame: None,
+            seek,
+            duration,
         })
     }
 
@@ -1186,6 +1351,7 @@ impl Switchblade {
 
         let now = Instant::now();
         let anim_t = now.saturating_duration_since(self.t0).as_secs_f32();
+        let skip_bar = self.skip_bar();
         self.anim_rendered = false;
         let mut tiles = Vec::new();
         // Z-order: grid tiles, then the hovered tile lifted above its
@@ -1239,7 +1405,14 @@ impl Switchblade {
                 let mut live_hires: Option<(f32, f32)> = None;
                 if selected {
                     if let Some(l) = &self.live_sel {
-                        if l.clip == i && l.first_frame.is_some() {
+                        // Path (not index) match: indices churn during the
+                        // D swap. A skip-respawned stream with no frame yet
+                        // keeps showing the texture's last frame — same
+                        // clip, so it reads as a freeze then jump.
+                        if l.path == clip.path
+                            && (l.first_frame.is_some()
+                                || self.hires_shown.as_ref() == Some(&l.path))
+                        {
                             live_hires = Some((l.player.w as f32, l.player.h as f32));
                         }
                     }
@@ -1449,6 +1622,12 @@ impl Switchblade {
                     // Selected tiles make the wait obvious: big, centered.
                     push_loading_dots(out, &tile, ease, anim_t, selected);
                 }
+                // Post-skip position flash (in quickview the modal has it).
+                if selected && !self.quickview {
+                    if let Some((pos, a)) = skip_bar {
+                        push_skip_bar(out, &tile, pos, a * ease);
+                    }
+                }
             }
         }
         tiles.extend(hovered_group);
@@ -1526,11 +1705,14 @@ impl Switchblade {
 
                 // The modal shows the same hires stream the tile plays —
                 // already running, already sharp, no handoff. Static thumb
-                // stands in for the brief first-frame window.
-                let live = self
-                    .live_sel
-                    .as_ref()
-                    .filter(|l| l.clip == self.selected && l.first_frame.is_some());
+                // stands in for the brief first-frame window; a skip
+                // respawn keeps the texture's last frame instead; and
+                // during the D swap the shielded stream stays up while
+                // the selection index is in flux.
+                let live = self.live_sel.as_ref().filter(|l| {
+                    (l.path == clip.path || self.pending_reselect.as_ref() == Some(&l.path))
+                        && (l.first_frame.is_some() || self.hires_shown.as_ref() == Some(&l.path))
+                });
                 let src = if let Some(l) = live {
                     let (w, h) = (l.player.w as f32, l.player.h as f32);
                     let (hw, hh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
@@ -1562,7 +1744,7 @@ impl Switchblade {
                     } else {
                         w = h * a;
                     }
-                    tiles.push(Tile {
+                    let video = Tile {
                         x: (vw - w) * 0.5,
                         y: (avail_h - h) * 0.5 + 6.0,
                         w,
@@ -1576,7 +1758,12 @@ impl Switchblade {
                         frame_fade: 0.0,
                         tex_mix: fade,
                         hires,
-                    });
+                    };
+                    tiles.push(video);
+                    // Post-skip position flash along the video's bottom.
+                    if let Some((pos, a)) = skip_bar {
+                        push_skip_bar(&mut tiles, &video, pos, a * fade);
+                    }
                 } else {
                     // Nothing decoded yet: big dots in the middle.
                     let stage = full(
@@ -1776,6 +1963,7 @@ impl App for Switchblade {
                         if i != self.selected {
                             self.selected = i;
                             self.sel_changed_at = Instant::now();
+                            self.pending_reselect = None; // click outranks the D reselect
                             self.scroll_to_selected();
                         }
                     } else {
@@ -1792,6 +1980,7 @@ impl App for Switchblade {
                     } else {
                         self.selected = i;
                         self.sel_changed_at = Instant::now();
+                        self.pending_reselect = None; // click outranks the D reselect
                     }
                 }
             }
@@ -1833,6 +2022,124 @@ impl App for Switchblade {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive the app loop headlessly until `cond` holds (or time out).
+    fn pump_until(app: &mut Switchblade, cond: impl Fn(&Switchblade) -> bool) -> bool {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let _ = app.frame(0.016, vp);
+            if cond(app) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// `D` rebuilds the library from the selected clip's parent directory
+    /// and the clip finds itself again once the listing streams in.
+    #[test]
+    fn open_parent_swaps_to_siblings_and_reselects() {
+        let dir = std::env::temp_dir().join("sb_app_parent_swap_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["a.mp4", "b.mp4", "c.mp4"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None), // no live decoders in tests
+            inputs: vec![dir.join("b.mp4")],
+            demo: false,
+        });
+        assert!(
+            pump_until(&mut app, |a| a.clips.len() == 1),
+            "single-file ingest"
+        );
+        assert_eq!(app.selected, 0);
+
+        app.event(InputEvent::Key {
+            key: Key::Char('D'),
+            repeat: false,
+        });
+        assert!(
+            pump_until(&mut app, |a| a.clips.len() == 3
+                && a.pending_reselect.is_none()),
+            "siblings swap"
+        );
+        assert_eq!(
+            app.clips[app.selected].path,
+            dir.join("b.mp4"),
+            "the clip re-finds itself among its siblings"
+        );
+    }
+
+    /// `]` respawns the selected stream further into the clip and arms
+    /// the skip flash bar. Needs ffmpeg (thumb + live decode) — skipped
+    /// quietly when it's not on PATH, like the sb-media pacing tests.
+    #[test]
+    fn skip_respawns_the_selected_stream_at_a_new_offset() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_skip_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("skip.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=320x180:rate=30")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip],
+            demo: false,
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+        let before = app.live_sel.as_ref().unwrap().position();
+
+        app.event(InputEvent::Key {
+            key: Key::Char(']'),
+            repeat: false,
+        });
+        let l = app.live_sel.as_ref().expect("stream survives the skip");
+        assert!(
+            l.seek > before + 0.2,
+            "expected a forward jump, seek {} from position {before}",
+            l.seek
+        );
+        assert!(l.first_frame.is_none(), "skip respawns the decoder");
+        assert!(app.skip_bar().is_some(), "the flash bar arms on skip");
+    }
+}
+
 /// A little cloud in the tile's bottom-right corner, built from two circles
 /// and a rounded bar — no icon assets, no text stack, just tiles.
 fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
@@ -1857,6 +2164,34 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
     out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
     out.push(part(bx, by + 7.0, 28.0, 10.0)); // base bar
+}
+
+/// A slim playback-position bar along a tile's bottom edge — the short
+/// flash after a `[`/`]` skip. Dark track under a bright fill so it reads
+/// over any video content.
+fn push_skip_bar(out: &mut Vec<Tile>, tile: &Tile, pos: f32, alpha: f32) {
+    let pad = 12.0_f32.min(tile.w * 0.06).max(4.0);
+    let bw = (tile.w - pad * 2.0).max(8.0);
+    let bh = 3.0;
+    let by = tile.y + tile.h - bh - pad;
+    let bar = |x: f32, w: f32, color: [f32; 4]| Tile {
+        x,
+        y: by,
+        w,
+        h: bh,
+        color,
+        border_color: [0.0; 4],
+        corner_radius: bh * 0.5,
+        border_width: 0.0,
+        uv: [0.0; 4],
+        uv2: [0.0; 4],
+        frame_fade: 0.0,
+        tex_mix: 0.0,
+        hires: false,
+    };
+    let bx = tile.x + pad;
+    out.push(bar(bx, bw, [0.08, 0.08, 0.10, 0.55 * alpha]));
+    out.push(bar(bx, (bw * pos).max(bh), [0.95, 0.95, 0.98, 0.95 * alpha]));
 }
 
 /// Three pulsing dots while a thumbnail is generating: each breathes from
