@@ -75,7 +75,12 @@ pub struct Tuning {
     pub corner_radius: f32,
     /// Corner radius of the selected tile (usually larger).
     pub selection_corner_radius: f32,
-    pub border_width: f32,
+    /// Border widths of the selected / hovered tile (colors come from
+    /// selection_border / hover_border below). `border_width` is accepted
+    /// as a legacy alias for the selection one.
+    #[serde(alias = "border_width")]
+    pub selection_border_width: f32,
+    pub hover_border_width: f32,
     /// Tile spawn fade/scale-in duration.
     pub fade_in_ms: f32,
     /// Pinch delta multiplier for zoom.
@@ -173,7 +178,8 @@ impl Default for Tuning {
             scale_smoothing: 0.35,
             corner_radius: 5.0,
             selection_corner_radius: 10.0,
-            border_width: 6.0,
+            selection_border_width: 6.0,
+            hover_border_width: 1.0,
             fade_in_ms: 220.0,
             pinch_sensitivity: 1.0,
             zoom_min: 0.35,

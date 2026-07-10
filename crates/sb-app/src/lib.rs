@@ -88,6 +88,10 @@ struct SelLive {
     seek: f64,
     /// Cached probe duration, for skip targets and the skip flash bar.
     duration: Option<f64>,
+    /// Set when this stream was born from a `[`/`]` skip of this signed
+    /// size — scrub intent: the next same-direction destination pre-warms
+    /// so a chained press lands instantly instead of paying a cold spawn.
+    skip_delta: Option<f64>,
 }
 
 impl SelLive {
@@ -151,6 +155,10 @@ pub struct Switchblade {
     /// unwatched player's bounded frame queue fills and stalls ffmpeg
     /// after a few frames, so warmth is all but free.
     warm: Vec<SelLive>,
+    /// Pre-warmed decoder at the selected stream's next skip destination
+    /// (`seek + skip_delta`), so chained `[`/`]` presses jump instantly —
+    /// a cold respawn costs ~1s, the same floor the neighbor pool hides.
+    warm_skip: Option<SelLive>,
     /// The newest hires frame this tick, routed to Frame.hires_upload.
     hires_frame: Option<HiresFrame>,
     /// Which clip's pixels the hires texture currently holds. Lets a
@@ -309,6 +317,7 @@ impl Switchblade {
             live_sel: None,
             live_hover: None,
             warm: Vec::new(),
+            warm_skip: None,
             hires_frame: None,
             hires_shown: None,
             pending_reselect: None,
@@ -550,11 +559,14 @@ impl Switchblade {
     /// has no seek channel); the last frame stays on screen via
     /// `hires_shown` until the new stream delivers, so it reads as a
     /// jump, not a reload. Wraps at the ends — playback loops anyway.
+    /// A chained press promotes the pre-warmed decoder at the next
+    /// checkpoint (see `warm_skip`) and shows video the same tick; only
+    /// the first skip on a stream pays the cold-spawn floor.
     fn skip(&mut self, forward: bool, amount: Option<f32>) {
         let Some(path) = self.clips.get(self.selected).map(|c| c.path.clone()) else {
             return;
         };
-        let target = {
+        let (delta, target, promote) = {
             let Some(l) = &self.live_sel else { return };
             if l.path != path {
                 return; // stream not on the selected clip (e.g. mid-swap)
@@ -563,13 +575,30 @@ impl Switchblade {
                 return; // duration unknown: no meaningful fraction to jump
             };
             let frac = amount.unwrap_or(self.tuning.skip_fraction).clamp(0.001, 1.0) as f64;
-            (l.position() + if forward { frac * d } else { -frac * d }).rem_euclid(d)
+            let delta = if forward { frac * d } else { -frac * d };
+            // The warm decoder sits at the anchor-relative checkpoint
+            // (seek + delta); take it while playback is still within one
+            // skip-length of the anchor — chained presses always are, and
+            // a longer dwell means the user is watching, where an exact
+            // position-relative respawn beats a stale checkpoint.
+            let want = (l.seek + delta).rem_euclid(d);
+            let promote = l.position() - l.seek < delta.abs()
+                && self
+                    .warm_skip
+                    .as_ref()
+                    .is_some_and(|w| w.path == path && (w.seek - want).abs() < 0.05);
+            (delta, (l.position() + delta).rem_euclid(d), promote)
         };
-        if let Some(l) = self.start_sel_live(self.selected, Some(target)) {
-            self.live_sel = Some(l); // old player drops (reader wakes + exits)
-            self.skip_flash_at = Some(Instant::now());
-            self.wake(1.5); // outlive the flash bar's hold + fade
-        }
+        let next = if promote {
+            self.warm_skip.take() // its queued frames serve this same tick
+        } else {
+            self.start_sel_live(self.selected, Some(target))
+        };
+        let Some(mut l) = next else { return };
+        l.skip_delta = Some(delta); // scrub intent: pre-warm the next one
+        self.live_sel = Some(l); // old player drops (reader wakes + exits)
+        self.skip_flash_at = Some(Instant::now());
+        self.wake(1.5); // outlive the flash bar's hold + fade
     }
 
     /// The post-skip flash bar: `Some((played fraction, alpha))` while
@@ -1177,8 +1206,49 @@ impl Switchblade {
         let warming_up = self
             .warm
             .iter()
+            .chain(self.warm_skip.as_ref())
             .any(|w| w.player.buffered() == 0 && w.spawned.elapsed().as_secs_f32() < 5.0);
-        if sel_ready && !warming_up && self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
+
+        // Skip pre-warm: a stream born from `[`/`]` keeps a decoder warm
+        // at its next same-direction checkpoint (seek + skip_delta). The
+        // plan dies once playback drifts a full skip-length past the
+        // anchor (the user stopped scrubbing — an exact position-relative
+        // respawn beats a stale checkpoint) or the stream changes clip.
+        let skip_plan = if pending || !live_on {
+            None
+        } else {
+            self.live_sel.as_ref().and_then(|l| {
+                let delta = l.skip_delta?;
+                let d = l.duration.filter(|d| *d > 0.05)?;
+                (l.position() - l.seek < delta.abs())
+                    .then(|| (l.path.clone(), (l.seek + delta).rem_euclid(d)))
+            })
+        };
+        if self.warm_skip.as_ref().is_some_and(|w| {
+            skip_plan
+                .as_ref()
+                .is_none_or(|(p, s)| *p != w.path || (*s - w.seek).abs() > 0.05)
+        }) {
+            self.warm_skip = None;
+        }
+        // Spawns share the neighbor pool's stagger rules (selected stream
+        // first, one warm-up at a time); the scrub destination outranks
+        // neighbors — the user's hands are on [ and ], not h and l.
+        let mut spawned_warm = false;
+        if sel_ready && !warming_up && self.warm_skip.is_none() {
+            if let Some((_, target)) = &skip_plan {
+                if let Some(mut l) = self.start_sel_live(self.selected, Some(*target)) {
+                    l.skip_delta = self.live_sel.as_ref().and_then(|s| s.skip_delta);
+                    log::debug!("skip pre-warm @{target:.1}s");
+                    self.warm_skip = Some(l);
+                    spawned_warm = true;
+                }
+            }
+        }
+        if sel_ready
+            && !warming_up
+            && !spawned_warm
+            && self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
         {
             if let Some(&i) = warm_targets
                 .iter()
@@ -1290,6 +1360,7 @@ impl Switchblade {
             first_frame: None,
             seek,
             duration,
+            skip_delta: None,
         })
     }
 
@@ -1581,11 +1652,15 @@ impl Switchblade {
                 let (border_color, border_width, radius) = if selected {
                     (
                         [sb[0], sb[1], sb[2], ease],
-                        t.border_width,
+                        t.selection_border_width,
                         t.selection_corner_radius,
                     )
                 } else if hovered {
-                    ([hb[0], hb[1], hb[2], 0.35 * ease], 1.0, t.corner_radius)
+                    (
+                        [hb[0], hb[1], hb[2], 0.35 * ease],
+                        t.hover_border_width,
+                        t.corner_radius,
+                    )
                 } else if thumb.is_none() && clip.readable && !clip.cloud {
                     ([eb[0], eb[1], eb[2], ease], 1.0, t.corner_radius)
                 } else {
@@ -2032,7 +2107,9 @@ mod tests {
             width: 1280.0,
             height: 800.0,
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Generous: media tests run in parallel and contend for ffmpeg
+        // spawns; the loop returns the moment the condition holds.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             let _ = app.frame(0.016, vp);
             if cond(app) {
@@ -2137,6 +2214,74 @@ mod tests {
         );
         assert!(l.first_frame.is_none(), "skip respawns the decoder");
         assert!(app.skip_bar().is_some(), "the flash bar arms on skip");
+    }
+
+    /// A chained same-direction skip must promote the pre-warmed decoder
+    /// at the next checkpoint — instantly (queued frames), not via a cold
+    /// respawn. Needs ffmpeg; skipped quietly when missing.
+    #[test]
+    fn chained_skips_promote_the_prewarmed_decoder() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_skip_chain_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("chain.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=20:size=320x180:rate=30")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip],
+            demo: false,
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+
+        // First skip: cold, but it declares scrub intent (skip_delta) —
+        // the next checkpoint should pre-warm and buffer frames.
+        app.skip(true, Some(0.25));
+        assert!(
+            app.live_sel.as_ref().is_some_and(|l| l.skip_delta.is_some()),
+            "skip marks scrub intent"
+        );
+        assert!(
+            pump_until(&mut app, |a| a
+                .warm_skip
+                .as_ref()
+                .is_some_and(|w| w.player.buffered() > 0)),
+            "next checkpoint never pre-warmed"
+        );
+        let planned = app.warm_skip.as_ref().unwrap().seek;
+
+        // Chained press: the warm decoder is promoted as-is and already
+        // holds due frames — video the same tick, no cold spawn.
+        app.skip(true, Some(0.25));
+        let l = app.live_sel.as_ref().expect("stream survives");
+        assert_eq!(l.seek, planned, "promoted the pre-warmed decoder");
+        assert!(l.player.buffered() > 0, "promotion serves instantly");
+        assert!(app.warm_skip.is_none(), "the warm slot was consumed");
     }
 }
 
