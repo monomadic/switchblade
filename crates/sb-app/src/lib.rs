@@ -130,6 +130,12 @@ pub struct Switchblade {
     warm: Vec<SelLive>,
     /// The newest hires frame this tick, routed to Frame.hires_upload.
     hires_frame: Option<HiresFrame>,
+    /// Clips already queued for meta.json healing this session (old
+    /// cache entries lack pix_fmt, so live spawns fall back to the
+    /// software chain until a background reprobe rewrites them — see
+    /// `MediaService::request_reprobe`). Keeps repeat visits from
+    /// re-queueing the same clip.
+    reprobed: std::collections::HashSet<PathBuf>,
     sel_changed_at: Instant,
     hover_changed_at: Instant,
     demo: bool,
@@ -259,6 +265,7 @@ impl Switchblade {
             live_hover: None,
             warm: Vec::new(),
             hires_frame: None,
+            reprobed: std::collections::HashSet::new(),
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
@@ -1053,6 +1060,16 @@ impl Switchblade {
         }
     }
 
+    /// Cache entries written before `Meta.pix_fmt` existed force the
+    /// software scale chain (the hw gate can't run blind); queue a
+    /// one-time background reprobe so the clip's NEXT spawn goes
+    /// hardware. Never probe on the render thread — that's a hitch.
+    fn heal_meta(&mut self, meta: Option<&sb_media::Meta>, path: &std::path::Path) {
+        if meta.is_some_and(|m| m.pix_fmt.is_none()) && self.reprobed.insert(path.to_path_buf()) {
+            self.media.request_reprobe(path.to_path_buf());
+        }
+    }
+
     /// The selected clip's decoder: natural resolution, capped at the hires
     /// texture (never upscaled past the source when its dims are known).
     fn start_sel_live(&mut self, i: usize) -> Option<SelLive> {
@@ -1089,9 +1106,8 @@ impl Switchblade {
             .and_then(|m| m.duration)
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        let fps = meta.as_ref().and_then(|m| m.fps).unwrap_or(30.0);
-        let codec = meta.as_ref().and_then(|m| m.codec.as_deref());
-        let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek, fps, codec)?;
+        self.heal_meta(meta.as_ref(), &path);
+        let player = sb_media::LivePlayer::spawn(&path, dw, dh, seek, meta.as_ref())?;
         log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
         Some(SelLive {
             clip: i,
@@ -1120,9 +1136,8 @@ impl Switchblade {
             .and_then(|m| m.duration)
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
-        let fps = meta.as_ref().and_then(|m| m.fps).unwrap_or(30.0);
-        let codec = meta.as_ref().and_then(|m| m.codec.as_deref());
-        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek, fps, codec) else {
+        self.heal_meta(meta.as_ref(), &path);
+        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek, meta.as_ref()) else {
             log::debug!("live preview failed to start: {}", path.display());
             return None;
         };

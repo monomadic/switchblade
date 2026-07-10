@@ -58,6 +58,9 @@ pub const SEEK_FRACTION: f64 = 0.10;
 
 enum Request {
     Thumb(PathBuf),
+    /// Re-run ffprobe and rewrite meta.json — heals cache entries
+    /// written before a `Meta` field existed. No result is sent.
+    Reprobe(PathBuf),
     /// Generate the thumb (+ meta) on disk without decoding/uploading —
     /// the library-wide background sweep.
     Gen(PathBuf),
@@ -66,16 +69,21 @@ enum Request {
 
 /// Strict-priority work queue, popped top to bottom — a lower tier never
 /// runs while a higher one has work:
-///   1. `thumbs` — visible thumbnails (something on screen needs pixels)
-///   2. `gen`    — background thumb generation for the whole library
-///   3. `anims`  — sprite sheets, always last: every file gets a
+///   1. `thumbs`   — visible thumbnails (something on screen needs pixels)
+///   2. `reprobes` — meta.json healing for clips the user is playing
+///      live right now (one cheap ffprobe unblocks the hardware scale
+///      chain for that clip's next spawn)
+///   3. `gen`      — background thumb generation for the whole library
+///   4. `anims`    — sprite sheets, always last: every file gets a
 ///      thumbnail before any animation work starts, and newly discovered
 ///      files (streaming stdin, dir walks) jump ahead of sheets too.
+///
 /// (Live video never queues here at all — it has its own unniced ffmpeg
 /// processes; these workers are niced below it.)
 #[derive(Default)]
 struct Queues {
     thumbs: VecDeque<PathBuf>,
+    reprobes: VecDeque<PathBuf>,
     gen: VecDeque<PathBuf>,
     anims: VecDeque<PathBuf>,
 }
@@ -148,6 +156,18 @@ impl MediaService {
         cv.notify_one();
     }
 
+    /// Queue a background meta.json rewrite for a clip whose cached
+    /// probe predates a `Meta` field (today: `pix_fmt`, which gates the
+    /// hardware scale chain — the clip plays through the software chain
+    /// until healed). Duplicate requests are cheap no-ops (the worker
+    /// skips entries that are already complete), but callers should
+    /// still dedup per session to keep the queue clean.
+    pub fn request_reprobe(&self, path: PathBuf) {
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().reprobes.push_back(path);
+        cv.notify_one();
+    }
+
     /// Queue background thumb generation (disk cache only, no upload).
     pub fn request_gen(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
@@ -173,6 +193,60 @@ impl MediaService {
 /// than straight software decode — don't send them there.
 fn vt_accel(codec: Option<&str>) -> bool {
     cfg!(target_os = "macos") && matches!(codec, Some("h264" | "hevc" | "h265" | "prores"))
+}
+
+/// Hardware *scaling* for live playback: keep frames on the GPU through
+/// decode → (transpose_vt) → scale_vt, and only `hwdownload` at TARGET
+/// resolution — the CPU then converts ~1.5Mpx to RGBA instead of
+/// scaling 8Mpx down first. Measured on 4K60 HEVC → 1440p: 2.3× the
+/// throughput at ~2.5× less CPU than the software chain (PERF.md §1).
+///
+/// Returns the `-vf` string, or None when the clip must take the
+/// software chain instead:
+/// - non-VT codec (VP9/AV1 decode *slower* through VT — see `vt_accel`);
+/// - unknown/exotic pixel format: `hwdownload` requires the raw format
+///   named explicitly, and it differs by bit depth (nv12 for 8-bit
+///   4:2:0, p010le for 10-bit; 4:2:2/4:4:4 aren't worth a hw mapping);
+///   callers must pass dims already aligned down to a multiple of 8
+///   (see `spawn`) or delivery jitters;
+/// - a rotation hw frames can't express: they do NOT autorotate
+///   (verified — misrotated output scores ~0.25dB PSNR vs ground
+///   truth). ±90° maps onto transpose_vt (direction PSNR-verified,
+///   31dB+ both signs); 180° and odd angles fall back to software,
+///   which autorotates correctly.
+fn hw_scale_vf(
+    codec: Option<&str>,
+    pix_fmt: Option<&str>,
+    rotation: Option<f64>,
+    w: u32,
+    h: u32,
+) -> Option<String> {
+    if !vt_accel(codec) {
+        return None;
+    }
+    let dl = match pix_fmt? {
+        "yuv420p" | "yuvj420p" | "nv12" => "nv12",
+        "yuv420p10le" | "p010le" => "p010le",
+        _ => return None,
+    };
+    let transpose = match rotation {
+        None => "",
+        Some(r) => {
+            let q = (r / 90.0).round();
+            if (r - q * 90.0).abs() > 1.0 {
+                return None; // odd angle
+            }
+            match (q as i64).rem_euclid(4) {
+                0 => "",
+                1 => "transpose_vt=cclock,", // rotation +90 / -270
+                3 => "transpose_vt=clock,",  // rotation -90 / +270
+                _ => return None,            // 180°
+            }
+        }
+    };
+    Some(format!(
+        "{transpose}scale_vt={w}:{h},hwdownload,format={dl},format=rgba"
+    ))
 }
 
 /// Background jobs (probe, thumbs, sheets, cache decode) run niced so
@@ -230,25 +304,61 @@ const LIVE_QUEUE_DEPTH: usize = 3;
 impl LivePlayer {
     /// `seek` starts playback that many seconds in — pass the thumbnail's
     /// frame time so live video continues from what the tile showed.
-    /// `fps` paces delivery (the clip's rate from cached meta; ~30 if
-    /// unknown). `codec` (from cached meta) gates hardware decode.
-    pub fn spawn(
-        path: &Path,
-        w: u32,
-        h: u32,
-        seek: f64,
-        fps: f64,
-        codec: Option<&str>,
-    ) -> Option<Self> {
-        let (w, h) = (w.max(2), h.max(2));
+    /// `meta` (the clip's cached probe) supplies fps for pacing (~30 if
+    /// unknown), codec to gate hardware decode, and pix_fmt/rotation to
+    /// gate hardware *scaling*. The actual decode size is `self.w/h` —
+    /// the hardware chain rounds the request DOWN to a multiple of 8:
+    /// unaligned scale_vt/hwdownload dims deliver frames with periodic
+    /// ~2× interval jitter (measured: 8-bit needs mod-4, 10-bit mod-8;
+    /// mod-2 gapped 4/s). Content is squeezed ≤7px, never cropped.
+    pub fn spawn(path: &Path, w: u32, h: u32, seek: f64, meta: Option<&Meta>) -> Option<Self> {
+        let (mut w, mut h) = (w.max(2), h.max(2));
+        let fps = meta.and_then(|m| m.fps).unwrap_or(30.0);
+        let codec = meta.and_then(|m| m.codec.as_deref());
+        let hw_vf = if w >= 8 && h >= 8 {
+            hw_scale_vf(
+                codec,
+                meta.and_then(|m| m.pix_fmt.as_deref()),
+                meta.and_then(|m| m.rotation),
+                w & !7,
+                h & !7,
+            )
+        } else {
+            None // tiny target: sw scaling is cheap and exact
+        };
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-stream_loop", "-1"]);
-        if vt_accel(codec) {
+        if hw_vf.is_some() {
+            (w, h) = (w & !7, h & !7);
+            // -noautorotate pins rotation handling to our explicit
+            // transpose_vt: hw frames never autorotate today, but don't
+            // let a future ffmpeg change that behind our back.
+            cmd.args(["-noautorotate", "-hwaccel", "videotoolbox"]);
+            cmd.args(["-hwaccel_output_format", "videotoolbox_vld"]);
+        } else if vt_accel(codec) {
             cmd.args(["-hwaccel", "videotoolbox"]);
         }
         if seek > 0.05 {
             cmd.args(["-ss", &format!("{seek:.3}")]);
         }
+        let fps = if fps.is_finite() {
+            fps.clamp(1.0, 240.0)
+        } else {
+            30.0
+        };
+        // Software fallback scales with fast_bilinear: at video rates the
+        // frame persists ~17ms and the hires texture is mip-sampled, so
+        // bicubic buys nothing visible — it cost ~0.7 core extra and the
+        // difference between keeping up with 4K60 and not (100 vs 67fps
+        // measured; thumb/anim generation keeps bicubic, quality matters
+        // there and rate doesn't).
+        let vf = hw_vf.unwrap_or_else(|| format!("scale={w}:{h}:flags=fast_bilinear"));
+        // Output `-r` forces CFR at the pacing rate. The reader stamps
+        // frames 1/fps apart and ASSUMES ffmpeg emits that cadence —
+        // `-r` makes the assumption true by construction, so wrong or
+        // missing fps meta and genuinely-VFR sources degrade to
+        // dup/dropped frames at the right wall-clock speed instead of
+        // playing at the wrong speed.
         let mut child = cmd
             .arg("-i")
             .arg(path)
@@ -256,7 +366,9 @@ impl LivePlayer {
                 "-an",
                 "-sn",
                 "-vf",
-                &format!("scale={w}:{h}"),
+                &vf,
+                "-r",
+                &format!("{fps}"),
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -276,11 +388,6 @@ impl LivePlayer {
         });
         let shared = queue.clone();
         let frame_bytes = (w * h * 4) as usize;
-        let fps = if fps.is_finite() {
-            fps.clamp(1.0, 240.0)
-        } else {
-            30.0
-        };
         thread::spawn(move || {
             use std::io::Read;
             use std::sync::atomic::Ordering;
@@ -316,7 +423,12 @@ impl LivePlayer {
                     _ => now,
                 };
                 next_due = Some(due + interval);
-                shared.frames.lock().unwrap().push_back((due, buf.clone()));
+                // Hand the filled buffer over and allocate a fresh one
+                // OUTSIDE the lock — `buf.clone()` as the push_back arg
+                // ran a 14.7MB memcpy (1–2ms at 1440p) while holding the
+                // mutex `take_frame` contends on every render tick.
+                let frame = std::mem::replace(&mut buf, vec![0u8; frame_bytes]);
+                shared.frames.lock().unwrap().push_back((due, frame));
             }
         });
         Some(Self { child, queue, w, h })
@@ -391,6 +503,9 @@ fn worker(
                 if let Some(p) = q.thumbs.pop_front() {
                     break Request::Thumb(p);
                 }
+                if let Some(p) = q.reprobes.pop_front() {
+                    break Request::Reprobe(p);
+                }
                 if let Some(p) = q.gen.pop_front() {
                     break Request::Gen(p);
                 }
@@ -405,6 +520,12 @@ fn worker(
                 Some((w, h, rgba)) => ThumbResult::Ready { path, w, h, rgba },
                 None => ThumbResult::Failed { path },
             },
+            Request::Reprobe(path) => {
+                if have_ffmpeg {
+                    reprobe(&path, &root);
+                }
+                continue; // nothing to upload, no result
+            }
             Request::Gen(path) => {
                 ensure_thumb_file(&path, &root, have_ffmpeg, &recipe);
                 ThumbResult::GenDone { path }
@@ -598,6 +719,13 @@ pub struct Meta {
     /// relative to the coded dims above. Absent in older meta.json.
     #[serde(default)]
     pub rotation: Option<f64>,
+    /// Source pixel format (`yuv420p`, `p010le`, …). Gates the hardware
+    /// scale chain: `hwdownload` needs the raw format named explicitly
+    /// and 8- vs 10-bit take different ones. Absent in older meta.json —
+    /// those clips play through the software chain until a background
+    /// reprobe heals the cache entry (`request_reprobe`).
+    #[serde(default)]
+    pub pix_fmt: Option<String>,
 }
 
 /// Read the cached meta.json for a clip without probing (cheap: one small
@@ -609,7 +737,38 @@ pub fn cached_meta(path: &Path) -> Option<Meta> {
     serde_json::from_slice(&std::fs::read(file).ok()?).ok()
 }
 
-fn probe(src: &Path) -> Option<Meta> {
+/// Worker-side half of `request_reprobe`: probe again and rewrite the
+/// clip's meta.json in place. Skips entries that already carry every
+/// gating field (duplicate queue entries and cross-worker races both
+/// land here as cheap no-ops — last write wins and the writes agree).
+fn reprobe(src: &Path, root: &Path) {
+    let Ok(st) = std::fs::metadata(src) else {
+        return;
+    };
+    let fp = fingerprint(src, st.len(), mtime_secs(&st));
+    let dir = root.join(&fp[..2]).join(&fp);
+    let file = dir.join("meta.json");
+    if let Ok(bytes) = std::fs::read(&file) {
+        if serde_json::from_slice::<Meta>(&bytes).is_ok_and(|m| m.pix_fmt.is_some()) {
+            return; // already healed
+        }
+    }
+    let Some(m) = probe(src) else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&m) {
+        let _ = std::fs::write(&file, json);
+        log::debug!("meta healed: {}", src.display());
+    }
+}
+
+/// Probe a clip with ffprobe (niced, blocking — do not call from the
+/// render path; the cache normally supplies this via `cached_meta`).
+/// Public for the pacebench example and future tooling.
+pub fn probe(src: &Path) -> Option<Meta> {
     let out = media_cmd("ffprobe")
         .args([
             "-v",
@@ -658,6 +817,7 @@ fn probe(src: &Path) -> Option<Meta> {
         codec: video.and_then(|s| s["codec_name"].as_str().map(String::from)),
         fps,
         rotation,
+        pix_fmt: video.and_then(|s| s["pix_fmt"].as_str().map(String::from)),
     })
 }
 
@@ -818,6 +978,21 @@ fn have_binary(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Meta for the generated test clips (h264 yuv420p @30) — on macOS
+    /// this takes the hardware scale chain, so the pacing tests cover it.
+    fn test_meta(clip: &Path) -> Meta {
+        Meta {
+            src: clip.to_path_buf(),
+            duration: None,
+            width: None,
+            height: None,
+            codec: Some("h264".into()),
+            fps: Some(30.0),
+            rotation: None,
+            pix_fmt: Some("yuv420p".into()),
+        }
+    }
+
     /// Live playback must deliver frames at the clip's rate from the very
     /// start — no initial burst (the fast-forward bug) and no stall.
     #[test]
@@ -848,7 +1023,7 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0, Some("h264")).expect("spawn");
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Give it a moment to open the input, then measure one second.
         let mut first = None;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -956,7 +1131,7 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0, Some("h264")).expect("spawn");
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Never drain: the queue fills and the reader parks on `space`.
         thread::sleep(std::time::Duration::from_millis(700));
         // The reader holds the only other strong ref to the queue; if the
@@ -1002,7 +1177,7 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, 30.0, Some("h264")).expect("spawn");
+        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Warm without watching: the queue caps at LIVE_QUEUE_DEPTH and
         // the decoder stalls behind it.
         thread::sleep(std::time::Duration::from_millis(800));
