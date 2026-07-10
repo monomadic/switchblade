@@ -8,7 +8,7 @@ log = "0.4"
 [package]
 name = "switchblade"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A GPU-rendered video clip picker. fzf for videos."
 
 [dependencies]
