@@ -7,5 +7,5 @@ edition = "2021"
 sb-window = { path = "../sb-window" }
 sb-media = { path = "../sb-media" }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 log = { workspace = true }

@@ -117,13 +117,18 @@ fn reduce_in(root: &Path, recipe: &Recipe, target_bytes: u64) -> Removed {
 }
 
 /// Iterate entry directories: `<root>/<2-hex shard>/<fingerprint>/`.
-fn entries(root: &Path) -> impl Iterator<Item = PathBuf> {
+fn entries(root: &Path) -> impl Iterator<Item = PathBuf> + use<> {
     std::fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|shard| shard.path().is_dir())
-        .flat_map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten())
+        .flat_map(|shard| {
+            std::fs::read_dir(shard.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
         .map(|e| e.path())
         .filter(|p| p.is_dir())
 }
@@ -242,12 +247,12 @@ mod tests {
         // Live entry: current artifacts + old-recipe + tmp leftovers.
         let live = live_entry(&root, &src);
         for name in [
-            RECIPE.thumb_file(),                     // keep
-            RECIPE.anim_file(),                      // keep
-            "thumb_fit_320x180_q7.jpg".into(),       // old recipe
-            "anim_2x2_640x360_q5.jpg".into(),        // old recipe
-            "thumb_fit_640x360_q5.jpg.tmp".into(),   // interrupted write
-            "animf_4.jpg".into(),                    // orphaned frame
+            RECIPE.thumb_file(),                   // keep
+            RECIPE.anim_file(),                    // keep
+            "thumb_fit_320x180_q7.jpg".into(),     // old recipe
+            "anim_2x2_640x360_q5.jpg".into(),      // old recipe
+            "thumb_fit_640x360_q5.jpg.tmp".into(), // interrupted write
+            "animf_4.jpg".into(),                  // orphaned frame
         ] {
             std::fs::write(live.join(name), b"jpg").unwrap();
         }

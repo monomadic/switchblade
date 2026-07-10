@@ -107,7 +107,10 @@ fn main() {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize] * 1000.0;
     let expected = 1000.0 / fps;
-    let long_gaps = intervals.iter().filter(|&&i| i * 1000.0 > expected * 1.8).count();
+    let long_gaps = intervals
+        .iter()
+        .filter(|&&i| i * 1000.0 > expected * 1.8)
+        .count();
     println!(
         "first frame: {:.0}ms after spawn\n\
          delivered {} frames over {:.2}s = {:.2} fps (target {:.2})\n\

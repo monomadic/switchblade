@@ -256,7 +256,10 @@ fn benchmark(clip: std::path::PathBuf) -> anyhow::Result<()> {
     println!("\ntile lane {}x{}:", tile.0, tile.1);
     bench_pass(&clip, tile.0, tile.1, &meta, 8.0, false);
 
-    println!("\nquickview {}x{} (current config chain):", quick.0, quick.1);
+    println!(
+        "\nquickview {}x{} (current config chain):",
+        quick.0, quick.1
+    );
     bench_pass(&clip, quick.0, quick.1, &meta, 8.0, false);
 
     // The hardware scale chain needs a VT codec AND a known 4:2:0
@@ -269,7 +272,10 @@ fn benchmark(clip: std::path::PathBuf) -> anyhow::Result<()> {
     if vt_codec && meta.pix_fmt.is_some() {
         let mut sw_meta = meta.clone();
         sw_meta.pix_fmt = None;
-        println!("\nquickview {}x{} (forced software scale):", quick.0, quick.1);
+        println!(
+            "\nquickview {}x{} (forced software scale):",
+            quick.0, quick.1
+        );
         bench_pass(&clip, quick.0, quick.1, &sw_meta, 8.0, false);
     } else {
         println!(
@@ -291,7 +297,14 @@ fn benchmark(clip: std::path::PathBuf) -> anyhow::Result<()> {
 /// One measurement pass: spawn, poll at 60Hz for `secs`, report
 /// delivery stats against the clip's own frame rate (`quiet` runs the
 /// pass without reporting — the warmup).
-fn bench_pass(clip: &std::path::Path, w: u32, h: u32, meta: &sb_media::Meta, secs: f64, quiet: bool) {
+fn bench_pass(
+    clip: &std::path::Path,
+    w: u32,
+    h: u32,
+    meta: &sb_media::Meta,
+    secs: f64,
+    quiet: bool,
+) {
     use std::time::{Duration, Instant};
     let fps = meta.fps.unwrap_or(30.0).clamp(1.0, 240.0);
     let t_spawn = Instant::now();

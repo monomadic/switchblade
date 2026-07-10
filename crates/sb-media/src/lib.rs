@@ -86,7 +86,7 @@ enum Request {
 struct Queues {
     thumbs: VecDeque<PathBuf>,
     reprobes: VecDeque<PathBuf>,
-    gen: VecDeque<PathBuf>,
+    r#gen: VecDeque<PathBuf>,
     anims: VecDeque<PathBuf>,
 }
 
@@ -173,7 +173,7 @@ impl MediaService {
     /// Queue background thumb generation (disk cache only, no upload).
     pub fn request_gen(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().gen.push_back(path);
+        lock.lock().unwrap().r#gen.push_back(path);
         cv.notify_one();
     }
 
@@ -493,7 +493,7 @@ fn worker(
                 if let Some(p) = q.reprobes.pop_front() {
                     break Request::Reprobe(p);
                 }
-                if let Some(p) = q.gen.pop_front() {
+                if let Some(p) = q.r#gen.pop_front() {
                     break Request::Gen(p);
                 }
                 if let Some(p) = q.anims.pop_front() {
@@ -1010,7 +1010,8 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
+        let player =
+            LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Give it a moment to open the input, then measure one second.
         let mut first = None;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1118,7 +1119,8 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
+        let player =
+            LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Never drain: the queue fills and the reader parks on `space`.
         thread::sleep(std::time::Duration::from_millis(700));
         // The reader holds the only other strong ref to the queue; if the
@@ -1164,7 +1166,8 @@ mod tests {
             assert!(ok, "failed to generate test clip");
         }
 
-        let player = LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
+        let player =
+            LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Warm without watching: the queue caps at LIVE_QUEUE_DEPTH and
         // the decoder stalls behind it.
         thread::sleep(std::time::Duration::from_millis(800));

@@ -159,16 +159,17 @@ impl Backdrop {
 impl Gpu {
     pub async fn new(window: Arc<Window>, atlas_cfg: AtlasCfg) -> anyhow::Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // No display handle: only needed for GLES/Wayland presentation,
+        // and it lives on the event loop, not the window.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window)?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
+                ..Default::default()
             })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no suitable gpu adapter"))?;
+            .await?;
         // wgpu's default limits cap textures at 8192² — half the slot
         // count the atlas can use on modern GPUs (Apple silicon and
         // desktop GPUs all do 16384²). Ask for what the adapter has.
@@ -176,13 +177,10 @@ impl Gpu {
         limits.max_texture_dimension_2d =
             adapter.limits().max_texture_dimension_2d.clamp(8192, 16384);
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    required_limits: limits,
-                    ..Default::default()
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            })
             .await?;
 
         let caps = surface.get_capabilities(&adapter);
@@ -199,6 +197,8 @@ impl Gpu {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: caps.alpha_modes[0],
+            // Auto = wgpu's historical color-space choice (sRGB here).
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -262,7 +262,7 @@ impl Gpu {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -332,8 +332,8 @@ impl Gpu {
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tiles"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let instance_layout = wgpu::VertexBufferLayout {
@@ -361,7 +361,7 @@ impl Gpu {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[instance_layout],
+                buffers: &[Some(instance_layout)],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -376,7 +376,7 @@ impl Gpu {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -409,8 +409,8 @@ impl Gpu {
         });
         let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blit"),
-            bind_group_layouts: &[&blit_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&blit_bgl)],
+            immediate_size: 0,
         });
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("hires mip blit"),
@@ -434,7 +434,7 @@ impl Gpu {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let hires_mip_views: Vec<wgpu::TextureView> = (0..hires_mips)
@@ -491,7 +491,7 @@ impl Gpu {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let fade_blend = wgpu::BlendComponent {
@@ -524,7 +524,7 @@ impl Gpu {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let backdrop = Backdrop::new(
@@ -717,13 +717,16 @@ impl Gpu {
         );
 
         let surface_tex = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
-            Err(e) => {
-                log::warn!("surface error: {e}");
+            // Minimized/hidden window — nothing to draw into, not an error.
+            wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Validation => {
+                log::warn!("no surface texture this frame");
                 return;
             }
         };
@@ -743,15 +746,14 @@ impl Gpu {
                     label: Some("hires mip"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.hires_mip_views[i],
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
+                    ..Default::default()
                 });
                 pass.set_pipeline(&self.blit_pipeline);
                 pass.set_bind_group(0, &self.hires_mip_bgs[i - 1], &[]);
@@ -774,6 +776,7 @@ impl Gpu {
                     label: Some("backdrop grid"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.backdrop.views[0],
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -785,9 +788,7 @@ impl Gpu {
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
+                    ..Default::default()
                 });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -799,15 +800,14 @@ impl Gpu {
                     label: Some("backdrop mip"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.backdrop.views[i],
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
+                    ..Default::default()
                 });
                 pass.set_pipeline(&self.backdrop_pipeline);
                 pass.set_bind_group(0, &self.backdrop.down_bgs[i - 1], &[]);
@@ -819,6 +819,7 @@ impl Gpu {
                 label: Some("tiles"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -830,9 +831,7 @@ impl Gpu {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -859,6 +858,6 @@ impl Gpu {
             }
         }
         self.queue.submit([encoder.finish()]);
-        surface_tex.present();
+        self.queue.present(surface_tex);
     }
 }
