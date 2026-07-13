@@ -109,6 +109,8 @@ anim_min_tile_w = 140.0
 # 4 = heavy frost, 0 = no blur. GPU-cheap either way.
 quickview_dim = 0.90
 quickview_blur = 3.0
+# Fade-in when quickview opens (dim + blur + the modal); 0 ≈ instant.
+quickview_fade_ms = 150.0
 # (Playback resolution is quickview_max_width/height, under Startup
 # settings below.)
 
@@ -174,11 +176,18 @@ quickview_max_height = 1440
 # clip · D = browse the selected clip's parent dir. Entries here override
 # them.
 #
-# A key can name an internal action (quit, fullscreen, copy_path,
-# quickview, toggle_anim, toggle_focus_pause, zoom_in, zoom_out,
-# zoom_reset, skip_forward, skip_back, open_parent) or any [commands.*]
-# entry below. In command args, {path}, {dir} and {name} expand against the
-# selected clip.
+# A key can name an internal action (quit, fullscreen, fast_fullscreen,
+# copy_path, quickview, toggle_anim, toggle_focus_pause, zoom_in,
+# zoom_out, zoom_reset, skip_forward, skip_back, open_parent) or any
+# [commands.*] entry below. In command args, {path}, {dir} and {name}
+# expand against the selected clip.
+#
+# fullscreen = macOS native (the window animates into its own Space);
+# fast_fullscreen = mpv-style: a borderless window covering the screen —
+# instant, and you stay on the current Space. Either exits whichever
+# fullscreen mode is active, so bind one or both:
+# f = "fast_fullscreen"
+# The --fullscreen / --fast-fullscreen CLI flags start the app that way.
 
 [keys]
 enter = "open"

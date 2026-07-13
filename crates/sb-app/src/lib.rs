@@ -135,6 +135,10 @@ pub struct Options {
     pub inputs: Vec<PathBuf>,
     /// Force the fake-tile demo grid.
     pub demo: bool,
+    /// `--fullscreen` / `--fast-fullscreen`: start fullscreen. The bool
+    /// is the fast flag (borderless desktop-sized window instead of
+    /// macOS native fullscreen).
+    pub fullscreen: Option<bool>,
 }
 
 pub struct Switchblade {
@@ -366,6 +370,11 @@ impl Switchblade {
             cmds: Vec::new(),
             title: String::new(),
         };
+        // Queued now, drained by the window layer right after the window
+        // exists — so --fullscreen never flashes a windowed frame.
+        if let Some(fast) = opts.fullscreen {
+            app.cmds.push(WindowCommand::ToggleFullscreen { fast });
+        }
         if demo {
             log::info!("stdin is a tty — demo mode with {DEMO_TILES} fake tiles");
             let now = Instant::now();
@@ -508,7 +517,9 @@ impl Switchblade {
         };
         match action {
             Action::Quit => self.cmds.push(WindowCommand::Quit),
-            Action::ToggleFullscreen => self.cmds.push(WindowCommand::ToggleFullscreen),
+            Action::ToggleFullscreen { fast } => {
+                self.cmds.push(WindowCommand::ToggleFullscreen { fast })
+            }
             Action::ZoomIn => self.set_zoom(self.zoom_target * 1.15),
             Action::ZoomOut => self.set_zoom(self.zoom_target / 1.15),
             Action::ZoomReset => self.set_zoom(1.0),
@@ -1745,7 +1756,9 @@ impl Switchblade {
                 let fade = if !ui {
                     1.0
                 } else {
-                    (self.quickview_at.elapsed().as_secs_f32() / 0.15).min(1.0)
+                    (self.quickview_at.elapsed().as_secs_f32() * 1000.0
+                        / t.quickview_fade_ms.max(1.0))
+                    .min(1.0)
                 };
                 let (vw, vh) = (self.viewport.width, self.viewport.height);
                 if t.quickview_blur >= 0.5 {
@@ -2135,6 +2148,7 @@ mod tests {
             animation: Some(AnimLevel::None), // no live decoders in tests
             inputs: vec![dir.join("b.mp4")],
             demo: false,
+            ..Options::default()
         });
         assert!(
             pump_until(&mut app, |a| a.clips.len() == 1),
@@ -2192,6 +2206,7 @@ mod tests {
             animation: Some(AnimLevel::Normal),
             inputs: vec![clip],
             demo: false,
+            ..Options::default()
         });
         assert!(
             pump_until(&mut app, |a| a
@@ -2250,6 +2265,7 @@ mod tests {
             animation: Some(AnimLevel::Normal),
             inputs: vec![clip],
             demo: false,
+            ..Options::default()
         });
         assert!(
             pump_until(&mut app, |a| a

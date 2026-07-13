@@ -63,7 +63,13 @@ pub enum InputEvent {
 #[derive(Debug, Clone)]
 pub enum WindowCommand {
     Quit,
-    ToggleFullscreen,
+    /// `fast` = borrow the whole screen with a borderless desktop-sized
+    /// window (instant, same Space — mpv's no-native-fs) instead of the
+    /// OS's native fullscreen (own Space + animation on macOS). Either
+    /// way, toggling while in *any* fullscreen mode exits it.
+    ToggleFullscreen {
+        fast: bool,
+    },
     SetTitle(String),
 }
 
@@ -271,14 +277,9 @@ impl<A: App> Runner<A> {
         for cmd in self.app.commands() {
             match cmd {
                 WindowCommand::Quit => event_loop.exit(),
-                WindowCommand::ToggleFullscreen => {
+                WindowCommand::ToggleFullscreen { fast } => {
                     if let Some(w) = &self.window {
-                        let next = if w.fullscreen().is_some() {
-                            None
-                        } else {
-                            Some(Fullscreen::Borderless(None))
-                        };
-                        w.set_fullscreen(next);
+                        toggle_fullscreen(w, fast);
                     }
                 }
                 WindowCommand::SetTitle(title) => {
@@ -288,6 +289,39 @@ impl<A: App> Runner<A> {
                 }
             }
         }
+    }
+}
+
+/// On macOS the two fullscreen flavors are distinct window states:
+/// native (`Fullscreen::Borderless`) animates into its own Space, while
+/// simple fullscreen just resizes the window over the desktop. Exiting
+/// checks both so one `f` always gets you out, whichever mode (or CLI
+/// flag) put you in.
+fn toggle_fullscreen(w: &Window, fast: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowExtMacOS;
+        if w.simple_fullscreen() {
+            w.set_simple_fullscreen(false);
+        } else if w.fullscreen().is_some() {
+            w.set_fullscreen(None);
+        } else if fast {
+            w.set_simple_fullscreen(true);
+        } else {
+            w.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No Spaces elsewhere: borderless fullscreen already behaves
+        // like the fast mode.
+        let _ = fast;
+        let next = if w.fullscreen().is_some() {
+            None
+        } else {
+            Some(Fullscreen::Borderless(None))
+        };
+        w.set_fullscreen(next);
     }
 }
 
@@ -309,6 +343,9 @@ impl<A: App> ApplicationHandler for Runner<A> {
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.last_frame = Instant::now();
+        // Startup commands (--fullscreen / --fast-fullscreen queue a
+        // toggle) apply before the first frame ever presents windowed.
+        self.apply_commands(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {

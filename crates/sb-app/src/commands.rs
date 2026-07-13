@@ -38,7 +38,12 @@ pub enum CommandSpec {
 pub enum Action {
     Spawn { program: String, args: Vec<String> },
     Quit,
-    ToggleFullscreen,
+    /// `fast` = borderless desktop-sized window (mpv's no-native-fs)
+    /// instead of macOS native fullscreen; either exits whichever mode
+    /// is active. Bind "fullscreen" and/or "fast_fullscreen".
+    ToggleFullscreen {
+        fast: bool,
+    },
     CopyPath,
     ZoomIn,
     ZoomOut,
@@ -162,7 +167,8 @@ fn key_name(key: &Key) -> Option<String> {
 fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
     Some(match name {
         "quit" => Action::Quit,
-        "fullscreen" | "toggle_fullscreen" => Action::ToggleFullscreen,
+        "fullscreen" | "toggle_fullscreen" => Action::ToggleFullscreen { fast: false },
+        "fast_fullscreen" | "toggle_fast_fullscreen" => Action::ToggleFullscreen { fast: true },
         "copy_path" => Action::CopyPath,
         "zoom_in" => Action::ZoomIn,
         "zoom_out" => Action::ZoomOut,
@@ -316,6 +322,21 @@ mod tests {
         assert!(matches!(
             map.action_for(&Key::Char('D')),
             Some(Action::OpenParent)
+        ));
+    }
+
+    #[test]
+    fn fullscreen_flavors_resolve() {
+        let map = KeyMap::default();
+        assert!(matches!(
+            map.action_for(&Key::Char('f')),
+            Some(Action::ToggleFullscreen { fast: false })
+        ));
+        let keys = HashMap::from([("F".to_string(), "fast_fullscreen".to_string())]);
+        let map = KeyMap::merged(keys, HashMap::new());
+        assert!(matches!(
+            map.action_for(&Key::Char('F')),
+            Some(Action::ToggleFullscreen { fast: true })
         ));
     }
 

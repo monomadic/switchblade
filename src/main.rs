@@ -39,6 +39,12 @@ OPTIONS:
                     quickview/selected/hovered; full = + background
                     sheet animation
     --no-anim       legacy alias for --animation normal
+    --fullscreen    start fullscreen (macOS native: own Space + animation)
+    --fast-fullscreen
+                    start fullscreen the fast way: a borderless window
+                    covering the screen — instant, no separate Space
+                    (bind the `fullscreen` / `fast_fullscreen` internal
+                    actions in [keys] to toggle either at runtime)
     --init          write the default config to ~/.config/switchblade.toml
     --demo          fake-tile demo grid (no media needed)
     -h, --help      print this help
@@ -85,6 +91,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             "--no-anim" => opts.animation = Some(sb_app::AnimLevel::Normal),
+            "--fullscreen" => opts.fullscreen = Some(false),
+            "--fast-fullscreen" => opts.fullscreen = Some(true),
             "--init" => return init_config(),
             "--demo" => opts.demo = true,
             "--clear-cache" => return clear_cache(),
