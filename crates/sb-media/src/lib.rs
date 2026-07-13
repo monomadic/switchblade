@@ -8,6 +8,8 @@
 //! RGBA for the renderer's atlas. The render thread never blocks on this.
 
 pub mod maintenance;
+mod seekable;
+pub use seekable::SeekablePlayer;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
