@@ -65,9 +65,14 @@ enum SlotKind {
 }
 
 /// The hovered tile's video playback: tile-sized, into an atlas slot.
+/// Rides `SeekablePlayer` like every live lane since the libav port (it
+/// never seeks, but the in-process spawn reaches first frame ~2× sooner
+/// than the CLI pipe — hover-play is all about that latency); the CLI
+/// `LivePlayer` stays in sb-media as the tested fallback until the
+/// in-process path has soaked a release.
 struct LiveState {
     clip: usize,
-    player: sb_media::LivePlayer,
+    player: sb_media::SeekablePlayer,
     slot: usize,
     /// Set when the first frame arrives; the tile switches to video then.
     first_frame: Option<Instant>,
@@ -1463,7 +1468,7 @@ impl Switchblade {
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
         self.heal_meta(meta.as_ref(), &path);
-        let Some(player) = sb_media::LivePlayer::spawn(&path, tw, th, seek, meta.as_ref()) else {
+        let Some(player) = sb_media::SeekablePlayer::spawn(&path, tw, th, seek, meta.as_ref()) else {
             log::debug!("live preview failed to start: {}", path.display());
             return None;
         };
