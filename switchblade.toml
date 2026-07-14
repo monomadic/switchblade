@@ -114,6 +114,20 @@ quickview_fade_ms = 150.0
 # (Playback resolution is quickview_max_width/height, under Startup
 # settings below.)
 
+# The seekbar over the quickview video: pointer motion over the video
+# reveals it, seekbar_hide_s of stillness fades it out over
+# seekbar_fade_ms. It thickens from seekbar_height to
+# seekbar_hover_height under the pointer (the click/drag target is a
+# taller invisible band either way). Click to seek; hold and drag to
+# scrub — coarse keyframe hops while dragging, an exact landing on
+# release. Hovering the bar previews the nearest animated-thumbnail
+# frame at seekbar_thumb_width px wide (0 hides the preview).
+seekbar_hide_s = 1.0
+seekbar_fade_ms = 250.0
+seekbar_height = 4.0
+seekbar_hover_height = 8.0
+seekbar_thumb_width = 190.0
+
 # The filmstrip of neighboring clips along the bottom.
 strip_height = 92.0           # chip height; chips are 16:9
 strip_gap = 10.0
@@ -125,6 +139,10 @@ strip_border_width = 4.0      # selected chip's border; its color comes
 # top, like the grid). Hovered chips also play video at level "normal"+.
 strip_selection_scale = 1.35
 strip_hover_scale = 1.15
+# Wheel / trackpad over quickview scrubs the strip: pixels per chip-step
+# are divided by this, and the selection follows the nearest chip.
+# Bigger = faster; negative flips direction.
+strip_scroll_sensitivity = 1.0
 
 # ── Startup settings (restart to apply) ─────────────────────────────────
 # Everything above this line hot-reloads; everything below is read once

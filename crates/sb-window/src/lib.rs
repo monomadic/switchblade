@@ -53,6 +53,11 @@ pub enum InputEvent {
         x: f32,
         y: f32,
     },
+    /// Left button released (ends a seekbar drag-scrub).
+    MouseUp {
+        x: f32,
+        y: f32,
+    },
     /// Window gained/lost focus (drives pause-when-unfocused).
     Focus {
         focused: bool,
@@ -425,12 +430,15 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 self.app.event(InputEvent::CursorMoved { x: p.x, y: p.y });
             }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state,
                 button: MouseButton::Left,
                 ..
             } => {
                 let (x, y) = self.cursor;
-                self.app.event(InputEvent::MouseDown { x, y });
+                self.app.event(match state {
+                    ElementState::Pressed => InputEvent::MouseDown { x, y },
+                    ElementState::Released => InputEvent::MouseUp { x, y },
+                });
                 self.apply_commands(event_loop);
             }
             WindowEvent::RedrawRequested => {

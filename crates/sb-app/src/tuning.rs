@@ -136,6 +136,20 @@ pub struct Tuning {
     /// they draw above their neighbors, like the grid).
     pub strip_selection_scale: f32,
     pub strip_hover_scale: f32,
+    /// Quickview seekbar: pointer motion over the video reveals it; after
+    /// this many seconds without motion it fades out over seekbar_fade_ms.
+    pub seekbar_hide_s: f32,
+    pub seekbar_fade_ms: f32,
+    /// Bar thickness at rest and when the pointer is on it (click target
+    /// stays generous either way — the hit band is taller than the bar).
+    pub seekbar_height: f32,
+    pub seekbar_hover_height: f32,
+    /// Width of the storyboard preview shown while hovering the bar (the
+    /// nearest anim-sheet frame to the hovered timestamp). 0 disables.
+    pub seekbar_thumb_width: f32,
+    /// Wheel/trackpad over the quickview filmstrip: pixels of scroll per
+    /// chip-step are divided by this. Negative flips direction.
+    pub strip_scroll_sensitivity: f32,
     /// Quickview backdrop: black-overlay strength (0..1) and frosted-glass
     /// blur level. The grid renders offscreen and is downsampled 2^level×
     /// before drawing back — a few tiny GPU passes, only while quickview
@@ -207,6 +221,12 @@ impl Default for Tuning {
             strip_border_width: 4.0,
             strip_selection_scale: 1.35,
             strip_hover_scale: 1.15,
+            seekbar_hide_s: 1.0,
+            seekbar_fade_ms: 250.0,
+            seekbar_height: 4.0,
+            seekbar_hover_height: 8.0,
+            seekbar_thumb_width: 190.0,
+            strip_scroll_sensitivity: 1.0,
             quickview_dim: 0.90,
             quickview_blur: 3.0,
             quickview_fade_ms: 150.0,

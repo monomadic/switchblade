@@ -191,6 +191,12 @@ pub struct Switchblade {
     /// Filmstrip chip under the cursor (quickview only) — scales up and
     /// gets the hover video lane, like grid hover.
     strip_hover: Option<usize>,
+    /// Last time the pointer moved over the quickview video — reveals
+    /// the seekbar, which fades out after `seekbar_hide_s` of stillness.
+    seekbar_seen: Option<Instant>,
+    /// Left button is down on the seekbar: keyframe seeks track the drag,
+    /// one exact seek lands on release.
+    scrubbing: bool,
     /// Background job counters for the progress indicator.
     jobs_total: u64,
     jobs_done: u64,
@@ -327,6 +333,8 @@ impl Switchblade {
             quickview_at: Instant::now(),
             strip_pos: 0.0,
             strip_hover: None,
+            seekbar_seen: None,
+            scrubbing: false,
             jobs_total: 0,
             jobs_done: 0,
             jobs_finished_at: None,
@@ -578,6 +586,18 @@ impl Switchblade {
         self.wake(1.5); // outlive the flash bar's hold + fade
     }
 
+    /// Played fraction (0..1) of the selected clip's live stream — the
+    /// decoder's real position (or the in-flight seek target), only when
+    /// the stream is on the selected clip and its duration is known.
+    fn seekbar_pos(&self) -> Option<f32> {
+        let l = self.live_sel.as_ref()?;
+        if self.clips.get(self.selected).is_none_or(|c| c.path != l.path) {
+            return None;
+        }
+        let d = l.duration.filter(|d| *d > 0.05)?;
+        Some(((l.position().rem_euclid(d) / d) as f32).clamp(0.0, 1.0))
+    }
+
     /// The post-skip flash bar: `Some((played fraction, alpha))` while
     /// it's visible — holds a second after a skip, then fades out fast.
     fn skip_bar(&self) -> Option<(f32, f32)> {
@@ -585,12 +605,6 @@ impl Switchblade {
         if t >= SKIP_BAR_HOLD_S + SKIP_BAR_FADE_S {
             return None;
         }
-        let l = self.live_sel.as_ref()?;
-        // Only over the clip that was skipped (selection may have moved).
-        if self.clips.get(self.selected).is_none_or(|c| c.path != l.path) {
-            return None;
-        }
-        let d = l.duration.filter(|d| *d > 0.05)?;
         // Level "none": fades complete in one frame — show, then vanish.
         let alpha = if self.level().ui() {
             ((SKIP_BAR_HOLD_S + SKIP_BAR_FADE_S - t) / SKIP_BAR_FADE_S).min(1.0)
@@ -599,8 +613,107 @@ impl Switchblade {
         } else {
             return None;
         };
-        let pos = (l.position().rem_euclid(d) / d) as f32;
-        Some((pos.clamp(0.0, 1.0), alpha))
+        Some((self.seekbar_pos()?, alpha))
+    }
+
+    /// Pointer-reveal alpha for the quickview seekbar: solid while the
+    /// cursor moved over the video within `seekbar_hide_s`, then fading
+    /// over `seekbar_fade_ms`. Scrubbing pins it visible.
+    fn seekbar_alpha(&self) -> f32 {
+        if self.scrubbing {
+            return 1.0;
+        }
+        let Some(seen) = self.seekbar_seen else {
+            return 0.0;
+        };
+        let t = seen.elapsed().as_secs_f32();
+        let hide = self.tuning.seekbar_hide_s.max(0.0);
+        if t <= hide {
+            return 1.0;
+        }
+        if !self.level().ui() {
+            return 0.0; // snap mode: no fade tail
+        }
+        let fade = (self.tuning.seekbar_fade_ms / 1000.0).max(0.001);
+        (1.0 - (t - hide) / fade).clamp(0.0, 1.0)
+    }
+
+    /// The quickview modal's video rectangle — the same geometry
+    /// `build_frame` draws, factored out so pointer hit-tests and the
+    /// seekbar can't drift from what's on screen.
+    fn quickview_video_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        if !self.quickview {
+            return None;
+        }
+        let clip = self.clips.get(self.selected)?;
+        let live = self.live_sel.as_ref().filter(|l| {
+            (l.path == clip.path || self.pending_reselect.as_ref() == Some(&l.path))
+                && (l.first_frame.is_some() || self.hires_shown.as_ref() == Some(&l.path))
+        });
+        let (tw, th) = match live {
+            Some(l) => (l.player.w as f32, l.player.h as f32),
+            None => match clip.thumb {
+                Thumb::Ready { tw, th, .. } => (tw as f32, th as f32),
+                _ => return None,
+            },
+        };
+        let vw = self.viewport.width;
+        let (_, _, strip_y) = self.strip_geom();
+        let avail_h = (strip_y - 18.0).max(60.0);
+        let a = tw / th.max(1.0);
+        let (mut w, mut h) = (vw * 0.88, avail_h * 0.92);
+        if a > w / h {
+            h = w / a;
+        } else {
+            w = h * a;
+        }
+        Some(((vw - w) * 0.5, (avail_h - h) * 0.5 + 6.0, w, h))
+    }
+
+    /// Seekbar line geometry: (left x, width, bottom y). The bar hugs the
+    /// video's bottom edge with the same inset as the skip flash bar.
+    fn seekbar_line(&self) -> Option<(f32, f32, f32)> {
+        let (x, y, w, h) = self.quickview_video_rect()?;
+        let pad = 12.0_f32.min(w * 0.06).max(4.0);
+        Some((x + pad, (w - pad * 2.0).max(8.0), y + h - pad))
+    }
+
+    /// Fraction of the bar under screen-x (unclamped hit — used while
+    /// dragging, where the pointer may wander off the line).
+    fn seekbar_frac(&self, x: f32) -> Option<f32> {
+        let (bx, bw, _) = self.seekbar_line()?;
+        Some(((x - bx) / bw).clamp(0.0, 1.0))
+    }
+
+    /// Fraction under the pointer when it's on the bar's hit band — a
+    /// taller target than the drawn line, so the bar is easy to grab.
+    fn seekbar_hit(&self, x: f32, y: f32) -> Option<f32> {
+        let (bx, bw, bot) = self.seekbar_line()?;
+        (self.seekbar_pos().is_some()
+            && (bot - 18.0..=bot + 10.0).contains(&y)
+            && (bx - 6.0..=bx + bw + 6.0).contains(&x))
+        .then(|| ((x - bx) / bw).clamp(0.0, 1.0))
+    }
+
+    /// Seek the selected clip's stream to a fraction of its duration.
+    /// Keyframe mode while a drag is in flight (instant feedback), exact
+    /// on release / click-settle (PLAN.md §14 M8 two-phase scrub).
+    fn scrub_seek(&mut self, frac: f32, exact: bool) {
+        let Some(clip) = self.clips.get(self.selected) else {
+            return;
+        };
+        let Some(l) = &self.live_sel else { return };
+        if l.path != clip.path {
+            return;
+        }
+        let Some(d) = l.duration.filter(|d| *d > 0.05) else {
+            return;
+        };
+        // Stay a frame short of the end: an exact seek to the tail would
+        // land on EOF and wrap the loop back to 0:00.
+        l.player
+            .seek((frac as f64 * d).clamp(0.0, (d - 0.05).max(0.0)), exact);
+        self.wake(1.5);
     }
 
     /// `D`: rebuild the library from the selected clip's parent directory
@@ -951,6 +1064,29 @@ impl Switchblade {
         }
     }
 
+    /// The seekbar's storyboard preview samples the anim sheet, which the
+    /// grid only generates at animation level `full` — so quickview
+    /// requests the selected clip's sheet on demand (g² cheap seeked
+    /// extracts, disk-cached) at any level. One clip at a time, never
+    /// library-wide (PLAN.md §14 M8).
+    fn request_quickview_sheet(&mut self) {
+        if !self.quickview || self.tuning.seekbar_thumb_width < 8.0 {
+            return;
+        }
+        let Some(clip) = self.clips.get_mut(self.selected) else {
+            return;
+        };
+        if clip.readable
+            && !clip.cloud
+            && matches!(clip.anim, Thumb::None)
+            && matches!(clip.thumb, Thumb::Ready { .. })
+        {
+            self.media.request_anim(clip.path.clone());
+            clip.anim = Thumb::Pending;
+            self.jobs_total += 1;
+        }
+    }
+
     /// Collect finished thumbnails into atlas uploads for this frame.
     fn drain_media(&mut self, lay: &Layout) -> Vec<ThumbUpload> {
         let mut uploads = Vec::new();
@@ -1200,7 +1336,13 @@ impl Switchblade {
         }
         if self.live_hover.is_none() {
             if let Some(i) = hover_target {
-                if self.hover_changed_at.elapsed().as_millis() as f32 >= delay_ms {
+                // Filmstrip chips skip the settle delay: hovering one in
+                // quickview is a deliberate pointer act, like the modal
+                // itself (grid hover keeps the delay — the cursor crosses
+                // tiles it doesn't mean).
+                if self.quickview
+                    || self.hover_changed_at.elapsed().as_millis() as f32 >= delay_ms
+                {
                     self.live_hover = self.start_live(lay, i);
                 }
             }
@@ -1747,22 +1889,18 @@ impl Switchblade {
                         _ => None,
                     }
                 };
-                // The video sits above the filmstrip.
+                // The video sits above the filmstrip (geometry shared with
+                // the pointer hit-tests via quickview_video_rect).
                 let (chip_w, chip_h, strip_y) = self.strip_geom();
                 let avail_h = (strip_y - 18.0).max(60.0);
-                if let Some((uv, tw, th, hires)) = src {
-                    let a = tw / th.max(1.0);
-                    let (mut w, mut h) = (vw * 0.88, avail_h * 0.92);
-                    if a > w / h {
-                        h = w / a;
-                    } else {
-                        w = h * a;
-                    }
+                if let (Some((uv, _, _, hires)), Some((rx, ry, rw, rh))) =
+                    (src, self.quickview_video_rect())
+                {
                     let video = Tile {
-                        x: (vw - w) * 0.5,
-                        y: (avail_h - h) * 0.5 + 6.0,
-                        w,
-                        h,
+                        x: rx,
+                        y: ry,
+                        w: rw,
+                        h: rh,
                         color: [0.0, 0.0, 0.0, fade],
                         border_color: [0.0; 4],
                         corner_radius: t.selection_corner_radius,
@@ -1774,9 +1912,98 @@ impl Switchblade {
                         hires,
                     };
                     tiles.push(video);
-                    // Post-skip position flash along the video's bottom.
-                    if let Some((pos, a)) = skip_bar {
-                        push_skip_bar(&mut tiles, &video, pos, a * fade);
+                    // Seekbar along the video's bottom: revealed by pointer
+                    // motion (fades after a short idle) or the skip flash;
+                    // thickens under the pointer; click/drag scrubs. The
+                    // fill tracks the decoder's real position — the seek
+                    // target while one is in flight, so scrubbing feels
+                    // attached to the pointer even mid-decode.
+                    let bar_a = {
+                        let flash = skip_bar.map(|(_, a)| a).unwrap_or(0.0);
+                        self.seekbar_alpha().max(flash) * fade
+                    };
+                    if bar_a > 0.005 {
+                        if let (Some(pos), Some((bx, bw, bot))) =
+                            (self.seekbar_pos(), self.seekbar_line())
+                        {
+                            let (cx, cy) = self.cursor;
+                            let hot = self.scrubbing || self.seekbar_hit(cx, cy).is_some();
+                            let bh = if hot {
+                                t.seekbar_hover_height
+                            } else {
+                                t.seekbar_height
+                            }
+                            .max(2.0);
+                            let bar = |x: f32, w: f32, color: [f32; 4]| Tile {
+                                x,
+                                y: bot - bh,
+                                w,
+                                h: bh,
+                                color,
+                                border_color: [0.0; 4],
+                                corner_radius: bh * 0.5,
+                                border_width: 0.0,
+                                uv: [0.0; 4],
+                                uv2: [0.0; 4],
+                                frame_fade: 0.0,
+                                tex_mix: 0.0,
+                                hires: false,
+                            };
+                            tiles.push(bar(bx, bw, [0.08, 0.08, 0.10, 0.55 * bar_a]));
+                            tiles.push(bar(
+                                bx,
+                                (bw * pos).max(bh),
+                                [0.95, 0.95, 0.98, 0.95 * bar_a],
+                            ));
+                            // Storyboard preview (PLAN.md §14 M8 phase 1):
+                            // the anim sheet is already g² frames spread
+                            // across the duration — hovering the bar shows
+                            // the cell nearest that timestamp. A denser
+                            // dedicated strip lands later if g² is too
+                            // coarse.
+                            let hover_f = if self.scrubbing {
+                                self.seekbar_frac(cx)
+                            } else {
+                                self.seekbar_hit(cx, cy)
+                            };
+                            if let (Some(f), &Thumb::Ready { slot, tw, th, .. }) =
+                                (hover_f, &clip.anim)
+                            {
+                                let tw_px = t.seekbar_thumb_width;
+                                if tw_px >= 8.0 {
+                                    let g = self.anim_grid.max(1) as usize;
+                                    let cells = g * g;
+                                    let k = ((f * cells as f32) as usize).min(cells - 1);
+                                    let (fw, fh) =
+                                        (tw as f32 / g as f32, th as f32 / g as f32);
+                                    let cuv = self.atlas_cfg.uv(
+                                        slot,
+                                        (k % g) as f32 * fw,
+                                        (k / g) as f32 * fh,
+                                        fw,
+                                        fh,
+                                    );
+                                    let cw2 = tw_px.min(rw * 0.5);
+                                    let ch2 = cw2 * fh / fw.max(1.0);
+                                    tiles.push(Tile {
+                                        x: (bx + f * bw - cw2 * 0.5)
+                                            .clamp(rx + 4.0, rx + rw - cw2 - 4.0),
+                                        y: bot - bh - ch2 - 10.0,
+                                        w: cw2,
+                                        h: ch2,
+                                        color: [0.02, 0.02, 0.03, bar_a],
+                                        border_color: [0.85, 0.85, 0.9, 0.7 * bar_a],
+                                        corner_radius: 4.0,
+                                        border_width: 1.0,
+                                        uv: cuv,
+                                        uv2: [0.0; 4],
+                                        frame_fade: 0.0,
+                                        tex_mix: bar_a,
+                                        hires: false,
+                                    });
+                                }
+                            }
+                        }
                     }
                 } else {
                     // Nothing decoded yet: big dots in the middle.
@@ -1951,7 +2178,31 @@ impl App for Switchblade {
         self.wake(0.6);
         match event {
             InputEvent::Key { key, .. } => self.key(key),
-            InputEvent::Scroll { dy, .. } => {
+            InputEvent::Scroll { dx, dy } => {
+                if self.quickview {
+                    // Wheel/trackpad scrubs the filmstrip: the strip slides
+                    // freely under the gesture and the selection commits to
+                    // the nearest chip — the snap spring then centers it,
+                    // so it reads as magnetic, chip-by-chip flow. The grid
+                    // backdrop never pans under the modal.
+                    let (cw, _, _) = self.strip_geom();
+                    let step = cw + self.tuning.strip_gap;
+                    let d = if dx.abs() > dy.abs() { dx } else { dy };
+                    let n = self.clips.len();
+                    if n > 0 && step > 1.0 {
+                        self.strip_pos = (self.strip_pos
+                            - d * self.tuning.strip_scroll_sensitivity / step)
+                            .clamp(0.0, (n - 1) as f32);
+                        let i = self.strip_pos.round() as usize;
+                        if i != self.selected {
+                            self.selected = i;
+                            self.sel_changed_at = Instant::now();
+                            self.pending_reselect = None; // scroll outranks the D reselect
+                            self.scroll_to_selected();
+                        }
+                    }
+                    return;
+                }
                 let d = -dy * self.tuning.pan_sensitivity;
                 self.scroll_target += d;
                 self.scroll_vel = self.scroll_vel * 0.7 + d * 60.0 * 0.3;
@@ -1964,15 +2215,43 @@ impl App for Switchblade {
             }
             InputEvent::CursorMoved { x, y } => {
                 self.cursor = (x, y);
+                if self.scrubbing {
+                    // Drag-scrub: coarse keyframe hops track the pointer
+                    // (the decoder coalesces to the newest target); the
+                    // exact landing waits for release.
+                    self.seekbar_seen = Some(Instant::now());
+                    if let Some(f) = self.seekbar_frac(x) {
+                        self.scrub_seek(f, false);
+                    }
+                } else if self.quickview
+                    && self
+                        .quickview_video_rect()
+                        .is_some_and(|(vx, vy, vw, vh)| {
+                            (vx..=vx + vw).contains(&x) && (vy..=vy + vh + 12.0).contains(&y)
+                        })
+                {
+                    self.seekbar_seen = Some(Instant::now());
+                    // Stay awake through the idle-hide and the fade tail.
+                    self.wake(
+                        self.tuning.seekbar_hide_s + self.tuning.seekbar_fade_ms / 1000.0 + 0.2,
+                    );
+                }
             }
             InputEvent::Focus { focused } => {
                 self.focused = focused;
             }
             InputEvent::MouseDown { x, y } => {
-                // In quickview: clicking a filmstrip chip selects it;
+                // In quickview: the seekbar grabs first (click = seek,
+                // hold = scrub), then a filmstrip chip click selects it;
                 // anywhere else closes. In the grid: click selects, click
                 // on the selection opens quickview.
                 if self.quickview {
+                    if let Some(f) = self.seekbar_hit(x, y) {
+                        self.scrubbing = true;
+                        self.seekbar_seen = Some(Instant::now());
+                        self.scrub_seek(f, false);
+                        return;
+                    }
                     if let Some(i) = self.strip_chip_at(x, y) {
                         if i != self.selected {
                             self.selected = i;
@@ -1998,6 +2277,14 @@ impl App for Switchblade {
                     }
                 }
             }
+            InputEvent::MouseUp { x, .. } => {
+                if self.scrubbing {
+                    self.scrubbing = false;
+                    if let Some(f) = self.seekbar_frac(x) {
+                        self.scrub_seek(f, true); // exact landing on release
+                    }
+                }
+            }
         }
     }
 
@@ -2011,6 +2298,7 @@ impl App for Switchblade {
         self.step(dt);
         let lay = self.layout();
         self.request_visible_thumbs(&lay);
+        self.request_quickview_sheet();
         let mut uploads = self.drain_media(&lay);
         self.update_live(&lay, &mut uploads);
         self.update_title();
@@ -2047,8 +2335,9 @@ mod tests {
             height: 800.0,
         };
         // Generous: media tests run in parallel and contend for ffmpeg
-        // spawns; the loop returns the moment the condition holds.
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // spawns (a cold cache pays clip gen + thumb + live spawn all at
+        // once); the loop returns the moment the condition holds.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             let _ = app.frame(0.016, vp);
             if cond(app) {
@@ -2174,6 +2463,145 @@ mod tests {
             "chained skip advances from the previous target, position {}",
             l.position()
         );
+    }
+
+    /// Quickview seekbar: press grabs the bar (keyframe scrub), drag
+    /// tracks the pointer, release lands an exact seek — all on the same
+    /// resident decoder. Needs ffmpeg; skipped quietly when missing.
+    #[test]
+    fn seekbar_click_and_drag_scrubs_the_stream() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_scrub_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("scrub.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=8:size=320x180:rate=30")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip],
+            demo: false,
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+        app.quickview = true;
+        app.quickview_at = Instant::now();
+        let _ = app.frame(
+            0.016,
+            Viewport {
+                width: 1280.0,
+                height: 800.0,
+            },
+        );
+        let (bx, bw, bot) = app.seekbar_line().expect("seekbar geometry");
+
+        // Reveal: pointer motion over the video arms the bar.
+        let (vx, vy, vw, vh) = app.quickview_video_rect().unwrap();
+        app.event(InputEvent::CursorMoved {
+            x: vx + vw * 0.5,
+            y: vy + vh * 0.5,
+        });
+        assert!(app.seekbar_alpha() > 0.9, "motion over the video reveals the bar");
+
+        // Grab at 75%: keyframe scrub starts, position reports the target.
+        app.event(InputEvent::MouseDown {
+            x: bx + bw * 0.75,
+            y: bot - 3.0,
+        });
+        assert!(app.scrubbing, "press on the bar starts a scrub");
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!((5.4..=6.6).contains(&p), "position tracks the grab point, got {p}");
+        // One frame with the bar revealed + hot exercises the draw path.
+        let _ = app.frame(
+            0.016,
+            Viewport {
+                width: 1280.0,
+                height: 800.0,
+            },
+        );
+
+        // Drag to 25%, release: exact landing near 2s on the SAME stream.
+        app.event(InputEvent::CursorMoved {
+            x: bx + bw * 0.25,
+            y: bot - 3.0,
+        });
+        app.event(InputEvent::MouseUp {
+            x: bx + bw * 0.25,
+            y: bot - 3.0,
+        });
+        assert!(!app.scrubbing, "release ends the scrub");
+        let l = app.live_sel.as_ref().unwrap();
+        assert!(l.first_frame.is_some(), "scrubbing never respawns the decoder");
+        let p = l.position();
+        assert!((1.4..=2.6).contains(&p), "release lands near 25%, got {p}");
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.player.buffered() > 0)),
+            "no frames after the scrub landing"
+        );
+    }
+
+    /// Wheel/trackpad over quickview scrubs the filmstrip: the strip
+    /// slides with the gesture and the selection commits to the nearest
+    /// chip, clamped at the ends.
+    #[test]
+    fn filmstrip_scroll_commits_selection() {
+        let dir = std::env::temp_dir().join("sb_app_strip_scroll_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["a.mp4", "b.mp4", "c.mp4"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None), // no live decoders in tests
+            inputs: vec![dir.clone()],
+            demo: false,
+            ..Options::default()
+        });
+        assert!(pump_until(&mut app, |a| a.clips.len() == 3), "ingest");
+        app.quickview = true;
+        app.quickview_at = Instant::now();
+        app.strip_pos = 0.0;
+
+        let (cw, _, _) = app.strip_geom();
+        let step = cw + app.tuning.strip_gap;
+        // One chip-step of leftward gesture advances the selection…
+        app.event(InputEvent::Scroll { dx: -step, dy: 0.0 });
+        assert_eq!(app.selected, 1, "one chip-step advances the selection");
+        // …and a huge fling clamps at the last clip.
+        app.event(InputEvent::Scroll {
+            dx: -step * 50.0,
+            dy: 0.0,
+        });
+        assert_eq!(app.selected, 2, "the strip clamps at the ends");
+        // Grid pan must not have moved under the modal.
+        assert_eq!(app.scroll_target, 0.0, "the backdrop grid never pans");
     }
 }
 
