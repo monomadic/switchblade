@@ -459,19 +459,42 @@ Sequence:
 
 **Exit criteria:** large clip sets become practical.
 
-### M8 — Quickview scrub *(MVP v2)*
-Pointer-driven seeking and filmstrip feel inside the quickview modal. Seeking applies **only to the quickview main video** — the grid never seeks. The prerequisite understanding (why a seek costs ~1s today, and what we trade to fix it) lives in §15 "Low-latency seek".
+### M8 — Quickview scrub *(MVP v2)* ✅ *feature-complete (2026-07)*
+Pointer-driven seeking + filmstrip feel in the quickview modal; seeking hits **only the quickview main video** (grid never seeks). Every live lane rides the in-process `SeekablePlayer` (§15). Shipped:
+- **Seekbar** — pointer motion over the video reveals a slim bar (shares the `[`/`]` skip flash's drawing), fades after `seekbar_hide_s`; thickens under the pointer. Click seeks; hold-drag scrubs two-phase like mpv — keyframe seeks while dragging (9–30ms), one exact seek on release (GOP-bound, hidden behind the shown keyframe frame). *(`seekbar_click_and_drag_scrubs_the_stream`)*
+- **Storyboard hover thumbs (phase 1)** — hovering the bar draws the anim-sheet cell nearest that timestamp; quickview requests the selected clip's sheet on demand at any animation level (grid only makes sheets at `full`, and the storyboard shouldn't depend on that).
+- **Filmstrip** — chips hover-play instantly (settle delay dropped in quickview); wheel/trackpad scrubs the strip and commits selection to the nearest chip while the backdrop grid stays put. *(`filmstrip_scroll_commits_selection`)*
+- Tuning: `seekbar_hide_s/fade_ms/height/hover_height/thumb_width`, `strip_scroll_sensitivity`.
 
-1. ✅ **Seekbar reveal/fade.** Mouse movement over the video shows a slim progress bar (grow the existing skip flash bar into a persistent widget); after ~1s without pointer motion over the video it fades out. Tuning: `seekbar_hide_s`, `seekbar_fade_ms`. It shares the skip bar's drawing so a `[`/`]` skip and a pointer hover flash the same element.
-2. ✅ **Click-to-seek.** The bar fattens slightly on hover (`seekbar_height` / `seekbar_hover_height`) but stays minimalist. Click maps x → fraction → `SeekablePlayer::seek()` on the resident decoder (§15 "Low-latency seek" — **the port has landed**; `[`/`]` already rides it). Two-phase, like mpv: click/drag issues a **keyframe** seek (measured 9–30ms — feedback within a frame or two), and on release/settle one **exact** seek refines to the true target (GOP-bound, worst ~600ms on long-GOP 4K, invisible behind the already-showing keyframe frame). No pre-warm machinery needed. *(Test: `seekbar_click_and_drag_scrubs_the_stream`.)*
-3. **Hover thumbnails over the bar.** Phased:
-   - ✅ *Phase 1 (free):* the anim sheet is already g² seeked extracts spread across the duration — sample it as a coarse storyboard (hover fraction → nearest sheet cell → draw the chip above the bar). Zero new generation, works today for every clip with a sheet. *(Landed with a twist: quickview requests the selected clip's sheet on demand at any animation level — the grid only generates sheets at `full`, and the storyboard shouldn't depend on that.)*
-   - *Phase 2:* a denser dedicated strip (`seek_16x1_<w>x<h>_q<q>.jpg`, seeked single-frame extracts like the anim recipe — never an `fps=` full decode) as a **fifth queue tier below anim sheets**, generated on first quickview of a clip rather than library-wide.
-   - *Phase 3 (only if density still disappoints):* exact frames on demand from a second **paused low-res `SeekablePlayer`** on the same clip — hover fraction → `seek()` → one frame (the in-process port makes thumbfast's paused-mpv-slave trick a two-line reuse of our own machinery instead of a process to babysit).
-4. ✅ **Filmstrip hover-play.** The hover lane for chips partially exists (hovered chips scale and get a tile-size lane) — audit why it doesn't *feel* like it plays: likely the grid's hover settle delay and warm-pool priorities apply where quickview should be eager. Chips the strip already pre-warms (±1) should show video instantly on hover via promotion, same rule as selection moves. *(Audit result: the settle delay was the culprit — quickview chips now start their lane immediately — and the hover lane rides `SeekablePlayer` too, halving its cold-spawn first-frame latency.)*
-5. ✅ **Filmstrip scroll.** Scroll wheel / trackpad over the strip scrubs it fluidly: map scroll delta to a strip offset velocity, let the existing snap spring (`strip_snap_strength`) settle onto a chip, and commit selection to the settled chip (so scrolling is also selecting, like `h`/`l` but analog). Pointer input routing must split: scroll over strip = scrub strip, scroll elsewhere in quickview = nothing (grid pan stays grid-only). *(`strip_scroll_sensitivity` tuning; test: `filmstrip_scroll_commits_selection`.)*
+Remaining, conditional (only if the g² storyboard proves too coarse in use): *phase 2* — a dedicated denser strip (`seek_16x1_<w>x<h>_q<q>.jpg`, seeked single-frame extracts like the anim recipe, never an `fps=` decode) as a fifth queue tier below anim sheets, generated on first quickview of a clip; *phase 3* (only if still coarse) — exact frames on demand from a second **paused low-res `SeekablePlayer`** on the same clip (the in-process port makes thumbfast's paused-slave trick a two-line reuse instead of a process to babysit).
 
-**Exit criteria:** in quickview, the pointer alone can find a moment in a clip (bar + hover thumbs + click), and the filmstrip behaves like a physical strip (hover previews, inertial scroll). Chained interactions never show the thumbnail flash — worst case is freeze-then-jump.
+**Exit criteria:** met — the pointer alone finds a moment (bar + hover thumbs + click), the filmstrip feels physical, and chained seeks never flash the thumbnail (worst case is freeze-then-jump).
+
+### M9 — Metadata sort & filter *(MVP v2)*
+Reorder and subset the ingested grid by metadata, driven by **internal commands bound to keys** — no UI chrome yet (`[keys]`/`[commands]`, per §11). Needs no text stack, so it can land before M7.
+
+Sorts (each toggles ascending/descending on repeat; a `sort_ingest` command restores stdin/CLI order):
+- `sort_created` — creation date.
+- `sort_rating` — rating.
+- `sort_size` — file size.
+
+Filters (each press cycles a mode, wrapping back to `all`):
+- `filter_resolution` — all → 1080p+ → 4K+.
+- `filter_fps` — all → 30fps+ → 60fps+ → 120fps+.
+
+**Data sources** — mostly already cached, which is why this is cheap:
+- resolution (`width`/`height`) and `fps` are already in `Meta` → the filters are free once a clip is probed; a not-yet-probed clip has no meta, so decide its bucket (show as "unknown", or hide until meta arrives — lean toward showing so an un-probed grid isn't empty).
+- file size: from the `stat()` already done at fingerprint time.
+- creation date: macOS `st_birthtime`, fall back to mtime. *Open: filesystem birthtime vs the container `creation_time` tag — the latter needs a new probe/`Meta` field; start with birthtime.*
+- rating: **the library encodes stars in filenames** (`… ★★★★★.mp4`, `★★★★☆`) — parse a trailing star run. *Confirm this is the canonical source before building; the alternative is an xattr or sidecar.*
+
+**Design constraints:**
+- **Stdin order stays sacred** (hard rule): sort/filter are a *view* over the ingested set, never a reordering of it. Keep the ingest vector authoritative and render from a separate ordered/filtered index list — the same view-indirection M7's fuzzy filter will want, so build it here and reuse it there.
+- **Selection stays sane across changes** (like M7): track the selected clip by path, re-resolve its position after any sort/filter; if a filter hides it, fall to the nearest visible clip.
+- Index-keyed machinery (warm pool, live lanes, slot owners) must key consistently off the *view* index, or off path where it already does (the D-swap `pending_reselect` path-matching is the precedent).
+- An empty result is a valid state (draw an empty grid, don't crash).
+
+**Exit criteria:** a keybind flips the grid between all/1080p+/4K+ and all/30/60/120fps+, and sorts by date/rating/size, with the selected clip preserved and stdin order restorable — all without a text stack.
 
 ### Later
 - `--wrap` infinite grid mode.
@@ -505,47 +528,23 @@ Start simple: external `ffmpeg`/`ffprobe` invocation, or a bundled media crate i
 
 Later compare: direct ffmpeg bindings, platform-native decode, libmpv only for the selected preview.
 
-> **Resolved for the quickview lane (2026-07):** direct ffmpeg bindings (in-process libav) — see "Low-latency seek" below. External CLI invocation stays for thumbs/probes/sheets and, initially, the grid's hover/warm lanes.
+> **Resolved for live playback (2026-07):** direct ffmpeg bindings (in-process libav) — see "Low-latency seek" below; all live lanes run on it now. External CLI invocation stays for thumbs/probes/sheets.
 
-### Low-latency seek (quickview) — *the M8 prerequisite*
+### Low-latency seek (quickview) ✅ *shipped 2026-07*
 
-**Why a seek costs ~1s today.** `LivePlayer` is an ffmpeg CLI child writing rawvideo to a pipe. That pipe is the *only* channel — there is no way to tell a running child "jump to 42s". So a seek is a **respawn**, and a fresh child pays, serially: process exec → open the input and parse the container index (≈ a probe) → create a VideoToolbox decoder session → demux to the keyframe preceding `-ss` → decode the GOP forward to the target. Benchmarked ~1s floor on 4K, not fixable with flags — the cost is session setup, not decode speed. Note what is *not* the cause: the tile and the quickview sharing one decoder (one stream into the hires texture) is orthogonal and good — it's why quickview *opens* instantly. The problem is exclusively the process-per-position model.
+The M8 prerequisite. **Problem:** the ffmpeg-CLI `LivePlayer` had no seek channel — its pipe carries only frames — so every seek was a process respawn (~1s floor on 4K: exec + probe + VT session init + GOP decode, unfixable with flags). The quickview tile/modal sharing one decoder was never the cost (that's why quickview *opens* instantly). Browsers and mpv seek in tens of ms because they keep a **persistent demuxer + decoder session** alive (seek = sample-table lookup → nearest keyframe → partial GOP).
 
-**Why browsers make this look free.** A `<video>` element keeps a **persistent demuxer + decoder session** alive for its whole life. The MP4 `moov` atom is a full sample table already parsed in memory, so seek = table lookup → jump to nearest keyframe → decode a partial GOP; the hardware decoder session is never torn down. That's tens of ms. (Also, site preview grids are usually tiny short-GOP proxy encodes, not 4K masters — they've pre-paid on the content side too.) mpv is fast to seek for exactly the same reason: one long-lived seekable decoder. thumbfast (dotfiles: `~/.config/mpv/scripts/thumbfast.lua`) extends that to hover thumbs by keeping a second *paused* low-res mpv alive and IPC-ing `async seek <t> absolute+keyframes` at it.
+**Decision:** own the demuxer + decoder in-process via libav (`rsmpeg`), session + index resident. Rejected — latency-hiding pre-warm (floor is still the cold spawn), paused-mpv slave (a process to babysit; but see M8 hover-thumb phase 3), AVFoundation (macOS-only, diverges from ffmpeg color math). Benchmarked before committing (`spikes/seek-bench`, rsmpeg 0.18 vs brew ffmpeg 8):
 
-**The trade space** (quickview lane only; grid tiles never seek):
-
-| | mechanism | seek latency | cost |
+| | session init | keyframe seek | exact seek (avg / worst) |
 |---|---|---|---|
-| **A. Hide it** (warm decoders) | current respawn model + hover/scrub-predicted pre-warm (`warm_skip` generalized) | ~0 when predicted, ~1s floor when not | none — it's machinery we already have |
-| **B. In-process libav** (`ffmpeg-next`/`rsmpeg` bindings) | own the demuxer + decoder; `avformat_seek_file` + decode forward; session and index stay resident | keyframe-distance, tens of ms, any position | heavy dep + unsafe FFI; replaces spawn/pipe with FFI inside `LivePlayer` (the `PacedQueue` consumer side is unchanged) |
-| **C. Paused mpv slave** (thumbfast pattern) | persistent headless mpv per clip, IPC seeks, raw frames via `--ofopts=update=1` file | keyframe-distance | a process to babysit; great for *paused* frame-serving (hover thumbs), awkward as the *playing* stream (encode-mode output isn't paced playback) |
-| **D. Platform decode** (AVFoundation `AVPlayer` + `AVPlayerItemVideoOutput`) | native session, zero-copy `CVPixelBuffer` → Metal | near-instant | macOS-only fork of the pipeline; diverges from ffmpeg color math (the reason thumbs decode via ffmpeg) |
+| resident VT, 4K h264 (long GOP) | 10ms once | 20–30ms | 311 / 592ms |
+| resident VT, 4K60 HEVC | 2ms once | 9–16ms | 121 / 196ms |
+| CLI respawn (old model) | per seek | — | 280–880ms every time |
 
-**Decision (settled 2026-07):** **B — in-process libav.** A is only a latency *hider* (its floor is still the cold spawn whenever prediction misses), and B is the only option that makes *arbitrary* seeks genuinely cheap. It keeps color math in ffmpeg-land, keeps `PacedQueue`/pacing/backpressure semantics intact (the reader thread decodes via FFI instead of `read_exact` on a pipe), retroactively deletes the skip-checkpoint machinery (`warm_skip`), and unlocks edge-peek. C and D are off the table unless B disappoints on macOS.
+Exact seeks are GOP-decode-bound (~7ms/frame under VT), so long-GOP 4K can't hit <100ms exact — which **settles the interaction design, mpv-style: scrub = keyframe seeks (instant), release/settle = one exact seek** (hidden behind the keyframe frame already on screen). VT stays load-bearing; VP9/AV1 keep sw decode (keyframe-snappy, exact-slow — acceptable).
 
-Port shape:
-1. **Benchmark bin first** (derisk, not re-decide): open a 4K clip via the bindings, hw-decode with VideoToolbox, seek to N random positions; report session-init-once vs per-seek latency and confirm the VT session survives `avformat_seek_file` + flush. Also confirms the binding crate builds against brew ffmpeg 8.x — version support is part of the spike.
-
-   **✅ Done (2026-07, `spikes/seek-bench`, M-series Mac, brew ffmpeg 8.1.2).** `rsmpeg 0.18` (`link_system_ffmpeg` + `ffmpeg8`) built and linked first try; the VT session survived every seek. Measured on a 9.5-min 4K30 h264 (long GOP, ~3s) and an 8s 4K60 10-bit HEVC (~1s GOP), 10 random seeks each, vs `ffmpeg -ss` CLI respawn at the same positions:
-
-   | | session init | keyframe seek | exact seek (avg / worst) |
-   |---|---|---|---|
-   | resident VT, 4K h264 | 10ms once | **20–30ms** | 311ms / 592ms |
-   | resident VT, 4K60 HEVC | 2ms once | **9–16ms** | 121ms / 196ms |
-   | CLI respawn (today) | per seek | — | 280–880ms **every time** |
-   | resident sw decode | | 40–150ms | 0.5–3s (10-bit HEVC pathological) |
-
-   Exact seeks are GOP-decode-bound (keyframe→target frames × ~7ms/frame under VT), so long-GOP 4K can't hit <100ms *exact* — which settles the interaction design, same as mpv: **scrub = keyframe seeks (instant feedback), settle/release = one exact seek** (worst ~600ms, hidden behind the already-showing keyframe frame). Full-res hw→sw download measured 1–6ms — negligible, and the real pipeline scales on-GPU first. Sw-decode exact seeks are unusable on heavy sources: VT stays load-bearing (VP9/AV1 keep sw decode and will feel keyframe-snappy but exact-slow; acceptable).
-2. **`SeekablePlayer` in sb-media** behind the same surface `LivePlayer` presents (`spawn/take_frame/buffered` + a new `seek(f64, exact: bool)`): demuxer + decoder owned by the reader thread, frames still due-stamped into the paced bounded queue, `seek()` = flush + `avformat_seek_file` backward (+ decode-forward when exact) — no respawn, position becomes a real property instead of `seek + wall-clock`. The decode chain mirrors the CLI flags exactly (VT for h264/hevc/prores, `scale_vt`+`hwdownload` at mod-8 target dims — the `hw_scale_vf` string is reused verbatim as the libavfilter graph — sw fallback with explicit rotation; pacing stamps by pts delta with late re-anchor, wall-clock-correct like the CLI's forced CFR).
-
-   **✅ Done (2026-07, `crates/sb-media/src/seekable.rs`).** Verified live on 4K: hw graph engaged, first frame 426ms after spawn, ~0.5 core for 4K30 (CLI-chain parity). Regression tests mirror the LivePlayer trio (pacing, backpressure stall, drop-wakes-reader) plus `seek_jumps_in_place_without_respawn`.
-3. **Quickview lane first, grid lanes later.** The hires stream moves to `SeekablePlayer`; hover/warm lanes can stay on CLI `LivePlayer` until the new path has soaked (both feed the same queue type, so they coexist).
-
-   **✅ Done for selected + warm pool** (they must share a type for promotion); **hover lane followed one commit later** — it never seeks, but the in-process spawn halves its first-frame latency, which is what chip hover-play lives on. `LivePlayer` remains in sb-media (tests + pacebench) as the instant-revert fallback until a release has soaked, then gets deleted.
-4. Then delete `warm_skip` and the chained-skip checkpoint plumbing — `[`/`]` becomes a plain `seek()`.
-
-   **✅ Done.** `[`/`]` is `player.seek(position + delta, exact)` on the live stream; `warm_skip`, `skip_delta` and the checkpoint pre-warm/stagger logic are gone. Test: `skip_seeks_the_selected_stream_in_place` (replaces the respawn + chained-promotion pair).
+**Shipped as `SeekablePlayer`** (`crates/sb-media/src/seekable.rs`): the same paced-queue contract `LivePlayer` presents (`spawn`/`take_frame`/`buffered`) plus `seek(f64, exact)`; demuxer + decoder owned by the reader thread, `seek()` = flush + `avformat_seek_file` backward (+ decode-forward when exact), position is a real pts property. The decode/scale chain reuses `hw_scale_vf` verbatim as a libavfilter graph (parity by construction), the sw fallback rotates explicitly (libavfilter doesn't autorotate), pacing stamps by pts-delta with late re-anchor. All live lanes — selected, warm pool, hover — run on it; `[`/`]` is a plain `seek()` and the old `warm_skip`/checkpoint machinery is deleted. `LivePlayer` stays in sb-media (tests + pacebench keep it compiling) as an instant-revert fallback until a release soaks, then goes. Tests: the `SeekablePlayer` pacing/stall/drop trio + `seek_jumps_in_place_without_respawn` + `skip_seeks_the_selected_stream_in_place`. Resident sessions are already the feed edge-peek needs.
 
 ### Cache lookup performance
 Start with the filesystem cache. Only add SQLite if profiling proves:

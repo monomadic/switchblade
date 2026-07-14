@@ -19,8 +19,8 @@ Built for VJs picking clips mid-set, creators sorting AI-generated footage, and 
 - **Streaming stdin** — tiles appear while `fd` is still finding files. Newline- or NUL-delimited, never blocks on a slow producer.
 - **Cached thumbnails** — one frame per clip (ffmpeg) in a content-addressed sidecar cache; a relaunch over the same library is instant. Your media files are never written to.
 - **Animated thumbnails** — a sprite sheet of frames sampled across each clip; tiles cycle with per-clip phase offsets and shader crossfade. Toggle with `a`.
-- **Live playback in-tile** — the selected and hovered clips play real (silent, looping) video inside their tiles, seek-matched to the thumbnail's frame so nothing jumps.
-- **Quickview** — `Space` (or click the selection): the grid dims and the clip plays large and centered at natural resolution (up to 1080p, configurable). Arrows keep browsing without closing it.
+- **Live playback in-tile** — the selected and hovered clips play real (silent, looping) video inside their tiles, seek-matched to the thumbnail's frame so nothing jumps. An in-process (libav) decoder keeps the demuxer resident, so seeking is a jump-in-place, not a reload.
+- **Quickview** — `Space` (or click the selection): the grid dims and frosts and the clip plays large and centered at natural resolution (up to 1080p, configurable). Move the pointer over the video for a **seekbar** — click to seek, hold-drag to scrub, hover for storyboard thumbnails; scroll to fly the **filmstrip** of neighbors along the bottom, or `h`/`l` to step. `[`/`]` skip through the clip anywhere.
 - **Pinch zoom** — tile size scales, columns reflow with a crossfade. `-`/`=`/`0` on the keyboard.
 - **Keymap** — bind any non-movement key to internal actions or launched programs with `{path}`/`{dir}`/`{name}` templates: open in mpv, reveal in Finder, run your renamer script, push to a VJ tool.
 - **Hot-tunable feel** — every motion constant (springs, gaps, scales, fades) lives in `switchblade.toml` and reloads within 250ms while the app runs.
@@ -30,7 +30,7 @@ Built for VJs picking clips mid-set, creators sorting AI-generated footage, and 
 ## Requirements
 
 - macOS (first target platform)
-- [ffmpeg](https://ffmpeg.org) + ffprobe on `PATH` — thumbnails and live decode (`brew install ffmpeg`)
+- [ffmpeg](https://ffmpeg.org) 8.x — both the `ffmpeg`/`ffprobe` CLIs (thumbnails, sprite sheets) **and** the dev libraries the in-process seekable decoder links against (`brew install ffmpeg` provides both)
 - [mpv](https://mpv.io) — optional, the default `open` command (`brew install mpv`)
 
 ## Build & run
@@ -52,13 +52,15 @@ switchblade --help # options, including --no-anim
 | `Space` | quickview (internal preview; `Esc`/`Space`/click closes, arrows browse) |
 | `c` | copy path |
 | `r` | reveal in Finder |
+| `[` / `]` | skip back / forward through the playing clip (wraps) |
+| `D` | browse the selected clip's siblings (its parent dir) |
 | `a` | toggle animated thumbnails |
 | `p` | toggle pause-when-unfocused |
 | `-` / `=` / `0` | zoom out / in / reset (also trackpad pinch) |
 | `f` | fullscreen |
 | `q` | quit |
 
-Trackpad pans without changing the selection. Click selects; clicking the selected clip quickviews. Everything except movement is remappable.
+Trackpad pans without changing the selection. Click selects; clicking the selected clip quickviews. In quickview, the pointer works the seekbar and the scroll wheel scrubs the filmstrip. Everything except movement is remappable.
 
 ## Configuration
 
