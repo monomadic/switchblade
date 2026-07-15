@@ -26,6 +26,7 @@ pub enum Key {
     Enter,
     Space,
     Escape,
+    Tab,
     Char(char),
 }
 
@@ -387,6 +388,7 @@ impl<A: App> ApplicationHandler for Runner<A> {
                     WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
                     WinitKey::Named(NamedKey::Space) => Some(Key::Space),
                     WinitKey::Named(NamedKey::Escape) => Some(Key::Escape),
+                    WinitKey::Named(NamedKey::Tab) => Some(Key::Tab),
                     WinitKey::Character(s) => s.chars().next().map(Key::Char),
                     _ => None,
                 };

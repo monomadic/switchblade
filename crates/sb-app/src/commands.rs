@@ -51,6 +51,9 @@ pub enum Action {
     ToggleAnim,
     ToggleFocusPause,
     Quickview,
+    /// Toggle fullview: the selected clip fills the whole window,
+    /// letterboxed on black. Esc or the same key exits.
+    Fullview,
     /// Jump the playing clip by a fraction of its duration; `None` falls
     /// back to the tuning `skip_fraction`.
     Skip { forward: bool, amount: Option<f32> },
@@ -71,6 +74,7 @@ impl Default for KeyMap {
             ("enter", "open"),
             ("o", "open"),
             ("space", "quickview"),
+            ("tab", "fullview"),
             ("c", "copy_path"),
             ("q", "quit"),
             ("f", "fullscreen"),
@@ -158,6 +162,7 @@ fn key_name(key: &Key) -> Option<String> {
         Key::Enter => "enter".to_string(),
         Key::Space => "space".to_string(),
         Key::Escape => "esc".to_string(),
+        Key::Tab => "tab".to_string(),
         Key::Char(c) => c.to_string(),
         // Arrows are reserved movement keys; they never reach the keymap.
         _ => return None,
@@ -176,6 +181,7 @@ fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
         "toggle_anim" => Action::ToggleAnim,
         "toggle_focus_pause" => Action::ToggleFocusPause,
         "quickview" => Action::Quickview,
+        "fullview" | "toggle_fullview" => Action::Fullview,
         "skip_forward" => Action::Skip {
             forward: true,
             amount,
@@ -322,6 +328,15 @@ mod tests {
         assert!(matches!(
             map.action_for(&Key::Char('D')),
             Some(Action::OpenParent)
+        ));
+    }
+
+    #[test]
+    fn fullview_binds_to_tab() {
+        let map = KeyMap::default();
+        assert!(matches!(
+            map.action_for(&Key::Tab),
+            Some(Action::Fullview)
         ));
     }
 

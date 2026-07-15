@@ -190,6 +190,10 @@ pub struct Switchblade {
     /// Internal fullscreen-ish preview of the selected clip.
     quickview: bool,
     quickview_at: Instant,
+    /// Fullview: the selected clip fills the whole window, letterboxed on
+    /// black — no filmstrip/seekbar/blur. Reuses the selected clip's live
+    /// hires stream (the same one the tile plays). Toggled by `fullview`.
+    fullview: bool,
     /// Filmstrip slide position (in clip-index units), springing toward
     /// the selected index with the keyboard chase curve.
     strip_pos: f32,
@@ -345,6 +349,7 @@ impl Switchblade {
             atlas_cfg,
             quickview: false,
             quickview_at: Instant::now(),
+            fullview: false,
             strip_pos: 0.0,
             strip_target: 0.0,
             strip_hover: None,
@@ -512,6 +517,10 @@ impl Switchblade {
     fn key(&mut self, key: Key) {
         // Movement keys are reserved; everything else goes through the keymap.
         match key {
+            Key::Escape if self.fullview => {
+                self.fullview = false;
+                return;
+            }
             Key::Escape if self.quickview => {
                 self.quickview = false;
                 return;
@@ -555,6 +564,7 @@ impl Switchblade {
                     self.strip_target = self.strip_pos;
                 }
             }
+            Action::Fullview => self.fullview = !self.fullview,
             Action::Skip { forward, amount } => self.skip(forward, amount),
             Action::OpenParent => self.open_parent(),
             Action::CopyPath => {
@@ -652,6 +662,37 @@ impl Switchblade {
         }
         let fade = (self.tuning.seekbar_fade_ms / 1000.0).max(0.001);
         (1.0 - (t - hide) / fade).clamp(0.0, 1.0)
+    }
+
+    /// UV + pixel dims + `hires` flag for the selected clip's current
+    /// frame: the live hires stream when it's up for this clip (already
+    /// running, already sharp — no handoff), else the static thumb.
+    /// Shared by the quickview modal and fullview so they can't drift.
+    fn selected_video_src(&self, clip: &Clip) -> Option<([f32; 4], f32, f32, bool)> {
+        let live = self.live_sel.as_ref().filter(|l| {
+            (l.path == clip.path || self.pending_reselect.as_ref() == Some(&l.path))
+                && (l.first_frame.is_some() || self.hires_shown.as_ref() == Some(&l.path))
+        });
+        if let Some(l) = live {
+            let (w, h) = (l.player.w as f32, l.player.h as f32);
+            let (hw, hh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
+            Some((
+                [0.5 / hw, 0.5 / hh, (w - 1.0) / hw, (h - 1.0) / hh],
+                w,
+                h,
+                true,
+            ))
+        } else {
+            match clip.thumb {
+                Thumb::Ready { slot, tw, th, .. } => Some((
+                    self.atlas_cfg.uv(slot, 0.0, 0.0, tw as f32, th as f32),
+                    tw as f32,
+                    th as f32,
+                    false,
+                )),
+                _ => None,
+            }
+        }
     }
 
     /// The quickview modal's video rectangle — the same geometry
@@ -1890,30 +1931,7 @@ impl Switchblade {
                 // respawn keeps the texture's last frame instead; and
                 // during the D swap the shielded stream stays up while
                 // the selection index is in flux.
-                let live = self.live_sel.as_ref().filter(|l| {
-                    (l.path == clip.path || self.pending_reselect.as_ref() == Some(&l.path))
-                        && (l.first_frame.is_some() || self.hires_shown.as_ref() == Some(&l.path))
-                });
-                let src = if let Some(l) = live {
-                    let (w, h) = (l.player.w as f32, l.player.h as f32);
-                    let (hw, hh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
-                    Some((
-                        [0.5 / hw, 0.5 / hh, (w - 1.0) / hw, (h - 1.0) / hh],
-                        w,
-                        h,
-                        true,
-                    ))
-                } else {
-                    match clip.thumb {
-                        Thumb::Ready { slot, tw, th, .. } => Some((
-                            self.atlas_cfg.uv(slot, 0.0, 0.0, tw as f32, th as f32),
-                            tw as f32,
-                            th as f32,
-                            false,
-                        )),
-                        _ => None,
-                    }
-                };
+                let src = self.selected_video_src(clip);
                 // The video sits above the filmstrip (geometry shared with
                 // the pointer hit-tests via quickview_video_rect).
                 let (chip_w, chip_h, strip_y) = self.strip_geom();
@@ -2139,6 +2157,63 @@ impl Switchblade {
             }
         }
 
+        // Fullview (internal `fullview` action): the selected clip fills
+        // the whole window, letterboxed on an opaque black backdrop — no
+        // filmstrip, seekbar, or blur. Reuses the same hires stream the
+        // tile plays, so it opens instantly with no handoff. Drawn over
+        // everything (including any quickview underneath); Esc/tab exits.
+        if self.fullview {
+            let (vw, vh) = (self.viewport.width, self.viewport.height);
+            let full = |x, y, w, h, color| Tile {
+                x,
+                y,
+                w,
+                h,
+                color,
+                border_color: [0.0; 4],
+                corner_radius: 0.0,
+                border_width: 0.0,
+                uv: [0.0; 4],
+                uv2: [0.0; 4],
+                frame_fade: 0.0,
+                tex_mix: 0.0,
+                hires: false,
+            };
+            // Opaque black covers the grid (and any quickview) behind it.
+            tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 1.0]));
+            if let Some(clip) = self.clips.get(self.selected) {
+                if let Some((uv, tw, th, hires)) = self.selected_video_src(clip) {
+                    // Letterbox: fit the frame's aspect inside the window.
+                    let a = tw / th.max(1.0);
+                    let (mut w, mut h) = (vw, vh);
+                    if a > vw / vh.max(1.0) {
+                        h = w / a;
+                    } else {
+                        w = h * a;
+                    }
+                    tiles.push(Tile {
+                        x: (vw - w) * 0.5,
+                        y: (vh - h) * 0.5,
+                        w,
+                        h,
+                        color: [0.0, 0.0, 0.0, 1.0],
+                        border_color: [0.0; 4],
+                        corner_radius: 0.0,
+                        border_width: 0.0,
+                        uv,
+                        uv2: [0.0; 4],
+                        frame_fade: 0.0,
+                        tex_mix: 1.0,
+                        hires,
+                    });
+                } else {
+                    // Nothing decoded yet: loading dots on the black stage.
+                    let stage = full((vw - 300.0) * 0.5, (vh - 100.0) * 0.5, 300.0, 100.0, [0.0; 4]);
+                    push_loading_dots(&mut tiles, &stage, 1.0, anim_t, true);
+                }
+            }
+        }
+
         // Background-jobs indicator: a hairline progress bar, bottom-right.
         // Drawn last — above the quickview dim — so "still working" stays
         // visible whenever it's true. Lingers a moment when the batch
@@ -2267,6 +2342,12 @@ impl App for Switchblade {
                 self.focused = focused;
             }
             InputEvent::MouseDown { x, y } => {
+                // In fullview a click exits — the grid it would select is
+                // hidden behind the black backdrop.
+                if self.fullview {
+                    self.fullview = false;
+                    return;
+                }
                 // In quickview: the seekbar grabs first (click = seek,
                 // hold = scrub), then a filmstrip chip click selects it;
                 // anywhere else closes. In the grid: click selects, click

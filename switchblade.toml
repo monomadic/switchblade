@@ -202,15 +202,15 @@ quickview_max_height = 1440
 
 # ── Keys & commands (PLAN.md §11) ────────────────────────────────────────
 # hjkl / arrows are reserved for movement; every other key is remappable.
-# Built-in defaults: enter/o = open · space = quickview · c = copy_path ·
-# q = quit · f = fullscreen · a = toggle_anim · p = toggle_focus_pause ·
-# r = reveal · -/=/0 = zoom · [ / ] = skip back/fwd through the playing
-# clip · D = browse the selected clip's parent dir. Entries here override
-# them.
+# Built-in defaults: enter/o = open · space = quickview · tab = fullview ·
+# c = copy_path · q = quit · f = fullscreen · a = toggle_anim ·
+# p = toggle_focus_pause · r = reveal · -/=/0 = zoom · [ / ] = skip
+# back/fwd through the playing clip · D = browse the selected clip's
+# parent dir. Entries here override them.
 #
 # A key can name an internal action (quit, fullscreen, fast_fullscreen,
-# copy_path, quickview, toggle_anim, toggle_focus_pause, zoom_in,
-# zoom_out, zoom_reset, skip_forward, skip_back, open_parent) or any
+# copy_path, quickview, fullview, toggle_anim, toggle_focus_pause,
+# zoom_in, zoom_out, zoom_reset, skip_forward, skip_back, open_parent) or any
 # [commands.*] entry below. In command args, {path}, {dir} and {name}
 # expand against the selected clip.
 #
@@ -226,6 +226,7 @@ enter = "open"
 o = "open"
 space = "quickview"      # internal preview; Esc or Space closes, arrows browse
 # space = "preview"      # alternative: external looping mpv (defined below)
+tab = "fullview"         # selected clip fills the window on black; Esc or Tab exits
 c = "copy_path"
 a = "toggle_anim"        # animated thumbnails on/off
 p = "toggle_focus_pause" # pause-when-unfocused on/off
