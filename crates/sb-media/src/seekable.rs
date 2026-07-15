@@ -610,6 +610,11 @@ unsafe fn build_graph(
         (*par).format = (*frame).format;
         (*par).width = (*frame).width;
         (*par).height = (*frame).height;
+        // Colorspace/range too: buffersrc defaults them to unspecified,
+        // and real camera output tags bt709/tv — the mismatch makes every
+        // spawn log "Changing video frame properties on the fly".
+        (*par).color_space = (*frame).colorspace;
+        (*par).color_range = (*frame).color_range;
         // Declare the true stream timebase: frames carry pts in it, and
         // the sink's own timebase (read back below) prices the output.
         (*par).time_base = tb;
@@ -781,6 +786,58 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(shared.upgrade().is_none(), "reader thread leaked after drop");
+    }
+
+    /// Real camera/encoder output tags colorspace and range (bt709/tv);
+    /// the lavfi test clips don't, which is how a buffersrc declared
+    /// without color properties slipped through. The graph must accept
+    /// tagged frames without renegotiation stalls on either chain.
+    #[test]
+    fn color_tagged_source_still_delivers_frames() {
+        if !crate::have_binary("ffmpeg") {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_seekable_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("tagged.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=320x180:rate=30")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .args(["-colorspace", "bt709", "-color_primaries", "bt709"])
+                .args(["-color_trc", "bt709", "-color_range", "tv"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate tagged test clip");
+        }
+        // hw chain (VT decode + scale_vt) and sw chain (no pix_fmt in
+        // meta forces the software scale path) — both must flow.
+        let mut sw_meta = meta(&clip);
+        sw_meta.pix_fmt = None;
+        for (label, m) in [("hw", meta(&clip)), ("sw", sw_meta)] {
+            let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&m)).expect("spawn");
+            assert!(
+                take_one(&p, Duration::from_secs(3)).is_some(),
+                "{label} chain: no first frame from color-tagged source"
+            );
+            let t0 = Instant::now();
+            let mut frames = 0u32;
+            while t0.elapsed() < Duration::from_secs(1) {
+                if p.take_frame().is_some() {
+                    frames += 1;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                (20..=45).contains(&frames),
+                "{label} chain: expected ~30 paced frames from tagged source, got {frames}"
+            );
+            assert!(!p.failed(), "{label} chain: reader reported failure");
+        }
     }
 
     /// The whole point of the port: `seek()` jumps the SAME stream — no

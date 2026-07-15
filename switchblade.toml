@@ -169,6 +169,20 @@ thumb_quality = 8
 # 3 = 9 smaller frames (more motion), 2 = 4 crisper frames.
 anim_grid = 3
 
+# How cached thumbnails are tied to source files (startup-only):
+#   "size_mtime" (default) size + mtime only, so the cache survives
+#                renames and moves — reshuffling a library or renaming
+#                clips (e.g. appending rating stars) keeps every
+#                thumbnail. Two distinct files that share an exact byte
+#                size AND mtime second would collide (vanishingly rare;
+#                worst case is a wrong thumb until --cleanup-cache), and
+#                exact duplicates deliberately share one entry.
+#   "path"       absolute path + size + mtime. A moved or RENAMED file
+#                loses its cache and regenerates from scratch.
+# "size_mtime" adopts existing "path"-keyed entries in place on first
+# access — it does NOT regenerate the library.
+cache_key = "size_mtime"
+
 # GPU atlas: how many thumbs stay resident on the GPU at once.
 #   slots = floor(atlas_width/thumb_width) x floor(atlas_height/thumb_height)
 # With the sizes above that's 21 x 37 = 777 slots (~1.0 GB unified

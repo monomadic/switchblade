@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Deserialize;
 
 use crate::commands::{CommandSpec, KeyMap};
+use sb_media::CacheKey;
 
 /// How much moves. Each level includes everything below it:
 /// `none` = snap-everything, no tweens, no video, no sheets;
@@ -115,6 +116,13 @@ pub struct Tuning {
     /// Anim sheet grid (frames = grid², frame size = thumb/grid). 3 = more
     /// motion, 2 = crisper frames. Startup-only.
     pub anim_grid: u32,
+    /// How cache entries are keyed to source files (startup-only):
+    /// "size_mtime" (default) = size + mtime only, so entries survive
+    /// renames/moves (rating-star renames, library reshuffles); "path" =
+    /// absolute path + size + mtime, so a rename or move loses the cache.
+    /// "size_mtime" adopts existing path-keyed entries in place — no
+    /// library-wide regeneration.
+    pub cache_key: CacheKey,
     /// Atlas texture dimensions (VRAM ≈ w×h×4 bytes). Clamped to 8192.
     pub atlas_width: u32,
     pub atlas_height: u32,
@@ -210,6 +218,7 @@ impl Default for Tuning {
             thumb_height: 360,
             thumb_quality: 7,
             anim_grid: 3,
+            cache_key: CacheKey::SizeMtime,
             atlas_width: 7680,
             atlas_height: 4320,
             quickview_max_width: 1920,

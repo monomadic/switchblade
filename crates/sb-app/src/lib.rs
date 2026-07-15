@@ -281,6 +281,10 @@ impl Switchblade {
             Some(cfg) => (cfg.tuning, cfg.keymap),
             None => (Tuning::default(), KeyMap::default()),
         };
+        // Startup-only, before any cache access (ingest stats, thumb
+        // requests): the fingerprint keying can't change under a live
+        // cache without splitting entries across two keyings.
+        sb_media::set_cache_key(tuning.cache_key);
 
         // CLI paths beat stdin; --demo beats both; a TTY stdin with
         // neither also falls back to the demo grid.
@@ -1073,7 +1077,10 @@ impl Switchblade {
     /// grid only generates at animation level `full` — so quickview
     /// requests the selected clip's sheet on demand (g² cheap seeked
     /// extracts, disk-cached) at any level. One clip at a time, never
-    /// library-wide (PLAN.md §14 M8).
+    /// library-wide (PLAN.md §14 M8). `request_anim_now`, not
+    /// `request_anim`: the bulk-sheet tier sits below the library gen
+    /// sweep, which can back up for hours after a recipe change — the
+    /// user hovering the seekbar can't wait behind that.
     fn request_quickview_sheet(&mut self) {
         if !self.quickview || self.tuning.seekbar_thumb_width < 8.0 {
             return;
@@ -1086,7 +1093,7 @@ impl Switchblade {
             && matches!(clip.anim, Thumb::None)
             && matches!(clip.thumb, Thumb::Ready { .. })
         {
-            self.media.request_anim(clip.path.clone());
+            self.media.request_anim_now(clip.path.clone());
             clip.anim = Thumb::Pending;
             self.jobs_total += 1;
         }

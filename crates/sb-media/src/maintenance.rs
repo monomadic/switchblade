@@ -5,9 +5,10 @@
 //!
 //! "Stale" is deterministic, not guessed from file ages: every entry's
 //! `meta.json` records its source path, and the entry's directory name
-//! IS the fingerprint of (path, size, mtime). So an entry is dead when
-//! its source no longer exists or no longer fingerprints to this entry
-//! (the file was edited/re-encoded — its cache lives elsewhere now).
+//! IS the source's fingerprint under one of the `cache_key` modes. So
+//! an entry is dead when its source no longer exists or no longer
+//! fingerprints to this entry under either keying (the file was
+//! edited/re-encoded — its cache lives elsewhere now).
 //! Within live entries, artifacts whose recipe-encoded names don't
 //! match the current config would never be served, so they go too.
 //! Only `--reduce-cache` uses time, and only to *rank* live entries
@@ -16,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::{cache_root, fingerprint, mtime_secs, Meta, Recipe};
+use crate::{cache_root, fingerprint_with, mtime_secs, CacheKey, Meta, Recipe};
 
 /// What a maintenance pass removed (or, for `usage`, what exists).
 #[derive(Debug, Default, Clone, Copy)]
@@ -136,6 +137,9 @@ fn entries(root: &Path) -> impl Iterator<Item = PathBuf> + use<> {
 /// Dead = we can no longer tie this entry to a source file that still
 /// fingerprints to it. No meta.json means no provenance (interrupted
 /// first write) — also dead; regeneration is one queued job away.
+/// Either `cache_key` keying counts as alive: a config switch must not
+/// turn the other keying's still-valid entries into cleanup fodder
+/// (they get adopted or served lazily, never regenerated for nothing).
 fn entry_is_dead(entry: &Path) -> bool {
     let Ok(bytes) = std::fs::read(entry.join("meta.json")) else {
         return true;
@@ -146,8 +150,12 @@ fn entry_is_dead(entry: &Path) -> bool {
     let Ok(st) = std::fs::metadata(&meta.src) else {
         return true; // source gone (or unreadable — treat as gone)
     };
-    let fp = fingerprint(&meta.src, st.len(), mtime_secs(&st));
-    entry.file_name().is_none_or(|name| name != fp.as_str())
+    let Some(name) = entry.file_name() else {
+        return true;
+    };
+    ![CacheKey::Path, CacheKey::SizeMtime]
+        .iter()
+        .any(|&k| name == fingerprint_with(k, &meta.src, st.len(), mtime_secs(&st)).as_str())
 }
 
 /// Best-effort last-use of an entry: the newest access-or-modify time
@@ -228,12 +236,37 @@ mod tests {
 
     /// A cache entry whose fingerprint matches `src` as it exists now.
     fn live_entry(root: &Path, src: &Path) -> PathBuf {
+        live_entry_keyed(root, src, CacheKey::Path)
+    }
+
+    fn live_entry_keyed(root: &Path, src: &Path, key: CacheKey) -> PathBuf {
         let st = std::fs::metadata(src).unwrap();
-        let fp = fingerprint(src, st.len(), mtime_secs(&st));
+        let fp = fingerprint_with(key, src, st.len(), mtime_secs(&st));
         let dir = root.join(&fp[..2]).join(&fp);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("meta.json"), meta_for(src)).unwrap();
         dir
+    }
+
+    /// Entries from EITHER keying stay alive as long as their source
+    /// still matches — switching `cache_key` in the config must never
+    /// turn the old keying's cache into cleanup fodder.
+    #[test]
+    fn entries_from_either_cache_key_survive_cleanup() {
+        let root = std::env::temp_dir().join("sb_maint_keying_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("clip.mp4");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&src, b"not really a video").unwrap();
+        let by_path = live_entry_keyed(&root, &src, CacheKey::Path);
+        let by_stat = live_entry_keyed(&root, &src, CacheKey::SizeMtime);
+        assert_ne!(by_path, by_stat);
+        assert!(!entry_is_dead(&by_path));
+        assert!(!entry_is_dead(&by_stat));
+        cleanup_in(&root, &RECIPE);
+        assert!(by_path.join("meta.json").exists());
+        assert!(by_stat.join("meta.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

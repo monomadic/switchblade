@@ -73,23 +73,51 @@ enum Request {
 
 /// Strict-priority work queue, popped top to bottom — a lower tier never
 /// runs while a higher one has work:
-///   1. `thumbs`   — visible thumbnails (something on screen needs pixels)
-///   2. `reprobes` — meta.json healing for clips the user is playing
+///   1. `thumbs`    — visible thumbnails (something on screen needs pixels)
+///   2. `reprobes`  — meta.json healing for clips the user is playing
 ///      live right now (one cheap ffprobe unblocks the hardware scale
 ///      chain for that clip's next spawn)
-///   3. `gen`      — background thumb generation for the whole library
-///   4. `anims`    — sprite sheets, always last: every file gets a
-///      thumbnail before any animation work starts, and newly discovered
-///      files (streaming stdin, dir walks) jump ahead of sheets too.
+///   3. `anims_now` — the ONE sheet quickview asked for on demand (the
+///      seekbar storyboard): the user is hovering it right now, so it
+///      must not wait behind the sweep — after a thumb-recipe change the
+///      `gen` tier holds the whole library for hours across sessions,
+///      and tier-strict starvation below it silently killed the
+///      storyboard.
+///   4. `gen`       — background thumb generation for the whole library
+///   5. `anims`     — bulk sprite sheets, always last: every file gets a
+///      thumbnail before library-wide animation work starts, and newly
+///      discovered files (streaming stdin, dir walks) jump ahead too.
 ///
-/// (Live video never queues here at all — it has its own unniced ffmpeg
-/// processes; these workers are niced below it.)
+/// (Live video never queues here at all — it runs in-process; these
+/// workers are niced below it.)
 #[derive(Default)]
 struct Queues {
     thumbs: VecDeque<PathBuf>,
     reprobes: VecDeque<PathBuf>,
+    anims_now: VecDeque<PathBuf>,
     r#gen: VecDeque<PathBuf>,
     anims: VecDeque<PathBuf>,
+}
+
+impl Queues {
+    fn pop(&mut self) -> Option<Request> {
+        if let Some(p) = self.thumbs.pop_front() {
+            return Some(Request::Thumb(p));
+        }
+        if let Some(p) = self.reprobes.pop_front() {
+            return Some(Request::Reprobe(p));
+        }
+        if let Some(p) = self.anims_now.pop_front() {
+            return Some(Request::Anim(p));
+        }
+        if let Some(p) = self.r#gen.pop_front() {
+            return Some(Request::Gen(p));
+        }
+        if let Some(p) = self.anims.pop_front() {
+            return Some(Request::Anim(p));
+        }
+        None
+    }
 }
 
 type SharedQueue = Arc<(Mutex<Queues>, Condvar)>;
@@ -182,6 +210,15 @@ impl MediaService {
     pub fn request_anim(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
         lock.lock().unwrap().anims.push_back(path);
+        cv.notify_one();
+    }
+
+    /// Queue one sheet ahead of the background sweep — for quickview's
+    /// storyboard, where the user is hovering the seekbar right now.
+    /// Bulk sheet generation must keep using `request_anim`.
+    pub fn request_anim_now(&self, path: PathBuf) {
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().anims_now.push_back(path);
         cv.notify_one();
     }
 
@@ -483,23 +520,14 @@ fn worker(
     recipe: Recipe,
 ) {
     loop {
-        // Strict priority: visible thumbs, then the gen sweep, then anims.
-        // The lock drops before any work starts.
+        // Strict priority (tier order documented on `Queues`). The lock
+        // drops before any work starts.
         let req = {
             let (lock, cv) = &*queue;
             let mut q = lock.lock().unwrap();
             loop {
-                if let Some(p) = q.thumbs.pop_front() {
-                    break Request::Thumb(p);
-                }
-                if let Some(p) = q.reprobes.pop_front() {
-                    break Request::Reprobe(p);
-                }
-                if let Some(p) = q.r#gen.pop_front() {
-                    break Request::Gen(p);
-                }
-                if let Some(p) = q.anims.pop_front() {
-                    break Request::Anim(p);
+                if let Some(r) = q.pop() {
+                    break r;
                 }
                 q = cv.wait(q).unwrap();
             }
@@ -554,8 +582,7 @@ fn ensure_thumb_file(
     if !meta.is_file() {
         return None;
     }
-    let fp = fingerprint(src, meta.len(), mtime_secs(&meta));
-    let dir = root.join(&fp[..2]).join(&fp);
+    let dir = entry_dir(root, src, meta.len(), mtime_secs(&meta));
     let jpg = dir.join(recipe.thumb_file());
 
     if !jpg.exists() {
@@ -593,8 +620,7 @@ fn make_anim(
     if !meta.is_file() {
         return None;
     }
-    let fp = fingerprint(src, meta.len(), mtime_secs(&meta));
-    let dir = root.join(&fp[..2]).join(&fp);
+    let dir = entry_dir(root, src, meta.len(), mtime_secs(&meta));
     let jpg = dir.join(recipe.anim_file());
 
     if !jpg.exists() {
@@ -721,9 +747,19 @@ pub struct Meta {
 /// file read; no process spawn). Present for anything with a thumbnail.
 pub fn cached_meta(path: &Path) -> Option<Meta> {
     let meta = std::fs::metadata(path).ok()?;
-    let fp = fingerprint(path, meta.len(), mtime_secs(&meta));
-    let file = cache_root().join(&fp[..2]).join(&fp).join("meta.json");
-    serde_json::from_slice(&std::fs::read(file).ok()?).ok()
+    let file = entry_dir(&cache_root(), path, meta.len(), mtime_secs(&meta)).join("meta.json");
+    let mut m: Meta = serde_json::from_slice(&std::fs::read(&file).ok()?).ok()?;
+    if m.src != path {
+        // Under `size_mtime` a rename keeps the entry but strands the
+        // recorded source path — and `--cleanup-cache` judges entries
+        // dead by whether meta.src still fingerprints here. Heal it on
+        // first access or cleanup eats the entry the keying preserved.
+        m.src = path.to_path_buf();
+        if let Ok(json) = serde_json::to_vec_pretty(&m) {
+            let _ = std::fs::write(&file, json);
+        }
+    }
+    Some(m)
 }
 
 /// Worker-side half of `request_reprobe`: probe again and rewrite the
@@ -734,8 +770,7 @@ fn reprobe(src: &Path, root: &Path) {
     let Ok(st) = std::fs::metadata(src) else {
         return;
     };
-    let fp = fingerprint(src, st.len(), mtime_secs(&st));
-    let dir = root.join(&fp[..2]).join(&fp);
+    let dir = entry_dir(root, src, st.len(), mtime_secs(&st));
     let file = dir.join("meta.json");
     if let Ok(bytes) = std::fs::read(&file) {
         if serde_json::from_slice::<Meta>(&bytes).is_ok_and(|m| m.pix_fmt.is_some()) {
@@ -902,21 +937,79 @@ fn decode_jpeg(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>
     Some((w, h, out.stdout))
 }
 
-/// Pragmatic MVP fingerprint: absolute path + size + mtime (PLAN.md §8).
-/// FNV-1a so the key is stable across runs and toolchains. Tradeoff: moved
-/// files lose their cache; stronger modes (partial hash) come later.
-fn fingerprint(path: &Path, size: u64, mtime: u64) -> String {
+/// How cache entries are keyed to source files (config `cache_key`,
+/// PLAN.md §8). Startup-only: flipping it under a running cache would
+/// split entries across two keyings mid-session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheKey {
+    /// Absolute path + size + mtime — the original MVP key. Renamed or
+    /// moved files lose their cache (it regenerates elsewhere).
+    Path,
+    /// Size + mtime only (default): entries survive renames and moves
+    /// (rating renames, library reshuffles). The collision needing two
+    /// different files with the same byte size AND the same mtime second
+    /// is vanishingly rare in a clip library, and its cost is a wrong
+    /// thumb until `--cleanup-cache`; exact duplicates deliberately share
+    /// one entry.
+    #[default]
+    SizeMtime,
+}
+
+static CACHE_KEY: std::sync::OnceLock<CacheKey> = std::sync::OnceLock::new();
+
+/// Install the configured key. Call once at startup before any cache
+/// access; later calls are ignored (first write wins, like `cache_root`).
+pub fn set_cache_key(key: CacheKey) {
+    let _ = CACHE_KEY.set(key);
+}
+
+fn active_cache_key() -> CacheKey {
+    *CACHE_KEY.get_or_init(CacheKey::default)
+}
+
+/// Pragmatic MVP fingerprint (PLAN.md §8): what goes into it depends on
+/// the configured `CacheKey`. FNV-1a so the key is stable across runs
+/// and toolchains. Stronger modes (partial content hash) come later.
+/// Always reached through `entry_dir` (which layers on lazy adoption);
+/// `maintenance` calls it directly to test an entry against both keys.
+fn fingerprint_with(key: CacheKey, path: &Path, size: u64, mtime: u64) -> String {
+    let path_bytes: &[u8] = match key {
+        CacheKey::Path => path.as_os_str().as_encoded_bytes(),
+        CacheKey::SizeMtime => &[],
+    };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for chunk in [
-        path.as_os_str().as_encoded_bytes(),
-        &size.to_le_bytes(),
-        &mtime.to_le_bytes(),
-    ] {
+    for chunk in [path_bytes, &size.to_le_bytes(), &mtime.to_le_bytes()] {
         for &b in chunk {
             h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     format!("{h:016x}")
+}
+
+/// Resolve a source file's cache entry directory under the active key.
+/// Under `size_mtime`, an entry the old `path` keying left behind is
+/// adopted (renamed across) the first time the file is seen — switching
+/// keys must not regenerate a library-sized cache.
+fn entry_dir(root: &Path, src: &Path, size: u64, mtime: u64) -> PathBuf {
+    entry_dir_with(active_cache_key(), root, src, size, mtime)
+}
+
+fn entry_dir_with(key: CacheKey, root: &Path, src: &Path, size: u64, mtime: u64) -> PathBuf {
+    let fp = fingerprint_with(key, src, size, mtime);
+    let dir = root.join(&fp[..2]).join(&fp);
+    if key != CacheKey::Path && !dir.exists() {
+        let old_fp = fingerprint_with(CacheKey::Path, src, size, mtime);
+        let old = root.join(&old_fp[..2]).join(&old_fp);
+        if old.is_dir() {
+            let ok = std::fs::create_dir_all(dir.parent().unwrap()).is_ok()
+                && std::fs::rename(&old, &dir).is_ok();
+            if ok {
+                log::debug!("cache entry adopted under size_mtime: {}", src.display());
+            }
+        }
+    }
+    dir
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
@@ -966,6 +1059,86 @@ fn have_binary(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `size_mtime` keying ignores the path (renames/moves keep the
+    /// cache); `path` keying doesn't. Size or mtime changes always
+    /// re-key — the file's bytes changed, its artifacts are stale.
+    #[test]
+    fn cache_key_modes_fingerprint_as_documented() {
+        let (a, b) = (Path::new("/x/a.mp4"), Path::new("/y/b ★★★.mp4"));
+        let path_key = |p, s, m| fingerprint_with(CacheKey::Path, p, s, m);
+        let stat_key = |p, s, m| fingerprint_with(CacheKey::SizeMtime, p, s, m);
+        assert_ne!(path_key(a, 10, 20), path_key(b, 10, 20));
+        assert_eq!(stat_key(a, 10, 20), stat_key(b, 10, 20));
+        assert_ne!(stat_key(a, 10, 20), stat_key(a, 11, 20));
+        assert_ne!(stat_key(a, 10, 20), stat_key(a, 10, 21));
+        // The two keyings never collide for the same file, so adoption
+        // (below) can tell them apart.
+        assert_ne!(path_key(a, 10, 20), stat_key(a, 10, 20));
+    }
+
+    /// Switching to `size_mtime` adopts an existing path-keyed entry by
+    /// renaming it across — a library-sized cache must not regenerate
+    /// because the keying changed.
+    #[test]
+    fn size_mtime_adopts_path_keyed_entries() {
+        let root = std::env::temp_dir().join("sb_media_adopt_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("clip.mp4");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&src, b"not really a video").unwrap();
+        let st = std::fs::metadata(&src).unwrap();
+        let (len, mt) = (st.len(), mtime_secs(&st));
+
+        // The path-keyed era left an entry with artifacts.
+        let old_fp = fingerprint_with(CacheKey::Path, &src, len, mt);
+        let old = root.join(&old_fp[..2]).join(&old_fp);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("thumb_fit_640x360_q5.jpg"), b"jpg").unwrap();
+
+        let new = entry_dir_with(CacheKey::SizeMtime, &root, &src, len, mt);
+        assert_ne!(new, old);
+        assert!(!old.exists(), "old entry should have been renamed across");
+        assert!(new.join("thumb_fit_640x360_q5.jpg").exists());
+        // Second resolve is a plain hit, no rename left to do.
+        assert_eq!(entry_dir_with(CacheKey::SizeMtime, &root, &src, len, mt), new);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The quickview storyboard's sheet must outrank the library-wide
+    /// gen sweep: after a thumb-recipe change the sweep holds thousands
+    /// of entries for hours, and the strict tiers starved the on-demand
+    /// sheet below it — hover thumbs silently never arrived.
+    #[test]
+    fn quickview_sheet_outranks_gen_sweep_but_not_visible_thumbs() {
+        let mut q = Queues::default();
+        q.anims.push_back("bulk-sheet".into());
+        q.r#gen.push_back("sweep".into());
+        q.anims_now.push_back("storyboard".into());
+        q.reprobes.push_back("heal".into());
+        q.thumbs.push_back("visible".into());
+        let order: Vec<String> = std::iter::from_fn(|| q.pop())
+            .map(|r| {
+                let (kind, p) = match r {
+                    Request::Thumb(p) => ("thumb", p),
+                    Request::Reprobe(p) => ("reprobe", p),
+                    Request::Gen(p) => ("gen", p),
+                    Request::Anim(p) => ("anim", p),
+                };
+                format!("{kind}:{}", p.display())
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "thumb:visible",
+                "reprobe:heal",
+                "anim:storyboard",
+                "gen:sweep",
+                "anim:bulk-sheet",
+            ]
+        );
+    }
 
     /// Meta for the generated test clips (h264 yuv420p @30) — on macOS
     /// this takes the hardware scale chain, so the pacing tests cover it.

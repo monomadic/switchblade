@@ -201,13 +201,14 @@ Sidecar cache is simpler, safer, reversible, and works with read-only media. A s
 ```
 
 ### Fingerprint key
-Pragmatic file fingerprint for MVP:
+Configurable via `cache_key` (startup-only), two modes today:
 
 ```
-absolute path + size + mtime
+"size_mtime"  size + mtime                   (default; survives renames/moves)
+"path"        absolute path + size + mtime   (original MVP key)
 ```
 
-> **Tradeoff:** keying on the path means moved/renamed files lose their cache — and clip libraries get reorganized a lot. Later, optional stronger modes fix this: `size + mtime + partial hash` (one cheap 64KB read, survives moves) or full content hash. Store the source path in `meta.json` regardless, for debugging.
+> **Tradeoff:** `path` keying means moved/renamed files lose their cache — and clip libraries get reorganized a lot (rating-star renames especially), so `size_mtime` is the default: it drops the path so those entries survive. Its only cost is that two distinct files sharing an exact byte size AND mtime second collide (rare; a wrong thumb until `--cleanup-cache`), and exact duplicates deliberately share one entry. Switching to `size_mtime` **adopts** existing path-keyed entries by renaming them across on first access — no library-wide regeneration — and `--cleanup-cache` treats an entry as live under *either* keying, so a config flip never eats a still-valid cache. `cached_meta` heals the stranded `meta.src` path on first read (cleanup judges liveness by it). Still deferred: `size + mtime + partial hash` (one cheap 64KB read, disambiguates the collision) or full content hash. Store the source path in `meta.json` regardless, for debugging.
 
 ### Cache files
 
@@ -466,7 +467,7 @@ Pointer-driven seeking + filmstrip feel in the quickview modal; seeking hits **o
 - **Filmstrip** — chips hover-play instantly (settle delay dropped in quickview); wheel/trackpad scrubs the strip and commits selection to the nearest chip while the backdrop grid stays put. *(`filmstrip_scroll_commits_selection`)*
 - Tuning: `seekbar_hide_s/fade_ms/height/hover_height/thumb_width`, `strip_scroll_sensitivity`.
 
-Remaining, conditional (only if the g² storyboard proves too coarse in use): *phase 2* — a dedicated denser strip (`seek_16x1_<w>x<h>_q<q>.jpg`, seeked single-frame extracts like the anim recipe, never an `fps=` decode) as a fifth queue tier below anim sheets, generated on first quickview of a clip; *phase 3* (only if still coarse) — exact frames on demand from a second **paused low-res `SeekablePlayer`** on the same clip (the in-process port makes thumbfast's paused-slave trick a two-line reuse instead of a process to babysit).
+Remaining, conditional (only if the g² storyboard proves too coarse in use): *phase 2* — a dedicated denser strip (`seek_16x1_<w>x<h>_q<q>.jpg`, seeked single-frame extracts like the anim recipe, never an `fps=` decode) as its own queue tier, generated on first quickview of a clip (on-demand quickview work rides `anims_now` above the gen sweep — a starved storyboard taught us user-attention jobs never park below library-wide tiers); *phase 3* (only if still coarse) — exact frames on demand from a second **paused low-res `SeekablePlayer`** on the same clip (the in-process port makes thumbfast's paused-slave trick a two-line reuse instead of a process to babysit).
 
 **Exit criteria:** met — the pointer alone finds a moment (bar + hover thumbs + click), the filmstrip feels physical, and chained seeks never flash the thumbnail (worst case is freeze-then-jump).
 
