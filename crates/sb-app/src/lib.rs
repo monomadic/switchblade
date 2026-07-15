@@ -193,6 +193,11 @@ pub struct Switchblade {
     /// Filmstrip slide position (in clip-index units), springing toward
     /// the selected index with the keyboard chase curve.
     strip_pos: f32,
+    /// Where the strip is heading (clip-index units). Scroll/scrub gestures
+    /// nudge this free-float target and `strip_pos` eases toward it, so wheel
+    /// input flows like the grid instead of snapping frame-to-frame; when
+    /// idle it homes on `selected`.
+    strip_target: f32,
     /// Filmstrip chip under the cursor (quickview only) — scales up and
     /// gets the hover video lane, like grid hover.
     strip_hover: Option<usize>,
@@ -341,6 +346,7 @@ impl Switchblade {
             quickview: false,
             quickview_at: Instant::now(),
             strip_pos: 0.0,
+            strip_target: 0.0,
             strip_hover: None,
             seekbar_seen: None,
             scrubbing: false,
@@ -546,6 +552,7 @@ impl Switchblade {
                 if self.quickview {
                     self.quickview_at = Instant::now();
                     self.strip_pos = self.selected as f32;
+                    self.strip_target = self.strip_pos;
                 }
             }
             Action::Skip { forward, amount } => self.skip(forward, amount),
@@ -862,6 +869,7 @@ impl Switchblade {
             self.scroll_to_selected();
             if self.quickview {
                 self.strip_pos = i as f32; // snap; don't slide across the dir
+                self.strip_target = self.strip_pos;
             }
         }
     }
@@ -961,10 +969,15 @@ impl Switchblade {
         self.motion = motion;
 
         // Quickview filmstrip slides with the same curve as keyboard moves.
+        // While a scroll/scrub gesture is live the strip eases toward the
+        // free-float `strip_target`; once the gesture settles the target homes
+        // on the selected chip, so wheel input flows and then snaps magnetic.
         if self.quickview {
-            let target = self.selected as f32;
-            self.strip_pos += (target - self.strip_pos) * a_of(t.strip_snap_strength);
-            if (target - self.strip_pos).abs() > 0.001 {
+            if self.last_scroll_event.elapsed().as_secs_f32() > 0.12 {
+                self.strip_target = self.selected as f32;
+            }
+            self.strip_pos += (self.strip_target - self.strip_pos) * a_of(t.strip_snap_strength);
+            if (self.strip_target - self.strip_pos).abs() > 0.001 {
                 self.motion = true;
             }
         }
@@ -2145,9 +2158,9 @@ impl Switchblade {
                 self.jobs_finished_at = None;
             } else {
                 let progress = self.jobs_done as f32 / self.jobs_total as f32;
-                let (bw, bh) = (110.0, 3.0);
-                let bx = self.viewport.width - bw - 14.0;
-                let by = self.viewport.height - bh - 12.0;
+                let (bw, bh) = (84.0, 6.0);
+                let bx = self.viewport.width - bw - 24.0;
+                let by = self.viewport.height - bh - 22.0;
                 let bar = |x: f32, w: f32, a: f32| Tile {
                     x,
                     y: by,
@@ -2163,7 +2176,7 @@ impl Switchblade {
                     tex_mix: 0.0,
                     hires: false,
                 };
-                tiles.push(bar(bx, bw, 0.10)); // track
+                tiles.push(bar(bx, bw, 0.06)); // track
                 tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
             }
         }
@@ -2202,10 +2215,11 @@ impl App for Switchblade {
                     let d = if dx.abs() > dy.abs() { dx } else { dy };
                     let n = self.clips.len();
                     if n > 0 && step > 1.0 {
-                        self.strip_pos = (self.strip_pos
+                        self.strip_target = (self.strip_target
                             - d * self.tuning.strip_scroll_sensitivity / step)
                             .clamp(0.0, (n - 1) as f32);
-                        let i = self.strip_pos.round() as usize;
+                        self.last_scroll_event = Instant::now();
+                        let i = self.strip_target.round() as usize;
                         if i != self.selected {
                             self.selected = i;
                             self.sel_changed_at = Instant::now();
@@ -2282,6 +2296,7 @@ impl App for Switchblade {
                         self.quickview = true;
                         self.quickview_at = Instant::now();
                         self.strip_pos = self.selected as f32;
+                        self.strip_target = self.strip_pos;
                     } else {
                         self.selected = i;
                         self.sel_changed_at = Instant::now();
