@@ -587,7 +587,17 @@ artifact is ready rather than launch a duplicate generator.
 
 ### P1.3 — Reduce warm-player RGBA buffer residency
 
-**Status:** Ready
+**Status: DONE (2026-07-16) — Approach A.** `push_rgba` now parks on the
+full-queue condvar BEFORE allocating/copying the RGBA frame: a parked lane
+retains only its 3 queued frames (~42 MiB at 1440p), never a fourth
+pre-copied one, and a seek that lands while parked skips the copy
+entirely. The due-stamp moved after the park too, so a long-parked frame
+re-anchors instead of carrying a stale deadline. The lock drops during the
+copy (room only grows — one reader per player); close/seek are re-checked
+before the push. Approach B (buffer recycling) stays deferred until
+profiling shows the alloc itself matters. The pacing/stall/drop trio and
+the full app-level live tests all pass; live smoke shows unchanged
+first-frame latency and pacing.
 
 **Problem**
 

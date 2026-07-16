@@ -561,6 +561,33 @@ impl Pump<'_> {
             {
                 return Flow::Continue; // negotiation surprise: drop, don't crash
             }
+            // Bounded read-ahead: park until the consumer makes room — or
+            // the player is dropped, or a seek makes this frame stale.
+            // This wait runs BEFORE the RGBA allocation/copy (P1.3): a
+            // parked warm lane then retains only its queued frames, never
+            // a fourth pre-copied one (~14 MiB per lane at 1440p), and a
+            // seek that lands while parked skips the copy entirely. The
+            // lock drops for the copy itself — room only ever grows (one
+            // reader per player), so the re-check after is just for
+            // close/seek races.
+            {
+                let mut q = self.shared.frames.lock().unwrap();
+                loop {
+                    if self.shared.closed.load(Ordering::Relaxed) {
+                        return Flow::Stop;
+                    }
+                    if self.shared.cmd.lock().unwrap().is_some() {
+                        return Flow::Continue; // stale: the seek handler owns what's next
+                    }
+                    if q.len() < LIVE_QUEUE_DEPTH {
+                        break;
+                    }
+                    q = self.shared.space.wait(q).unwrap();
+                }
+            }
+            // Due time AFTER the park: a long-parked frame re-anchors to
+            // the wall clock (late-frame rule) instead of carrying a
+            // deadline that went stale while it waited.
             let now = Instant::now();
             let due = match self.anchor {
                 // Monotonic pts ahead of the anchor and not badly late:
@@ -592,20 +619,12 @@ impl Pump<'_> {
                     ptr::copy_nonoverlapping(src.add(y * stride), buf[y * row..].as_mut_ptr(), row);
                 }
             }
-            // Bounded read-ahead: park until the consumer makes room — or
-            // the player is dropped, or a seek makes this frame stale.
             let mut q = self.shared.frames.lock().unwrap();
-            loop {
-                if self.shared.closed.load(Ordering::Relaxed) {
-                    return Flow::Stop;
-                }
-                if self.shared.cmd.lock().unwrap().is_some() {
-                    return Flow::Continue; // stale: the seek handler owns what's next
-                }
-                if q.len() < LIVE_QUEUE_DEPTH {
-                    break;
-                }
-                q = self.shared.space.wait(q).unwrap();
+            if self.shared.closed.load(Ordering::Relaxed) {
+                return Flow::Stop;
+            }
+            if self.shared.cmd.lock().unwrap().is_some() {
+                return Flow::Continue; // seek landed during the copy: stale
             }
             q.push_back((due, pts_s, buf));
             Flow::Continue
