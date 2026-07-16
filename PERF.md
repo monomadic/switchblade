@@ -1,6 +1,8 @@
 # Live-video performance — status & durable facts
 
 Companion to [PLAN.md](PLAN.md), covering live-playback performance.
+Open performance and efficiency work is routed through
+[PERFORMANCE-TASKS.md](PERFORMANCE-TASKS.md).
 **Phases 0–4 shipped 2026-07-10** (investigated on an Apple M3, 8-core
 fanless, 60Hz panel, ffmpeg 8.1.1 Homebrew); **Phase 5 is deferred**
 (below). The per-lane player later moved from the ffmpeg-CLI `LivePlayer`
