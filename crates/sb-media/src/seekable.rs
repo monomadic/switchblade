@@ -805,7 +805,12 @@ mod tests {
             return;
         };
         let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&meta(&clip))).expect("spawn");
-        thread::sleep(Duration::from_millis(800));
+        // Bounded wait, not a fixed sleep — the fixed 800ms passed
+        // serially but flaked under parallel-suite contention (T1).
+        assert!(
+            wait_buffered(&p, LIVE_QUEUE_DEPTH, Duration::from_secs(15)),
+            "queue never filled while unwatched"
+        );
         assert!(
             p.shared.frames.lock().unwrap().len() <= LIVE_QUEUE_DEPTH,
             "queue must stay bounded while unwatched"
@@ -814,6 +819,19 @@ mod tests {
             p.take_frame().is_some(),
             "a warmed player must serve a frame on the first take"
         );
+    }
+
+    /// Bounded wait until the decoder has buffered at least `n` frames
+    /// (replaces the contention-flaky fixed sleeps; T1).
+    fn wait_buffered(p: &SeekablePlayer, n: usize, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if p.buffered() >= n {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        false
     }
 
     /// Drop must wake a reader parked on the full-queue condvar — the
@@ -825,7 +843,12 @@ mod tests {
             return;
         };
         let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&meta(&clip))).expect("spawn");
-        thread::sleep(Duration::from_millis(700)); // reader parks, queue full
+        // Reader parks once the queue fills — wait for that state
+        // (bounded, not a fixed sleep; T1).
+        assert!(
+            wait_buffered(&p, LIVE_QUEUE_DEPTH, Duration::from_secs(15)),
+            "queue never filled"
+        );
         let shared = Arc::downgrade(&p.shared);
         drop(p);
         let deadline = Instant::now() + Duration::from_secs(3);

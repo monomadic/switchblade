@@ -384,7 +384,17 @@ also embedded by `--init`, this is an important practical default.
 
 ### P0.6 — Eliminate the deterministic temp-file race
 
-**Status:** Ready
+**Status: DONE (2026-07-16).** `staging_path()` gives every generation a
+unique temp name (pid + process-wide sequence — also unique across two
+switchblade processes) beside the destination; `extract_frame`, the anim
+tile pass, AND `make_anim`'s per-cell `animf_*` files all use it, so
+concurrent duplicates can no longer interleave — atomic rename publishes
+only complete files, last writer wins. `meta.json` writes (thumb gen +
+reprobe heal) also go through staging + rename (`write_atomic`) — same
+corruption class. `--cleanup-cache` already sweeps stale `*.tmp` staging.
+Tests: `staging_paths_are_unique_per_generation`,
+`concurrent_generation_publishes_a_clean_artifact` (two threads, three
+rounds, artifact + meta.json both verified).
 
 **Problem**
 
@@ -763,10 +773,14 @@ scheduling and residency tasks above.
 
 **Priority:** P1
 
-The parallel workspace run failed both fixed-sleep warm-player assertions, while
-all 15 media tests passed serially. Replace the fixed 700–800 ms assumptions
-with a bounded wait until the queue has buffered a frame, then assert immediate
-service and bounded depth.
+**Status: DONE (2026-07-16, pulled forward).** The flake resurfaced during
+P0.6's gate (the new concurrent-generation test adds parallel ffmpeg load),
+so this landed early instead of waiting for P1.3. All four fixed-sleep
+sites — `unwatched_*_stalls_then_serves_instantly` and
+`dropped_*_releases_its_reader` for both `LivePlayer` and `SeekablePlayer`
+— now use a bounded `wait_buffered(player, LIVE_QUEUE_DEPTH, 15s)` before
+asserting bounded depth, immediate first take, and drop-release. Three
+consecutive parallel workspace runs green.
 
 ### T2 — Restore a clean clippy baseline
 

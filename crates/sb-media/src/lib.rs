@@ -602,7 +602,7 @@ fn ensure_thumb_file(
         if let Some(m) = &probed
             && let Ok(json) = serde_json::to_vec_pretty(m)
         {
-            let _ = std::fs::write(dir.join("meta.json"), json);
+            let _ = write_atomic(&dir.join("meta.json"), &json);
         }
         let seek = probed
             .as_ref()
@@ -653,7 +653,11 @@ fn make_anim(
         // The old single-command `fps=` filter decoded the ENTIRE clip
         // in software — minutes of multi-core churn per long 4K source,
         // three workers wide, surviving app quit. Never again.
-        let frame_tmp = |k: usize| dir.join(format!("animf_{k}.jpg"));
+        // Per-cell staging files carry a per-generation uid (P0.6): a
+        // concurrent duplicate generation (gen sweep + visible request on
+        // separate workers) must not overwrite this run's cells mid-tile.
+        let uid = format!("{}-{}", std::process::id(), staging_seq());
+        let frame_tmp = |k: usize| dir.join(format!("animf_{uid}_{k}.jpg"));
         let cleanup = |n: usize| {
             for k in 0..n {
                 let _ = std::fs::remove_file(frame_tmp(k));
@@ -704,8 +708,8 @@ fn make_anim(
             }
         }
 
-        let tmp = jpg.with_extension("jpg.tmp");
-        let pattern = dir.join("animf_%d.jpg");
+        let tmp = staging_path(&jpg);
+        let pattern = dir.join(format!("animf_{uid}_%d.jpg"));
         let out = media_cmd("ffmpeg")
             .args(["-y", "-v", "error", "-start_number", "0"])
             .arg("-i")
@@ -792,7 +796,7 @@ fn reprobe(src: &Path, root: &Path) {
         return;
     }
     if let Ok(json) = serde_json::to_vec_pretty(&m) {
-        let _ = std::fs::write(&file, json);
+        let _ = write_atomic(&file, &json);
         log::debug!("meta healed: {}", src.display());
     }
 }
@@ -853,6 +857,35 @@ pub fn probe(src: &Path) -> Option<Meta> {
     })
 }
 
+/// A staging path beside `dst`, unique per generation (P0.6): the name
+/// carries pid + a process-wide sequence number, so two workers — or two
+/// switchblade processes — generating the same missing artifact can never
+/// write the same temp file (a deterministic name let their ffmpeg
+/// outputs interleave and renamed a truncated JPEG into the cache). The
+/// duplicate WORK still happens until artifacts are coalesced (P1.2);
+/// with unique staging plus atomic rename, the last complete file simply
+/// wins. Stale staging files from a crash are swept by `--cleanup-cache`.
+fn staging_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}-{}.tmp", std::process::id(), staging_seq()));
+    dst.with_file_name(name)
+}
+
+/// Process-wide staging sequence (also keys `make_anim`'s per-cell files).
+fn staging_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Publish a small file atomically (staging + rename) — concurrent
+/// writers of the same `meta.json` must not interleave (P0.6).
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = staging_path(path);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
 fn extract_frame(
     src: &Path,
     dst: &Path,
@@ -860,9 +893,10 @@ fn extract_frame(
     recipe: &Recipe,
     codec: Option<&str>,
 ) -> Option<()> {
-    // Write to a temp name and rename, so a half-written jpg never
-    // looks like a cache hit to another worker or a later run.
-    let tmp = dst.with_extension("jpg.tmp");
+    // Write to a unique temp name and rename, so a half-written jpg never
+    // looks like a cache hit to another worker or a later run — and a
+    // concurrent duplicate generation can't interleave into the same file.
+    let tmp = staging_path(dst);
     let (tw, th) = (recipe.thumb_w, recipe.thumb_h);
     let q = recipe.quality.clamp(2, 31).to_string();
     let vf = format!("scale={tw}:{th}:force_original_aspect_ratio=decrease");
@@ -1223,6 +1257,80 @@ mod tests {
         );
     }
 
+    /// Two generations of the same artifact must never share a staging
+    /// file — a shared name let concurrent ffmpeg outputs interleave and
+    /// renamed a truncated JPEG into the cache (P0.6).
+    #[test]
+    fn staging_paths_are_unique_per_generation() {
+        let dst = Path::new("/cache/ab/entry/thumb_fit_640x360_q5.jpg");
+        let a = staging_path(dst);
+        let b = staging_path(dst);
+        assert_ne!(a, b, "two generations shared a staging path");
+        assert_eq!(
+            a.parent(),
+            dst.parent(),
+            "staging stays beside the artifact"
+        );
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+    }
+
+    /// Concurrent duplicate generation of one missing artifact (gen sweep
+    /// and visible request on separate workers — coalescing is P1.2's
+    /// job) must still publish a decodable file: unique staging and
+    /// atomic rename mean whichever complete file lands last wins (P0.6).
+    #[test]
+    fn concurrent_generation_publishes_a_clean_artifact() {
+        if !have_binary("ffmpeg") || !have_binary("ffprobe") {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_race_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("race.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=2:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+        let recipe = Recipe {
+            thumb_w: 320,
+            thumb_h: 180,
+            quality: 5,
+            anim_grid: 2,
+        };
+        let root = dir.join("race-cache");
+        for _ in 0..3 {
+            let _ = std::fs::remove_dir_all(&root);
+            let t = {
+                let (clip, root) = (clip.clone(), root.clone());
+                thread::spawn(move || ensure_thumb_file(&clip, &root, true, &recipe))
+            };
+            let here = ensure_thumb_file(&clip, &root, true, &recipe);
+            let there = t.join().unwrap();
+            let jpg = here.or(there).expect("at least one generation succeeds");
+            assert!(
+                decode_jpeg(&jpg, 320, 180).is_some(),
+                "published artifact must decode cleanly"
+            );
+            let meta: Result<Meta, _> =
+                serde_json::from_slice(&std::fs::read(jpg.with_file_name("meta.json")).unwrap());
+            assert!(meta.is_ok(), "meta.json must survive concurrent writers");
+        }
+    }
+
     /// Anim sheets must come from cheap seeked extracts (seconds), never
     /// a full-clip decode (the fps-filter approach cost minutes of
     /// multi-core software decode per long 4K source and bogged the
@@ -1308,7 +1416,16 @@ mod tests {
         let player =
             LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Never drain: the queue fills and the reader parks on `space`.
-        thread::sleep(std::time::Duration::from_millis(700));
+        // Wait until it actually has (bounded, not a fixed sleep — the
+        // fixed 700ms was contention-flaky in parallel test runs; T1).
+        assert!(
+            wait_buffered(
+                &player,
+                LIVE_QUEUE_DEPTH,
+                std::time::Duration::from_secs(15)
+            ),
+            "queue never filled"
+        );
         // The reader holds the only other strong ref to the queue; if the
         // weak ref dies after drop, the thread exited.
         let queue = Arc::downgrade(&player.queue);
@@ -1355,8 +1472,16 @@ mod tests {
         let player =
             LivePlayer::spawn(&clip, 320, 180, 0.4, Some(&test_meta(&clip))).expect("spawn");
         // Warm without watching: the queue caps at LIVE_QUEUE_DEPTH and
-        // the decoder stalls behind it.
-        thread::sleep(std::time::Duration::from_millis(800));
+        // the decoder stalls behind it. Wait until buffered (bounded,
+        // not a fixed sleep — contention-flaky in parallel runs; T1).
+        assert!(
+            wait_buffered(
+                &player,
+                LIVE_QUEUE_DEPTH,
+                std::time::Duration::from_secs(15)
+            ),
+            "queue never filled while unwatched"
+        );
         assert!(
             player.queue.frames.lock().unwrap().len() <= LIVE_QUEUE_DEPTH,
             "queue must stay bounded while unwatched"
@@ -1366,5 +1491,19 @@ mod tests {
             player.take_frame().is_some(),
             "a warmed player must serve a frame on the first take"
         );
+    }
+
+    /// Bounded wait until the player has buffered at least `n` frames.
+    /// The fixed sleeps this replaces passed serially but flaked under
+    /// parallel-suite CPU contention (T1).
+    fn wait_buffered(p: &LivePlayer, n: usize, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if p.buffered() >= n {
+                return true;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
     }
 }

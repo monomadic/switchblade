@@ -79,7 +79,8 @@ fn cleanup_in(root: &Path, recipe: &Recipe) -> Removed {
         }
         // Live entry: keep only meta + artifacts the current recipe
         // would actually serve. Everything else (old sizes/qualities,
-        // `*.jpg.tmp`, orphaned `animf_*.jpg` frames) is dead weight.
+        // `*.tmp` staging leftovers, orphaned `animf_*` frames) is dead
+        // weight.
         let keep = [
             String::from("meta.json"),
             recipe.thumb_file(),
