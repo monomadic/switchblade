@@ -190,6 +190,14 @@ cache_key = "size_mtime"
 # edges and reload churn when scrolling back. Cost is VRAM only —
 # rendering speed doesn't change with atlas size. Hardware cap: 16384
 # per side.
+#
+# Sized from measurement (2026-07-16, M3, ~400-clip library): at minimum
+# zoom the whole library sits in the visible+prefetch zone, wanting ~390
+# slots with sheets off (animation level "normal") and ~770 with sheets
+# cycling ("full") — so 777 is the measured sheets-on worst case, not
+# headroom. Startup logs the byte estimate ("gpu residency: ..."); the
+# debug redraw line reports live "slots used / zone demand" if you want
+# to re-measure for your own library/display before shrinking this.
 atlas_width = 16128
 atlas_height = 15984
 

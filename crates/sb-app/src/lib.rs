@@ -2678,11 +2678,14 @@ impl App for Switchblade {
         // at 10Hz as a safety net.
         if log::log_enabled!(log::Level::Debug) {
             // Atlas sizing evidence (P0.1/P0.5): actual occupancy vs the
-            // zone's worst-case demand (a static + an anim per in-zone
-            // clip, plus the live/hover lanes).
+            // zone's demand — a static per in-zone clip, an anim sheet
+            // only when sheets actually cycle (animation level `full` +
+            // the `a` toggle), plus the live/hover lanes.
             let used = self.slots.iter().filter(|s| s.is_some()).count();
             let (first, last) = self.visible_rows(&lay, PREFETCH_ROWS);
-            let demand = ((last - first + 1) * lay.cols * 2).min(self.clips.len() * 2) + 2;
+            let per_clip = 1 + usize::from(self.sheets_on());
+            let demand =
+                ((last - first + 1) * lay.cols * per_clip).min(self.clips.len() * per_clip) + 2;
             self.redraw_stats.slots(used, demand);
         }
         let motion = self.motion;

@@ -367,9 +367,17 @@ leaves the selected tile offscreen, even if quickview/fullview is closed.
 
 ### P0.5 — Right-size the checked-in atlas configuration
 
-**Status:** Blocked on the P0.1 residency/byte-estimate telemetry (the half of
-P0.1 that stays with this task). Pair the two: land the residency estimate, then
-size against it.
+**Status: DONE (2026-07-16) — measured, and the default stays.** The live
+measurement (M3, ~400-clip library, minimum zoom, fast scrolling) showed
+zone demand reaching ~770 of 777 slots with sheets cycling and ~390 with
+sheets off — the review's "disproportionate" framing only holds at normal
+zoom (~92 slots). The user chose to keep 777 slots (983 MiB): it is the
+measured sheets-on worst case for zoomed-out browsing, not idle headroom.
+The config comment now documents the measurement and how to re-measure
+(startup residency log + the debug `slots used / zone demand` gauge, which
+was also fixed to count anim slots only when sheets actually cycle).
+Byte-cost reduction, if ever wanted, is P2.3's smaller-grid-artifact
+territory, not slot-count shrinking.
 
 **Problem**
 
