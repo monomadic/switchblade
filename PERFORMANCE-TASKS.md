@@ -661,7 +661,22 @@ roughly 56 MiB per lane before libav/filter buffers.
 
 ### P1.4 — Redraw around the next live-frame deadline
 
-**Status:** Blocked on P0.2 scheduling shape
+**Status: DONE (2026-07-17) — Approach A with a push-notify assist.**
+
+- `SeekablePlayer::next_due()` exposes the head frame's due time;
+  `set_notify` installs a wake fired when a frame lands in a DRY queue
+  (the deadline sleeper's blind spot).
+- `Frame.redraw_at: Option<Instant>` carries the earliest deadline across
+  the app boundary (plain `std::time::Instant`, no winit types); the
+  window's idle path waits until `min(idle tick, redraw_at)` — ignored
+  while animating (UI motion owns the cadence) or occluded.
+- `frame.animating` dropped the `live` term entirely: live lanes now pace
+  by deadline. Parked/dry lanes report nothing. UI tweens, input wakes,
+  and the timer path are unchanged.
+
+Measured live: a static grid playing a 30fps clip presents ~27–29
+frames/s (was display-rate 60), with the loop otherwise idle. Warm-lane
+pacing/stall/promotion tests all green.
 
 **Problem**
 

@@ -66,6 +66,11 @@ struct Shared {
     /// the seek target while one is in flight — "where playback is".
     position: AtomicU64,
     failed: AtomicBool,
+    /// Fired when a frame lands in a previously EMPTY queue (P1.4): the
+    /// render loop sleeps toward `next_due()` instead of spinning at
+    /// display rate, so a frame arriving while the queue was dry needs
+    /// its own nudge or it would wait out the idle tick.
+    notify: Mutex<Option<crate::Notify>>,
 }
 
 impl SeekablePlayer {
@@ -127,6 +132,7 @@ impl SeekablePlayer {
             cmd: Mutex::new(None),
             position: AtomicU64::new(seek.max(0.0).to_bits()),
             failed: AtomicBool::new(false),
+            notify: Mutex::new(None),
         });
         let reader_shared = shared.clone();
         thread::spawn(move || {
@@ -169,6 +175,23 @@ impl SeekablePlayer {
     /// Frames currently queued (decoded, waiting for their due times).
     pub fn buffered(&self) -> usize {
         self.shared.frames.lock().unwrap().len()
+    }
+
+    /// When the next queued frame wants presenting — the render loop's
+    /// wake deadline while nothing else animates (P1.4). None while the
+    /// queue is dry (the reader's push-notify covers that gap).
+    pub fn next_due(&self) -> Option<Instant> {
+        self.shared
+            .frames
+            .lock()
+            .unwrap()
+            .front()
+            .map(|(due, ..)| *due)
+    }
+
+    /// Install the wake fired when a frame lands in an empty queue.
+    pub fn set_notify(&self, f: crate::Notify) {
+        *self.shared.notify.lock().unwrap() = Some(f);
     }
 
     /// The newest frame that's due for presentation, if any — identical
@@ -626,7 +649,14 @@ impl Pump<'_> {
             if self.shared.cmd.lock().unwrap().is_some() {
                 return Flow::Continue; // seek landed during the copy: stale
             }
+            let was_dry = q.is_empty();
             q.push_back((due, pts_s, buf));
+            drop(q);
+            // A deadline-sleeping render loop (P1.4) has no due time to
+            // wait for while the queue is dry — this push is its wake.
+            if was_dry && let Some(f) = &*self.shared.notify.lock().unwrap() {
+                f();
+            }
             Flow::Continue
         }
     }

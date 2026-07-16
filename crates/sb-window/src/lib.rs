@@ -201,6 +201,12 @@ pub struct Frame {
     /// False when nothing on screen is in motion: the loop drops to a
     /// slow idle tick instead of redrawing every vsync.
     pub animating: bool,
+    /// One-shot redraw deadline while NOT animating (P1.4): live video
+    /// with UI settled reports the next queued frame's due time here, so
+    /// a 30fps clip presents ~30 times a second instead of every vsync.
+    /// Ignored while `animating` (UI motion owns the cadence) and while
+    /// occluded.
+    pub redraw_at: Option<Instant>,
 }
 
 pub trait App {
@@ -323,6 +329,7 @@ pub fn run(app: impl App) -> anyhow::Result<()> {
         last_frame: Instant::now(),
         cursor: (0.0, 0.0),
         animating: true,
+        redraw_at: None,
         occluded: false,
     };
     event_loop.run_app(&mut runner)?;
@@ -351,6 +358,9 @@ struct Runner<A: App> {
     last_frame: Instant,
     cursor: (f32, f32),
     animating: bool,
+    /// The last frame's one-shot deadline (next live-frame due time);
+    /// caps the idle wait so video presents on schedule (P1.4).
+    redraw_at: Option<Instant>,
     /// Window fully hidden (minimized / covered / other Space). The
     /// surface won't present, so the continuous-redraw path must not
     /// run — see `about_to_wait`.
@@ -544,6 +554,7 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 };
                 let frame = self.app.frame(dt, viewport);
                 self.animating = frame.animating;
+                self.redraw_at = frame.redraw_at;
                 gpu.render(&frame, viewport);
                 self.apply_commands(event_loop);
             }
@@ -589,10 +600,22 @@ impl<A: App> ApplicationHandler for Runner<A> {
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(next));
             }
-        } else if self.last_frame.elapsed() >= IDLE_TICK {
-            w.request_redraw();
         } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_frame + IDLE_TICK));
+            // Idle — but a live-frame deadline (P1.4) caps the wait so
+            // video presents on schedule between idle ticks. Occluded
+            // ignores the deadline: nothing presents anyway, and the
+            // 10Hz tick keeps the world serviced.
+            let mut next = self.last_frame + IDLE_TICK;
+            if !self.occluded
+                && let Some(t) = self.redraw_at
+            {
+                next = next.min(t);
+            }
+            if Instant::now() >= next {
+                w.request_redraw();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
         }
     }
 }

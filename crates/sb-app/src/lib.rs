@@ -1827,6 +1827,9 @@ impl Switchblade {
             .unwrap_or(0.0);
         self.heal_meta(meta.as_ref(), &path);
         let player = sb_media::SeekablePlayer::spawn(&path, dw, dh, seek, meta.as_ref())?;
+        // Deadline-paced redraws (P1.4): a frame landing in a dry queue
+        // must nudge the sleeping loop.
+        player.set_notify(self.notify.clone());
         log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
         Some(SelLive {
             clip: i,
@@ -1866,6 +1869,7 @@ impl Switchblade {
             log::debug!("live preview failed to start: {}", path.display());
             return None;
         };
+        player.set_notify(self.notify.clone()); // P1.4 dry-queue wake
         log::debug!("hover live: {}", path.display());
         self.slots[slot] = Some((i, SlotKind::Live));
         Some(LiveState {
@@ -2516,6 +2520,7 @@ impl Switchblade {
             hires_upload: None,
             blur,
             animating: true,
+            redraw_at: None,
         }
     }
 }
@@ -2691,13 +2696,33 @@ impl App for Switchblade {
         let motion = self.motion;
         let sheets = self.anim_rendered;
         let transition = self.transition.is_some();
-        // A parked selected stream (offscreen, undrained, decoder stalled
-        // on backpressure) needs no frames — don't let it hold the loop.
-        let live = (self.live_sel.is_some() && !self.sel_parked) || self.live_hover.is_some();
         let timer = Instant::now() < self.wake_until;
-        frame.animating = motion || sheets || transition || live || timer;
-        self.redraw_stats
-            .record(motion, sheets, transition, live, timer, frame.animating);
+        // Live video no longer forces display-rate redraws (P1.4): with
+        // the UI settled, the next queued frame's due time becomes a
+        // one-shot deadline — a 30fps clip presents ~30 times a second
+        // on a 120Hz display instead of 120. A parked selected stream
+        // (offscreen, undrained) reports nothing; a dry queue reports
+        // nothing either (the reader's push-notify wakes the loop when
+        // the next frame lands).
+        let sel_due = self
+            .live_sel
+            .as_ref()
+            .filter(|_| !self.sel_parked)
+            .and_then(|l| l.player.next_due());
+        let hover_due = self.live_hover.as_ref().and_then(|l| l.player.next_due());
+        frame.redraw_at = match (sel_due, hover_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        frame.animating = motion || sheets || transition || timer;
+        self.redraw_stats.record(
+            motion,
+            sheets,
+            transition,
+            frame.redraw_at.is_some(),
+            timer,
+            frame.animating,
+        );
         frame
     }
 
