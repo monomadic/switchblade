@@ -75,11 +75,24 @@ was buried in.
 
 ### P0.1 — Add baseline and residency telemetry
 
-**Status:** Split — see execution order. The redraw-reason counter is pulled
-forward into P0.2 (it is that task's acceptance instrument); the residency /
-frame-time / drain-burst telemetry stays here and is sequenced with P0.5, which
-consumes the byte estimate. Do not treat this whole task as a prerequisite for
-the short-term focus items.
+**Status: DONE (2026-07-16) in reduced scope.** Landed:
+
+- Redraw-reason counter (landed with P0.2): once-a-second debug line with
+  frames/s, idle count, and cause tallies.
+- GPU residency report at startup (`sb-window::render`, info level): atlas
+  bytes + slot count, hires incl. mips, backdrop chain at initial window
+  size, and the total; plus a >512 MiB atlas warning reporting bytes and
+  slots without prescribing a size. Current default reports:
+  `atlas 983 MiB (777 slots of 768x432) + hires 18 MiB + backdrop 20 MiB
+  = 1022 MiB`.
+- Atlas sizing evidence in the debug redraw line: high-water `slots used`
+  vs `zone demand` (visible+prefetch statics+anims capped by library, +2
+  live lanes) — the direct input for P0.5. At a 1280×800 default-zoom
+  viewport, zone demand is ~92 of the 777 reserved slots.
+
+Deliberately dropped: ingest/media drain-burst counters (P0.3's budgets
+made the burst case structurally impossible), per-player buffered-frame
+gauges, and CPU-vs-GPU frame timing — add only if a later task needs them.
 
 **Problem**
 

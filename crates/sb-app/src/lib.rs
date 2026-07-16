@@ -289,6 +289,12 @@ struct RedrawStats {
     transition: u32,
     live: u32,
     timer: u32,
+    /// High-water atlas slots occupied this second (P0.1 — the measured
+    /// side of P0.5's atlas sizing).
+    slots_used: usize,
+    /// High-water visible+prefetch slot demand (statics + anims capped
+    /// by library size, + live/hover lanes).
+    slots_demand: usize,
 }
 
 impl RedrawStats {
@@ -302,7 +308,14 @@ impl RedrawStats {
             transition: 0,
             live: 0,
             timer: 0,
+            slots_used: 0,
+            slots_demand: 0,
         }
+    }
+
+    fn slots(&mut self, used: usize, demand: usize) {
+        self.slots_used = self.slots_used.max(used);
+        self.slots_demand = self.slots_demand.max(demand);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -327,7 +340,7 @@ impl RedrawStats {
         self.timer += u32::from(timer);
         if self.at.elapsed() >= Duration::from_secs(1) {
             log::debug!(
-                "redraw: {} frames/s ({} idle; causes: motion {} sheets {} transition {} live {} timer {})",
+                "redraw: {} frames/s ({} idle; causes: motion {} sheets {} transition {} live {} timer {}); atlas slots used {} / zone demand {}",
                 self.frames,
                 self.idle,
                 self.motion,
@@ -335,6 +348,8 @@ impl RedrawStats {
                 self.transition,
                 self.live,
                 self.timer,
+                self.slots_used,
+                self.slots_demand,
             );
             *self = Self::new();
         }
@@ -2661,6 +2676,15 @@ impl App for Switchblade {
         // (P0.2): their worker threads fire `waker` per delivery, so each
         // completion repaints once, and the idle tick still services them
         // at 10Hz as a safety net.
+        if log::log_enabled!(log::Level::Debug) {
+            // Atlas sizing evidence (P0.1/P0.5): actual occupancy vs the
+            // zone's worst-case demand (a static + an anim per in-zone
+            // clip, plus the live/hover lanes).
+            let used = self.slots.iter().filter(|s| s.is_some()).count();
+            let (first, last) = self.visible_rows(&lay, PREFETCH_ROWS);
+            let demand = ((last - first + 1) * lay.cols * 2).min(self.clips.len() * 2) + 2;
+            self.redraw_stats.slots(used, demand);
+        }
         let motion = self.motion;
         let sheets = self.anim_rendered;
         let transition = self.transition.is_some();

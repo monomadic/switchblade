@@ -536,6 +536,47 @@ impl Gpu {
             config.height,
         );
 
+        // Residency telemetry (PERFORMANCE-TASKS.md P0.1): report what
+        // this startup reserved on the GPU so atlas sizing (P0.5) is
+        // measured, not guessed. All three are RGBA/BGRA (4 B/px).
+        let mip_bytes = |w: u32, h: u32, mips: u32| -> u64 {
+            (0..mips)
+                .map(|l| u64::from((w >> l).max(1)) * u64::from((h >> l).max(1)) * 4)
+                .sum()
+        };
+        const MIB: u64 = 1024 * 1024;
+        let atlas_bytes = u64::from(atlas_cfg.tex_w()) * u64::from(atlas_cfg.tex_h()) * 4;
+        let hires_bytes = mip_bytes(
+            atlas_cfg.hires_w.max(2),
+            atlas_cfg.hires_h.max(2),
+            hires_mips,
+        );
+        let (bw, bh) = (config.width.max(2), config.height.max(2));
+        let backdrop_bytes = mip_bytes(
+            bw,
+            bh,
+            (32 - bw.max(bh).leading_zeros()).min(BACKDROP_MIP_LEVELS),
+        );
+        log::info!(
+            "gpu residency: atlas {} MiB ({} slots of {}x{}) + hires {} MiB + backdrop {} MiB = {} MiB",
+            atlas_bytes / MIB,
+            atlas_cfg.slots(),
+            atlas_cfg.slot_w,
+            atlas_cfg.slot_h,
+            hires_bytes / MIB,
+            backdrop_bytes / MIB,
+            (atlas_bytes + hires_bytes + backdrop_bytes) / MIB,
+        );
+        if atlas_bytes > 512 * MIB {
+            log::warn!(
+                "atlas reserves {} MiB for {} slots — verify visible+prefetch demand actually \
+                 needs this (smaller atlas_width/height in switchblade.toml frees the rest; \
+                 PERFORMANCE-TASKS.md P0.5)",
+                atlas_bytes / MIB,
+                atlas_cfg.slots(),
+            );
+        }
+
         let instance_capacity = 1024;
         let instances = Self::make_instance_buffer(&device, instance_capacity);
 
