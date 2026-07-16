@@ -200,6 +200,30 @@ fn walk_dir(
     Ok(())
 }
 
+/// Detect iCloud placeholders: APFS dataless files (evicted by
+/// fileproviderd, `SF_DATALESS` in st_flags) and legacy `.name.icloud`
+/// stub siblings for paths that don't resolve.
+fn is_cloud_placeholder(path: &Path, meta: Option<&std::fs::Metadata>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        const SF_DATALESS: u32 = 0x4000_0000;
+        if let Some(m) = meta {
+            return m.st_flags() & SF_DATALESS != 0;
+        }
+        // File missing entirely: look for the download stub.
+        if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+            let mut stub = std::ffi::OsString::from(".");
+            stub.push(name);
+            stub.push(".icloud");
+            return dir.join(stub).exists();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (path, meta);
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,28 +249,4 @@ mod tests {
         names.sort();
         assert_eq!(names, ["a.mp4", "b.mov"]);
     }
-}
-
-/// Detect iCloud placeholders: APFS dataless files (evicted by
-/// fileproviderd, `SF_DATALESS` in st_flags) and legacy `.name.icloud`
-/// stub siblings for paths that don't resolve.
-fn is_cloud_placeholder(path: &Path, meta: Option<&std::fs::Metadata>) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::macos::fs::MetadataExt;
-        const SF_DATALESS: u32 = 0x4000_0000;
-        if let Some(m) = meta {
-            return m.st_flags() & SF_DATALESS != 0;
-        }
-        // File missing entirely: look for the download stub.
-        if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
-            let mut stub = std::ffi::OsString::from(".");
-            stub.push(name);
-            stub.push(".icloud");
-            return dir.join(stub).exists();
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (path, meta);
-    false
 }

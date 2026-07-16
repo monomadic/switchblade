@@ -5,7 +5,7 @@ mod commands;
 mod ingest;
 mod tuning;
 
-pub use tuning::{config_path, AnimLevel, Tuning};
+pub use tuning::{AnimLevel, Tuning, config_path};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use sb_window::{
 };
 
 use commands::{Action, KeyMap};
-use tuning::{alpha, TuningFile};
+use tuning::{TuningFile, alpha};
 
 /// Rows beyond the viewport to prefetch thumbnails for.
 const PREFETCH_ROWS: usize = 2;
@@ -605,7 +605,9 @@ impl Switchblade {
         let Some(d) = l.duration.filter(|d| *d > 0.05) else {
             return; // duration unknown: no meaningful fraction to jump
         };
-        let frac = amount.unwrap_or(self.tuning.skip_fraction).clamp(0.001, 1.0) as f64;
+        let frac = amount
+            .unwrap_or(self.tuning.skip_fraction)
+            .clamp(0.001, 1.0) as f64;
         let delta = if forward { frac * d } else { -frac * d };
         l.player.seek((l.position() + delta).rem_euclid(d), true);
         self.skip_flash_at = Some(Instant::now());
@@ -617,7 +619,11 @@ impl Switchblade {
     /// the stream is on the selected clip and its duration is known.
     fn seekbar_pos(&self) -> Option<f32> {
         let l = self.live_sel.as_ref()?;
-        if self.clips.get(self.selected).is_none_or(|c| c.path != l.path) {
+        if self
+            .clips
+            .get(self.selected)
+            .is_none_or(|c| c.path != l.path)
+        {
             return None;
         }
         let d = l.duration.filter(|d| *d > 0.05)?;
@@ -1013,10 +1019,10 @@ impl Switchblade {
         if let Some(i) = reselect {
             self.selected = i;
             self.sel_changed_at = Instant::now();
-            if let Some(l) = &mut self.live_sel {
-                if l.path == self.clips[i].path {
-                    l.clip = i; // the surviving stream, renumbered
-                }
+            if let Some(l) = &mut self.live_sel
+                && l.path == self.clips[i].path
+            {
+                l.clip = i; // the surviving stream, renumbered
             }
             self.scroll_to_selected();
             if self.quickview {
@@ -1438,20 +1444,19 @@ impl Switchblade {
         // stream demotes to a warm neighbor instead of dying — reversing
         // direction picks it right back up, still on its timeline.
         if self.live_sel.as_ref().is_some_and(|l| {
-            sel_target != Some(l.clip)
-                && self.pending_reselect.as_deref() != Some(l.path.as_path())
+            sel_target != Some(l.clip) && self.pending_reselect.as_deref() != Some(l.path.as_path())
         }) {
             let l = self.live_sel.take().unwrap();
             if warm_targets.contains(&l.clip) {
                 self.warm.push(l);
             }
         }
-        if let Some(l) = &self.live_hover {
-            if hover_target != Some(l.clip) {
-                let slot = l.slot;
-                self.live_hover = None;
-                self.slots[slot] = None;
-            }
+        if let Some(l) = &self.live_hover
+            && hover_target != Some(l.clip)
+        {
+            let slot = l.slot;
+            self.live_hover = None;
+            self.slots[slot] = None;
         }
 
         // Start lanes whose target has settled. Quickview skips the settle
@@ -1463,20 +1468,20 @@ impl Switchblade {
         // the selection itself — pruning first would kill the very decoder
         // that was warmed for this moment (the bug that made every advance
         // pay full cold-spawn latency).
-        if self.live_sel.is_none() && !pending {
-            if let Some(i) = sel_target {
-                if let Some(pos) = self.warm.iter().position(|w| w.clip == i) {
-                    let l = self.warm.remove(pos);
-                    log::debug!(
-                        "promoted warm decoder for clip {i} ({} frames buffered)",
-                        l.player.buffered()
-                    );
-                    self.live_sel = Some(l);
-                } else if self.quickview
-                    || self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
-                {
-                    self.live_sel = self.start_sel_live(i);
-                }
+        if self.live_sel.is_none()
+            && !pending
+            && let Some(i) = sel_target
+        {
+            if let Some(pos) = self.warm.iter().position(|w| w.clip == i) {
+                let l = self.warm.remove(pos);
+                log::debug!(
+                    "promoted warm decoder for clip {i} ({} frames buffered)",
+                    l.player.buffered()
+                );
+                self.live_sel = Some(l);
+            } else if self.quickview || self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
+            {
+                self.live_sel = self.start_sel_live(i);
             }
         }
         self.warm.retain(|w| warm_targets.contains(&w.clip));
@@ -1501,62 +1506,57 @@ impl Switchblade {
         if sel_ready
             && !warming_up
             && self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
-        {
-            if let Some(&i) = warm_targets
+            && let Some(&i) = warm_targets
                 .iter()
                 .find(|&&i| self.warm.iter().all(|w| w.clip != i))
-            {
-                if let Some(l) = self.start_sel_live(i) {
-                    self.warm.push(l);
-                }
-            }
+            && let Some(l) = self.start_sel_live(i)
+        {
+            self.warm.push(l);
         }
-        if self.live_hover.is_none() {
-            if let Some(i) = hover_target {
-                // Filmstrip chips skip the settle delay: hovering one in
-                // quickview is a deliberate pointer act, like the modal
-                // itself (grid hover keeps the delay — the cursor crosses
-                // tiles it doesn't mean).
-                if self.quickview
-                    || self.hover_changed_at.elapsed().as_millis() as f32 >= delay_ms
-                {
-                    self.live_hover = self.start_live(lay, i);
-                }
+        if self.live_hover.is_none()
+            && let Some(i) = hover_target
+        {
+            // Filmstrip chips skip the settle delay: hovering one in
+            // quickview is a deliberate pointer act, like the modal
+            // itself (grid hover keeps the delay — the cursor crosses
+            // tiles it doesn't mean).
+            if self.quickview || self.hover_changed_at.elapsed().as_millis() as f32 >= delay_ms {
+                self.live_hover = self.start_live(lay, i);
             }
         }
 
-        if let Some(live) = &mut self.live_hover {
-            if let Some(rgba) = live.player.take_frame() {
-                if live.first_frame.is_none() {
-                    live.first_frame = Some(Instant::now());
-                }
-                uploads.push(ThumbUpload {
-                    slot: live.slot,
-                    w: live.player.w,
-                    h: live.player.h,
-                    rgba,
-                });
+        if let Some(live) = &mut self.live_hover
+            && let Some(rgba) = live.player.take_frame()
+        {
+            if live.first_frame.is_none() {
+                live.first_frame = Some(Instant::now());
             }
+            uploads.push(ThumbUpload {
+                slot: live.slot,
+                w: live.player.w,
+                h: live.player.h,
+                rgba,
+            });
         }
-        if let Some(live) = &mut self.live_sel {
-            if let Some(rgba) = live.player.take_frame() {
-                if live.first_frame.is_none() {
-                    live.first_frame = Some(Instant::now());
-                    log::debug!(
-                        "sel live clip {} first frame {:.0}ms after spawn",
-                        live.clip,
-                        live.spawned.elapsed().as_secs_f32() * 1000.0
-                    );
-                }
-                if self.hires_shown.as_ref() != Some(&live.path) {
-                    self.hires_shown = Some(live.path.clone());
-                }
-                self.hires_frame = Some(HiresFrame {
-                    w: live.player.w,
-                    h: live.player.h,
-                    rgba,
-                });
+        if let Some(live) = &mut self.live_sel
+            && let Some(rgba) = live.player.take_frame()
+        {
+            if live.first_frame.is_none() {
+                live.first_frame = Some(Instant::now());
+                log::debug!(
+                    "sel live clip {} first frame {:.0}ms after spawn",
+                    live.clip,
+                    live.spawned.elapsed().as_secs_f32() * 1000.0
+                );
             }
+            if self.hires_shown.as_ref() != Some(&live.path) {
+                self.hires_shown = Some(live.path.clone());
+            }
+            self.hires_frame = Some(HiresFrame {
+                w: live.player.w,
+                h: live.player.h,
+                rgba,
+            });
         }
     }
 
@@ -1640,7 +1640,8 @@ impl Switchblade {
             .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
             .unwrap_or(0.0);
         self.heal_meta(meta.as_ref(), &path);
-        let Some(player) = sb_media::SeekablePlayer::spawn(&path, tw, th, seek, meta.as_ref()) else {
+        let Some(player) = sb_media::SeekablePlayer::spawn(&path, tw, th, seek, meta.as_ref())
+        else {
             log::debug!("live preview failed to start: {}", path.display());
             return None;
         };
@@ -1743,12 +1744,12 @@ impl Switchblade {
                             live_hires = Some((l.player.w as f32, l.player.h as f32));
                         }
                     }
-                } else if hovered {
-                    if let Some(live) = &self.live_hover {
-                        if live.clip == i && live.first_frame.is_some() {
-                            thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
-                        }
-                    }
+                } else if hovered
+                    && let Some(live) = &self.live_hover
+                    && live.clip == i
+                    && live.first_frame.is_some()
+                {
+                    thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
                 }
 
                 let s = clip.scale * (0.92 + 0.08 * ease);
@@ -1762,18 +1763,18 @@ impl Switchblade {
                 // background peeks out behind portrait clips. The crop
                 // below derives from w/h, so it morphs along.
                 let e = clip.emph.clamp(0.0, 1.0);
-                if e > 0.001 {
-                    if let Some((_, tw, th)) = thumb {
-                        let m = t.max_display_aspect.max(1.0);
-                        let a = (tw / th).clamp(1.0 / m, m);
-                        let (we, he) = if a > wg / hg {
-                            (hg * a, hg)
-                        } else {
-                            (wg, wg / a)
-                        };
-                        w = wg + (we - wg) * e;
-                        h = hg + (he - hg) * e;
-                    }
+                if e > 0.001
+                    && let Some((_, tw, th)) = thumb
+                {
+                    let m = t.max_display_aspect.max(1.0);
+                    let a = (tw / th).clamp(1.0 / m, m);
+                    let (we, he) = if a > wg / hg {
+                        (hg * a, hg)
+                    } else {
+                        (wg, wg / a)
+                    };
+                    w = wg + (we - wg) * e;
+                    h = hg + (he - hg) * e;
                 }
                 let (ox, oy) = self.cell_origin(&lay, col, row);
                 let cx = ox + lay.tile_w * 0.5;
@@ -1954,10 +1955,11 @@ impl Switchblade {
                     push_loading_dots(out, &tile, ease, anim_t, selected);
                 }
                 // Post-skip position flash (in quickview the modal has it).
-                if selected && !self.quickview {
-                    if let Some((pos, a)) = skip_bar {
-                        push_skip_bar(out, &tile, pos, a * ease);
-                    }
+                if selected
+                    && !self.quickview
+                    && let Some((pos, a)) = skip_bar
+                {
+                    push_skip_bar(out, &tile, pos, a * ease);
                 }
             }
         }
@@ -1996,191 +1998,190 @@ impl Switchblade {
         // and show the selected clip large, centered, playing via the live
         // slot. Arrows keep working — the modal follows the selection.
         let mut blur = None;
-        if self.quickview {
-            if let Some(clip) = self.clips.get(self.selected) {
-                let fade = if !ui {
-                    1.0
-                } else {
-                    (self.quickview_at.elapsed().as_secs_f32() * 1000.0
-                        / t.quickview_fade_ms.max(1.0))
+        if self.quickview
+            && let Some(clip) = self.clips.get(self.selected)
+        {
+            let fade = if !ui {
+                1.0
+            } else {
+                (self.quickview_at.elapsed().as_secs_f32() * 1000.0 / t.quickview_fade_ms.max(1.0))
                     .min(1.0)
-                };
-                let (vw, vh) = (self.viewport.width, self.viewport.height);
-                if t.quickview_blur >= 0.5 {
-                    blur = Some(Blur {
-                        split: tiles.len(),
-                        levels: t.quickview_blur.round() as u32,
-                        fade,
-                    });
-                }
-                let full = |x, y, w, h, color| Tile {
-                    x,
-                    y,
-                    w,
-                    h,
-                    color,
+            };
+            let (vw, vh) = (self.viewport.width, self.viewport.height);
+            if t.quickview_blur >= 0.5 {
+                blur = Some(Blur {
+                    split: tiles.len(),
+                    levels: t.quickview_blur.round() as u32,
+                    fade,
+                });
+            }
+            let full = |x, y, w, h, color| Tile {
+                x,
+                y,
+                w,
+                h,
+                color,
+                border_color: [0.0; 4],
+                corner_radius: 0.0,
+                border_width: 0.0,
+                uv: [0.0; 4],
+                uv2: [0.0; 4],
+                frame_fade: 0.0,
+                tex_mix: 0.0,
+                hires: false,
+            };
+            tiles.push(full(
+                0.0,
+                0.0,
+                vw,
+                vh,
+                [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0) * fade],
+            ));
+
+            // The modal shows the same hires stream the tile plays —
+            // already running, already sharp, no handoff. Static thumb
+            // stands in for the brief first-frame window; a skip
+            // respawn keeps the texture's last frame instead; and
+            // during the D swap the shielded stream stays up while
+            // the selection index is in flux.
+            let src = self.selected_video_src(clip);
+            // The video sits above the filmstrip (geometry shared with
+            // the pointer hit-tests via quickview_video_rect).
+            let (chip_w, chip_h, strip_y) = self.strip_geom();
+            let avail_h = (strip_y - 18.0).max(60.0);
+            if let (Some((uv, _, _, hires)), Some((rx, ry, rw, rh))) =
+                (src, self.quickview_video_rect())
+            {
+                let video = Tile {
+                    x: rx,
+                    y: ry,
+                    w: rw,
+                    h: rh,
+                    color: [0.0, 0.0, 0.0, fade],
                     border_color: [0.0; 4],
-                    corner_radius: 0.0,
+                    corner_radius: t.selection_corner_radius,
                     border_width: 0.0,
-                    uv: [0.0; 4],
+                    uv,
                     uv2: [0.0; 4],
                     frame_fade: 0.0,
-                    tex_mix: 0.0,
+                    tex_mix: fade,
+                    hires,
+                };
+                tiles.push(video);
+                // Seekbar along the video's bottom: revealed by pointer
+                // motion (fades after a short idle) or the skip flash;
+                // thickens under the pointer; click/drag scrubs.
+                let bar_a = {
+                    let flash = skip_bar.map(|(_, a)| a).unwrap_or(0.0);
+                    self.seekbar_alpha().max(flash) * fade
+                };
+                self.push_seekbar(&mut tiles, rx, rw, clip, bar_a);
+            } else {
+                // Nothing decoded yet: big dots in the middle.
+                let stage = full(
+                    (vw - 300.0) * 0.5,
+                    (avail_h - 100.0) * 0.5,
+                    300.0,
+                    100.0,
+                    [0.0; 4],
+                );
+                push_loading_dots(&mut tiles, &stage, fade, anim_t, true);
+            }
+
+            // Filmstrip: neighbors along the bottom, selected centered,
+            // sliding on the keyboard chase spring. Foreground layer —
+            // in quickview, actions live here; the grid is backdrop.
+            // Z-order like the grid: hovered chip above its neighbors,
+            // selected chip on top (both scale up and overlap).
+            let step = chip_w + t.strip_gap;
+            let half = (vw / step) as i64 / 2 + 1;
+            let center = self.strip_pos;
+            let mut sel_chip: Option<Tile> = None;
+            let mut hover_chip: Option<Tile> = None;
+            for di in -half..=half {
+                let idx = center.round() as i64 + di;
+                if idx < 0 || idx as usize >= self.clips.len() {
+                    continue;
+                }
+                let i = idx as usize;
+                let c = &self.clips[i];
+                let sel = i == self.selected;
+                let hov = !sel && self.strip_hover == Some(i);
+                let s = if sel {
+                    t.strip_selection_scale
+                } else if hov {
+                    t.strip_hover_scale
+                } else {
+                    1.0
+                };
+                let (w, h) = (chip_w * s, chip_h * s);
+                let cx = vw * 0.5 + (i as f32 - center) * step;
+                // The hovered chip plays its lane's video (tile-size,
+                // in the atlas Live slot); everything else shows its
+                // thumb, crop-filled to 16:9.
+                let live = self
+                    .live_hover
+                    .as_ref()
+                    .filter(|l| hov && l.clip == i && l.first_frame.is_some())
+                    .map(|l| (l.slot, l.player.w as f32, l.player.h as f32));
+                let src = live.or(match c.thumb {
+                    Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
+                    _ => None,
+                });
+                let (uv, has_tex) = match src {
+                    Some((slot, tw, th)) => {
+                        let target_a = 16.0 / 9.0;
+                        let (mut cw, mut ch) = (tw, th);
+                        if tw / th > target_a {
+                            cw = th * target_a;
+                        } else {
+                            ch = tw / target_a;
+                        }
+                        (
+                            self.atlas_cfg
+                                .uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch),
+                            true,
+                        )
+                    }
+                    None => ([0.0; 4], false),
+                };
+                let sb = t.selection_border;
+                let hb = t.hover_border;
+                let (border_color, border_width) = if sel {
+                    ([sb[0], sb[1], sb[2], fade], t.strip_border_width)
+                } else if hov {
+                    (
+                        [hb[0], hb[1], hb[2], fade],
+                        (t.strip_border_width * 0.5).max(1.0),
+                    )
+                } else {
+                    ([0.30, 0.30, 0.34, 0.55 * fade], 1.0)
+                };
+                let tile = Tile {
+                    x: cx - w * 0.5,
+                    y: strip_y + (chip_h - h) * 0.5,
+                    w,
+                    h,
+                    color: [0.03, 0.03, 0.04, fade],
+                    border_color,
+                    corner_radius: t.strip_corner_radius,
+                    border_width,
+                    uv,
+                    uv2: [0.0; 4],
+                    frame_fade: 0.0,
+                    tex_mix: if has_tex { fade } else { 0.0 },
                     hires: false,
                 };
-                tiles.push(full(
-                    0.0,
-                    0.0,
-                    vw,
-                    vh,
-                    [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0) * fade],
-                ));
-
-                // The modal shows the same hires stream the tile plays —
-                // already running, already sharp, no handoff. Static thumb
-                // stands in for the brief first-frame window; a skip
-                // respawn keeps the texture's last frame instead; and
-                // during the D swap the shielded stream stays up while
-                // the selection index is in flux.
-                let src = self.selected_video_src(clip);
-                // The video sits above the filmstrip (geometry shared with
-                // the pointer hit-tests via quickview_video_rect).
-                let (chip_w, chip_h, strip_y) = self.strip_geom();
-                let avail_h = (strip_y - 18.0).max(60.0);
-                if let (Some((uv, _, _, hires)), Some((rx, ry, rw, rh))) =
-                    (src, self.quickview_video_rect())
-                {
-                    let video = Tile {
-                        x: rx,
-                        y: ry,
-                        w: rw,
-                        h: rh,
-                        color: [0.0, 0.0, 0.0, fade],
-                        border_color: [0.0; 4],
-                        corner_radius: t.selection_corner_radius,
-                        border_width: 0.0,
-                        uv,
-                        uv2: [0.0; 4],
-                        frame_fade: 0.0,
-                        tex_mix: fade,
-                        hires,
-                    };
-                    tiles.push(video);
-                    // Seekbar along the video's bottom: revealed by pointer
-                    // motion (fades after a short idle) or the skip flash;
-                    // thickens under the pointer; click/drag scrubs.
-                    let bar_a = {
-                        let flash = skip_bar.map(|(_, a)| a).unwrap_or(0.0);
-                        self.seekbar_alpha().max(flash) * fade
-                    };
-                    self.push_seekbar(&mut tiles, rx, rw, clip, bar_a);
+                if sel {
+                    sel_chip = Some(tile);
+                } else if hov {
+                    hover_chip = Some(tile);
                 } else {
-                    // Nothing decoded yet: big dots in the middle.
-                    let stage = full(
-                        (vw - 300.0) * 0.5,
-                        (avail_h - 100.0) * 0.5,
-                        300.0,
-                        100.0,
-                        [0.0; 4],
-                    );
-                    push_loading_dots(&mut tiles, &stage, fade, anim_t, true);
+                    tiles.push(tile);
                 }
-
-                // Filmstrip: neighbors along the bottom, selected centered,
-                // sliding on the keyboard chase spring. Foreground layer —
-                // in quickview, actions live here; the grid is backdrop.
-                // Z-order like the grid: hovered chip above its neighbors,
-                // selected chip on top (both scale up and overlap).
-                let step = chip_w + t.strip_gap;
-                let half = (vw / step) as i64 / 2 + 1;
-                let center = self.strip_pos;
-                let mut sel_chip: Option<Tile> = None;
-                let mut hover_chip: Option<Tile> = None;
-                for di in -half..=half {
-                    let idx = center.round() as i64 + di;
-                    if idx < 0 || idx as usize >= self.clips.len() {
-                        continue;
-                    }
-                    let i = idx as usize;
-                    let c = &self.clips[i];
-                    let sel = i == self.selected;
-                    let hov = !sel && self.strip_hover == Some(i);
-                    let s = if sel {
-                        t.strip_selection_scale
-                    } else if hov {
-                        t.strip_hover_scale
-                    } else {
-                        1.0
-                    };
-                    let (w, h) = (chip_w * s, chip_h * s);
-                    let cx = vw * 0.5 + (i as f32 - center) * step;
-                    // The hovered chip plays its lane's video (tile-size,
-                    // in the atlas Live slot); everything else shows its
-                    // thumb, crop-filled to 16:9.
-                    let live = self
-                        .live_hover
-                        .as_ref()
-                        .filter(|l| hov && l.clip == i && l.first_frame.is_some())
-                        .map(|l| (l.slot, l.player.w as f32, l.player.h as f32));
-                    let src = live.or(match c.thumb {
-                        Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
-                        _ => None,
-                    });
-                    let (uv, has_tex) = match src {
-                        Some((slot, tw, th)) => {
-                            let target_a = 16.0 / 9.0;
-                            let (mut cw, mut ch) = (tw, th);
-                            if tw / th > target_a {
-                                cw = th * target_a;
-                            } else {
-                                ch = tw / target_a;
-                            }
-                            (
-                                self.atlas_cfg
-                                    .uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch),
-                                true,
-                            )
-                        }
-                        None => ([0.0; 4], false),
-                    };
-                    let sb = t.selection_border;
-                    let hb = t.hover_border;
-                    let (border_color, border_width) = if sel {
-                        ([sb[0], sb[1], sb[2], fade], t.strip_border_width)
-                    } else if hov {
-                        (
-                            [hb[0], hb[1], hb[2], fade],
-                            (t.strip_border_width * 0.5).max(1.0),
-                        )
-                    } else {
-                        ([0.30, 0.30, 0.34, 0.55 * fade], 1.0)
-                    };
-                    let tile = Tile {
-                        x: cx - w * 0.5,
-                        y: strip_y + (chip_h - h) * 0.5,
-                        w,
-                        h,
-                        color: [0.03, 0.03, 0.04, fade],
-                        border_color,
-                        corner_radius: t.strip_corner_radius,
-                        border_width,
-                        uv,
-                        uv2: [0.0; 4],
-                        frame_fade: 0.0,
-                        tex_mix: if has_tex { fade } else { 0.0 },
-                        hires: false,
-                    };
-                    if sel {
-                        sel_chip = Some(tile);
-                    } else if hov {
-                        hover_chip = Some(tile);
-                    } else {
-                        tiles.push(tile);
-                    }
-                }
-                tiles.extend(hover_chip);
-                tiles.extend(sel_chip);
             }
+            tiles.extend(hover_chip);
+            tiles.extend(sel_chip);
         }
 
         // Fullview (internal `fullview` action): the selected clip fills
@@ -2227,11 +2228,19 @@ impl Switchblade {
                         tex_mix: 1.0,
                         hires,
                     });
-                    let bar_a = self.seekbar_alpha().max(skip_bar.map(|(_, a)| a).unwrap_or(0.0));
+                    let bar_a = self
+                        .seekbar_alpha()
+                        .max(skip_bar.map(|(_, a)| a).unwrap_or(0.0));
                     self.push_seekbar(&mut tiles, rx, rw, clip, bar_a);
                 } else {
                     // Nothing decoded yet: loading dots on the black stage.
-                    let stage = full((vw - 300.0) * 0.5, (vh - 100.0) * 0.5, 300.0, 100.0, [0.0; 4]);
+                    let stage = full(
+                        (vw - 300.0) * 0.5,
+                        (vh - 100.0) * 0.5,
+                        300.0,
+                        100.0,
+                        [0.0; 4],
+                    );
                     push_loading_dots(&mut tiles, &stage, 1.0, anim_t, true);
                 }
             }
@@ -2347,12 +2356,9 @@ impl App for Switchblade {
                     if let Some(f) = self.seekbar_frac(x) {
                         self.scrub_seek(f, false);
                     }
-                } else if self
-                    .active_video_rect()
-                    .is_some_and(|(vx, vy, vw, vh)| {
-                        (vx..=vx + vw).contains(&x) && (vy..=vy + vh + 12.0).contains(&y)
-                    })
-                {
+                } else if self.active_video_rect().is_some_and(|(vx, vy, vw, vh)| {
+                    (vx..=vx + vw).contains(&x) && (vy..=vy + vh + 12.0).contains(&y)
+                }) {
                     self.seekbar_seen = Some(Instant::now());
                     // Stay awake through the idle-hide and the fade tail.
                     self.wake(
@@ -2461,6 +2467,99 @@ impl App for Switchblade {
     }
 }
 
+/// A little cloud in the tile's bottom-right corner, built from two circles
+/// and a rounded bar — no icon assets, no text stack, just tiles.
+fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
+    let color = [0.62, 0.72, 0.88, ease];
+    let bx = tile.x + tile.w - 40.0;
+    let by = tile.y + tile.h - 26.0;
+    let part = |x: f32, y: f32, w: f32, h: f32| Tile {
+        x,
+        y,
+        w,
+        h,
+        color,
+        border_color: [0.0; 4],
+        corner_radius: h * 0.5,
+        border_width: 0.0,
+        uv: [0.0; 4],
+        uv2: [0.0; 4],
+        frame_fade: 0.0,
+        tex_mix: 0.0,
+        hires: false,
+    };
+    out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
+    out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
+    out.push(part(bx, by + 7.0, 28.0, 10.0)); // base bar
+}
+
+/// A slim playback-position bar along a tile's bottom edge — the short
+/// flash after a `[`/`]` skip. Dark track under a bright fill so it reads
+/// over any video content.
+fn push_skip_bar(out: &mut Vec<Tile>, tile: &Tile, pos: f32, alpha: f32) {
+    let pad = 12.0_f32.min(tile.w * 0.06).max(4.0);
+    let bw = (tile.w - pad * 2.0).max(8.0);
+    let bh = 3.0;
+    let by = tile.y + tile.h - bh - pad;
+    let bar = |x: f32, w: f32, color: [f32; 4]| Tile {
+        x,
+        y: by,
+        w,
+        h: bh,
+        color,
+        border_color: [0.0; 4],
+        corner_radius: bh * 0.5,
+        border_width: 0.0,
+        uv: [0.0; 4],
+        uv2: [0.0; 4],
+        frame_fade: 0.0,
+        tex_mix: 0.0,
+        hires: false,
+    };
+    let bx = tile.x + pad;
+    out.push(bar(bx, bw, [0.08, 0.08, 0.10, 0.55 * alpha]));
+    out.push(bar(
+        bx,
+        (bw * pos).max(bh),
+        [0.95, 0.95, 0.98, 0.95 * alpha],
+    ));
+}
+
+/// Three pulsing dots while a thumbnail is generating: each breathes from
+/// near-transparent up to opaque near-white. Small in the bottom-right
+/// corner normally; big and centered when the tile is selected.
+fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: bool) {
+    let (d, gap) = if big { (13.0, 11.0) } else { (5.0, 4.0) };
+    let total_w = 3.0 * d + 2.0 * gap;
+    let (bx, by) = if big {
+        (
+            tile.x + (tile.w - total_w) * 0.5,
+            tile.y + (tile.h - d) * 0.5,
+        )
+    } else {
+        (tile.x + tile.w - total_w - 10.0, tile.y + tile.h - d - 10.0)
+    };
+    for k in 0..3 {
+        let wave = 0.5 + 0.5 * (t * 4.5 - k as f32 * 0.9).sin();
+        let pulse = wave * wave; // sharpen: dwell near-dark, peak bright
+        out.push(Tile {
+            x: bx + k as f32 * (d + gap),
+            y: by,
+            w: d,
+            h: d,
+            color: [0.94, 0.94, 0.97, (0.04 + 0.96 * pulse) * ease],
+            border_color: [0.0; 4],
+            corner_radius: d * 0.5,
+            border_width: 0.0,
+            uv: [0.0; 4],
+            uv2: [0.0; 4],
+            frame_fade: 0.0,
+            tex_mix: 0.0,
+            hires: false,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2548,7 +2647,14 @@ mod tests {
             let ok = std::process::Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
                 .arg("testsrc2=duration=8:size=320x180:rate=30")
-                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
                 .arg(&clip)
                 .status()
                 .map(|s| s.success())
@@ -2624,7 +2730,14 @@ mod tests {
             let ok = std::process::Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
                 .arg("testsrc2=duration=8:size=320x180:rate=30")
-                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
                 .arg(&clip)
                 .status()
                 .map(|s| s.success())
@@ -2662,7 +2775,10 @@ mod tests {
             x: vx + vw * 0.5,
             y: vy + vh * 0.5,
         });
-        assert!(app.seekbar_alpha() > 0.9, "motion over the video reveals the bar");
+        assert!(
+            app.seekbar_alpha() > 0.9,
+            "motion over the video reveals the bar"
+        );
 
         // Grab at 75%: keyframe scrub starts, position reports the target.
         app.event(InputEvent::MouseDown {
@@ -2671,7 +2787,10 @@ mod tests {
         });
         assert!(app.scrubbing, "press on the bar starts a scrub");
         let p = app.live_sel.as_ref().unwrap().position();
-        assert!((5.4..=6.6).contains(&p), "position tracks the grab point, got {p}");
+        assert!(
+            (5.4..=6.6).contains(&p),
+            "position tracks the grab point, got {p}"
+        );
         // One frame with the bar revealed + hot exercises the draw path.
         let _ = app.frame(
             0.016,
@@ -2692,7 +2811,10 @@ mod tests {
         });
         assert!(!app.scrubbing, "release ends the scrub");
         let l = app.live_sel.as_ref().unwrap();
-        assert!(l.first_frame.is_some(), "scrubbing never respawns the decoder");
+        assert!(
+            l.first_frame.is_some(),
+            "scrubbing never respawns the decoder"
+        );
         let p = l.position();
         assert!((1.4..=2.6).contains(&p), "release lands near 25%, got {p}");
         assert!(
@@ -2739,94 +2861,5 @@ mod tests {
         assert_eq!(app.selected, 2, "the strip clamps at the ends");
         // Grid pan must not have moved under the modal.
         assert_eq!(app.scroll_target, 0.0, "the backdrop grid never pans");
-    }
-}
-
-/// A little cloud in the tile's bottom-right corner, built from two circles
-/// and a rounded bar — no icon assets, no text stack, just tiles.
-fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
-    let color = [0.62, 0.72, 0.88, ease];
-    let bx = tile.x + tile.w - 40.0;
-    let by = tile.y + tile.h - 26.0;
-    let part = |x: f32, y: f32, w: f32, h: f32| Tile {
-        x,
-        y,
-        w,
-        h,
-        color,
-        border_color: [0.0; 4],
-        corner_radius: h * 0.5,
-        border_width: 0.0,
-        uv: [0.0; 4],
-        uv2: [0.0; 4],
-        frame_fade: 0.0,
-        tex_mix: 0.0,
-        hires: false,
-    };
-    out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
-    out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
-    out.push(part(bx, by + 7.0, 28.0, 10.0)); // base bar
-}
-
-/// A slim playback-position bar along a tile's bottom edge — the short
-/// flash after a `[`/`]` skip. Dark track under a bright fill so it reads
-/// over any video content.
-fn push_skip_bar(out: &mut Vec<Tile>, tile: &Tile, pos: f32, alpha: f32) {
-    let pad = 12.0_f32.min(tile.w * 0.06).max(4.0);
-    let bw = (tile.w - pad * 2.0).max(8.0);
-    let bh = 3.0;
-    let by = tile.y + tile.h - bh - pad;
-    let bar = |x: f32, w: f32, color: [f32; 4]| Tile {
-        x,
-        y: by,
-        w,
-        h: bh,
-        color,
-        border_color: [0.0; 4],
-        corner_radius: bh * 0.5,
-        border_width: 0.0,
-        uv: [0.0; 4],
-        uv2: [0.0; 4],
-        frame_fade: 0.0,
-        tex_mix: 0.0,
-        hires: false,
-    };
-    let bx = tile.x + pad;
-    out.push(bar(bx, bw, [0.08, 0.08, 0.10, 0.55 * alpha]));
-    out.push(bar(bx, (bw * pos).max(bh), [0.95, 0.95, 0.98, 0.95 * alpha]));
-}
-
-/// Three pulsing dots while a thumbnail is generating: each breathes from
-/// near-transparent up to opaque near-white. Small in the bottom-right
-/// corner normally; big and centered when the tile is selected.
-fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: bool) {
-    let (d, gap) = if big { (13.0, 11.0) } else { (5.0, 4.0) };
-    let total_w = 3.0 * d + 2.0 * gap;
-    let (bx, by) = if big {
-        (
-            tile.x + (tile.w - total_w) * 0.5,
-            tile.y + (tile.h - d) * 0.5,
-        )
-    } else {
-        (tile.x + tile.w - total_w - 10.0, tile.y + tile.h - d - 10.0)
-    };
-    for k in 0..3 {
-        let wave = 0.5 + 0.5 * (t * 4.5 - k as f32 * 0.9).sin();
-        let pulse = wave * wave; // sharpen: dwell near-dark, peak bright
-        out.push(Tile {
-            x: bx + k as f32 * (d + gap),
-            y: by,
-            w: d,
-            h: d,
-            color: [0.94, 0.94, 0.97, (0.04 + 0.96 * pulse) * ease],
-            border_color: [0.0; 4],
-            corner_radius: d * 0.5,
-            border_width: 0.0,
-            uv: [0.0; 4],
-            uv2: [0.0; 4],
-            frame_fade: 0.0,
-            tex_mix: 0.0,
-            hires: false,
-        });
     }
 }

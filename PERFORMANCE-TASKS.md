@@ -732,10 +732,16 @@ service and bounded depth.
 
 **Priority:** Do first (step 0 in the execution order).
 
-`cargo clippy --workspace --all-targets -- -D warnings` currently stops on
-three existing `collapsible_if` warnings in `sb-media`. Every task here verifies
-against this exact gate, so the fix is a precondition, not a follow-up. Trivial
-and mechanical — clear it before starting P0.2.
+**Status: DONE (2026-07-16).** The visible three `collapsible_if` warnings in
+`sb-media` were only the first failing crate — clearing them surfaced 14 more
+`collapsible_if` and 2 `items_after_test_module` in `sb-app` (clippy stops at
+the first crate that fails, so the review undercounted). All 19 fixed
+mechanically (let-chains; moved `is_cloud_placeholder` and the `App` impl tail
+above their test modules). `cargo fmt --all` also re-established a fmt-clean
+tree — the checked-in code had drifted from the current toolchain's rustfmt in
+~30 places, which would otherwise churn into every future patch. Gate verified:
+fmt --check, clippy -D warnings, workspace tests, serial sb-media tests, and a
+release build all pass.
 
 ## Standard verification for completed tasks
 

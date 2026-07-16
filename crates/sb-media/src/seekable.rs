@@ -98,7 +98,11 @@ impl SeekablePlayer {
         // the mapping mirrors the PSNR-verified transpose_vt directions.
         let sw_pre = match rotation.map(|r| {
             let q = (r / 90.0).round();
-            if (r - q * 90.0).abs() > 1.0 { -1 } else { (q as i64).rem_euclid(4) }
+            if (r - q * 90.0).abs() > 1.0 {
+                -1
+            } else {
+                (q as i64).rem_euclid(4)
+            }
         }) {
             Some(1) => "transpose=2,",
             Some(3) => "transpose=1,",
@@ -330,8 +334,12 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
     quiet_libav_once();
     unsafe {
         let mut fmt_raw: *mut ffi::AVFormatContext = ptr::null_mut();
-        if ffi::avformat_open_input(&mut fmt_raw, cfg.cpath.as_ptr(), ptr::null(), ptr::null_mut())
-            < 0
+        if ffi::avformat_open_input(
+            &mut fmt_raw,
+            cfg.cpath.as_ptr(),
+            ptr::null(),
+            ptr::null_mut(),
+        ) < 0
         {
             return Err("open failed".into());
         }
@@ -718,7 +726,14 @@ mod tests {
             let ok = Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
                 .arg(format!("testsrc2=duration={secs}:size=320x180:rate=30"))
-                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
                 .arg(&clip)
                 .status()
                 .map(|s| s.success())
@@ -758,9 +773,14 @@ mod tests {
     /// from the start — no initial burst, no stall.
     #[test]
     fn seekable_player_paces_frames() {
-        let Some(clip) = test_clip("pace.mp4", 4) else { return };
+        let Some(clip) = test_clip("pace.mp4", 4) else {
+            return;
+        };
         let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&meta(&clip))).expect("spawn");
-        assert!(take_one(&p, Duration::from_secs(3)).is_some(), "no first frame within 3s");
+        assert!(
+            take_one(&p, Duration::from_secs(3)).is_some(),
+            "no first frame within 3s"
+        );
         let t0 = Instant::now();
         let mut frames = 0u32;
         while t0.elapsed() < Duration::from_secs(1) {
@@ -781,7 +801,9 @@ mod tests {
     /// and serves a frame the instant it's promoted.
     #[test]
     fn unwatched_seekable_player_stalls_then_serves_instantly() {
-        let Some(clip) = test_clip("warm.mp4", 4) else { return };
+        let Some(clip) = test_clip("warm.mp4", 4) else {
+            return;
+        };
         let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&meta(&clip))).expect("spawn");
         thread::sleep(Duration::from_millis(800));
         assert!(
@@ -799,7 +821,9 @@ mod tests {
     /// pinning frame buffers after every selection change).
     #[test]
     fn dropped_seekable_player_releases_its_reader() {
-        let Some(clip) = test_clip("drop.mp4", 4) else { return };
+        let Some(clip) = test_clip("drop.mp4", 4) else {
+            return;
+        };
         let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&meta(&clip))).expect("spawn");
         thread::sleep(Duration::from_millis(700)); // reader parks, queue full
         let shared = Arc::downgrade(&p.shared);
@@ -808,7 +832,10 @@ mod tests {
         while shared.upgrade().is_some() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(shared.upgrade().is_none(), "reader thread leaked after drop");
+        assert!(
+            shared.upgrade().is_none(),
+            "reader thread leaked after drop"
+        );
     }
 
     /// Real camera/encoder output tags colorspace and range (bt709/tv);
@@ -828,7 +855,14 @@ mod tests {
             let ok = Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
                 .arg("testsrc2=duration=4:size=320x180:rate=30")
-                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
                 .args(["-colorspace", "bt709", "-color_primaries", "bt709"])
                 .args(["-color_trc", "bt709", "-color_range", "tv"])
                 .arg(&clip)
@@ -869,10 +903,19 @@ mod tests {
     /// keyframe (worst case: decode-forward across the whole GOP).
     #[test]
     fn seek_jumps_in_place_without_respawn() {
-        let Some(clip) = test_clip("seek.mp4", 8) else { return };
+        let Some(clip) = test_clip("seek.mp4", 8) else {
+            return;
+        };
         let p = SeekablePlayer::spawn(&clip, 320, 180, 0.2, Some(&meta(&clip))).expect("spawn");
-        assert!(take_one(&p, Duration::from_secs(3)).is_some(), "no first frame");
-        assert!(p.position() < 2.0, "started near the head, got {}", p.position());
+        assert!(
+            take_one(&p, Duration::from_secs(3)).is_some(),
+            "no first frame"
+        );
+        assert!(
+            p.position() < 2.0,
+            "started near the head, got {}",
+            p.position()
+        );
 
         p.seek(6.0, true);
         assert!(

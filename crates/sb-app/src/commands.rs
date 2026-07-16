@@ -36,7 +36,10 @@ pub enum CommandSpec {
 /// or an internal action for the app to perform.
 #[derive(Debug, Clone)]
 pub enum Action {
-    Spawn { program: String, args: Vec<String> },
+    Spawn {
+        program: String,
+        args: Vec<String>,
+    },
     Quit,
     /// `fast` = borderless desktop-sized window (mpv's no-native-fs)
     /// instead of macOS native fullscreen; either exits whichever mode
@@ -56,7 +59,10 @@ pub enum Action {
     Fullview,
     /// Jump the playing clip by a fraction of its duration; `None` falls
     /// back to the tuning `skip_fraction`.
-    Skip { forward: bool, amount: Option<f32> },
+    Skip {
+        forward: bool,
+        amount: Option<f32>,
+    },
     /// Re-ingest from the selected clip's parent directory (siblings view).
     OpenParent,
 }
@@ -269,10 +275,10 @@ fn expand_template(arg: &str, path: &Path) -> String {
 }
 
 fn expand_tilde(program: &str) -> String {
-    if let Some(rest) = program.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(rest).to_string_lossy().into_owned();
-        }
+    if let Some(rest) = program.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Path::new(&home).join(rest).to_string_lossy().into_owned();
     }
     program.to_string()
 }
@@ -334,10 +340,7 @@ mod tests {
     #[test]
     fn fullview_binds_to_tab() {
         let map = KeyMap::default();
-        assert!(matches!(
-            map.action_for(&Key::Tab),
-            Some(Action::Fullview)
-        ));
+        assert!(matches!(map.action_for(&Key::Tab), Some(Action::Fullview)));
     }
 
     #[test]

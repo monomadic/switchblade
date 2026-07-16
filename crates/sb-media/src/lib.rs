@@ -591,10 +591,10 @@ fn ensure_thumb_file(
         }
         std::fs::create_dir_all(&dir).ok()?;
         let probed = probe(src);
-        if let Some(m) = &probed {
-            if let Ok(json) = serde_json::to_vec_pretty(m) {
-                let _ = std::fs::write(dir.join("meta.json"), json);
-            }
+        if let Some(m) = &probed
+            && let Ok(json) = serde_json::to_vec_pretty(m)
+        {
+            let _ = std::fs::write(dir.join("meta.json"), json);
         }
         let seek = probed
             .as_ref()
@@ -772,10 +772,10 @@ fn reprobe(src: &Path, root: &Path) {
     };
     let dir = entry_dir(root, src, st.len(), mtime_secs(&st));
     let file = dir.join("meta.json");
-    if let Ok(bytes) = std::fs::read(&file) {
-        if serde_json::from_slice::<Meta>(&bytes).is_ok_and(|m| m.pix_fmt.is_some()) {
-            return; // already healed
-        }
+    if let Ok(bytes) = std::fs::read(&file)
+        && serde_json::from_slice::<Meta>(&bytes).is_ok_and(|m| m.pix_fmt.is_some())
+    {
+        return; // already healed
     }
     let Some(m) = probe(src) else {
         return;
@@ -1101,7 +1101,10 @@ mod tests {
         assert!(!old.exists(), "old entry should have been renamed across");
         assert!(new.join("thumb_fit_640x360_q5.jpg").exists());
         // Second resolve is a plain hit, no rename left to do.
-        assert_eq!(entry_dir_with(CacheKey::SizeMtime, &root, &src, len, mt), new);
+        assert_eq!(
+            entry_dir_with(CacheKey::SizeMtime, &root, &src, len, mt),
+            new
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

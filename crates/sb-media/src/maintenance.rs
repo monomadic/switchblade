@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::{cache_root, fingerprint_with, mtime_secs, CacheKey, Meta, Recipe};
+use crate::{CacheKey, Meta, Recipe, cache_root, fingerprint_with, mtime_secs};
 
 /// What a maintenance pass removed (or, for `usage`, what exists).
 #[derive(Debug, Default, Clone, Copy)]
@@ -176,11 +176,11 @@ fn last_used(entry: &Path) -> SystemTime {
 fn dir_size(dir: &Path) -> Removed {
     let mut total = Removed::default();
     for f in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if let Ok(m) = f.metadata() {
-            if m.is_file() {
-                total.files += 1;
-                total.bytes += m.len();
-            }
+        if let Ok(m) = f.metadata()
+            && m.is_file()
+        {
+            total.files += 1;
+            total.bytes += m.len();
         }
     }
     total
