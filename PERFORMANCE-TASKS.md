@@ -528,10 +528,27 @@ second incompatible indexing layer.
 
 ### P1.2 — Coalesce media work by artifact and allow priority promotion
 
-**Status:** Ready. Scope is now *duplicated work* only — the temp-path
-corruption race moved to P0.6, which should already be landed. This task removes
-the wasted second probe/extract; it is a throughput/latency win, not a
-correctness fix.
+**Status: DONE (2026-07-16).** Implemented inside `Queues` (all under the
+existing mutex, tier semantics untouched):
+
+- Artifacts key as `(path, Art::{Thumb,Anim})` — visible-thumb and gen
+  target the same `Thumb` artifact, both sheet tiers the same `Anim`.
+- Membership mirrors (`in_thumbs`/`in_gen`/`in_anims*`, O(1) checks) + an
+  `inflight` set; `push_thumb` absorbs a queued gen entry (promotion to
+  tier 1) or joins in-flight work; `push_anim_now` moves a queued bulk
+  sheet above the gen tier; duplicate gens coalesce.
+- Result multiplicity is preserved via owed counters (`gen_owed`/
+  `thumb_owed`/`anim_owed`): the app counts one result per request, so a
+  merged request still gets its `GenDone`/`Ready` — the worker emits the
+  owed batch on completion, including the foreground decode for a visible
+  request that joined an in-flight generation. Progress accounting stays
+  balanced (the D-swap duplicate-gen case included).
+
+Tests: `visible_request_absorbs_queued_gen`,
+`visible_request_joins_inflight_gen`, `duplicate_gen_requests_coalesce`,
+`quickview_sheet_promotes_queued_bulk_anim`, plus the kept
+`quickview_sheet_outranks_gen_sweep_but_not_visible_thumbs`. Cold-cache
+live run: 6/6 thumbs served, no errors, jobs completed.
 
 **Problem**
 

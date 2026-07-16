@@ -11,7 +11,7 @@ pub mod maintenance;
 mod seekable;
 pub use seekable::SeekablePlayer;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -76,6 +76,30 @@ enum Request {
     Anim(PathBuf),
 }
 
+/// Which cached artifact a job produces — the coalescing key (P1.2):
+/// `Thumb` covers both the visible-thumb request and the gen sweep
+/// (identical jpg + meta on disk), `Anim` covers both sheet tiers.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Art {
+    Thumb,
+    Anim,
+}
+
+/// Results owed to requests that merged into someone else's generation
+/// (P1.2). The app counts one result per request, so a merged request
+/// still gets its result — just without a second ffprobe/ffmpeg run.
+#[derive(Default)]
+struct Owed {
+    /// Extra `GenDone`s (gen requests absorbed by a thumb job or a
+    /// duplicate gen).
+    gens: u32,
+    /// Foreground decode+`Ready`s (visible requests that joined an
+    /// in-flight generation).
+    thumbs: u32,
+    /// Extra anim results (duplicate sheet requests across tiers).
+    anims: u32,
+}
+
 /// Strict-priority work queue, popped top to bottom — a lower tier never
 /// runs while a higher one has work:
 ///   1. `thumbs`    — visible thumbnails (something on screen needs pixels)
@@ -102,26 +126,129 @@ struct Queues {
     anims_now: VecDeque<PathBuf>,
     r#gen: VecDeque<PathBuf>,
     anims: VecDeque<PathBuf>,
+    // ── artifact coalescing (P1.2) ──────────────────────────────────
+    // Membership mirrors of the four artifact queues (reprobes are
+    // self-deduped app-side and cheap): O(1) duplicate checks — the
+    // linear VecDeque scan only runs on an actual promotion/absorption.
+    in_thumbs: std::collections::HashSet<PathBuf>,
+    in_gen: std::collections::HashSet<PathBuf>,
+    in_anims_now: std::collections::HashSet<PathBuf>,
+    in_anims: std::collections::HashSet<PathBuf>,
+    /// Artifacts a worker is generating right now.
+    inflight: std::collections::HashSet<(PathBuf, Art)>,
+    /// Extra results owed per path when its artifact completes.
+    gen_owed: HashMap<PathBuf, u32>,
+    thumb_owed: HashMap<PathBuf, u32>,
+    anim_owed: HashMap<PathBuf, u32>,
 }
 
 impl Queues {
+    fn thumb_busy(&self, p: &Path) -> bool {
+        self.inflight.contains(&(p.to_path_buf(), Art::Thumb))
+    }
+    fn anim_busy(&self, p: &Path) -> bool {
+        self.inflight.contains(&(p.to_path_buf(), Art::Anim))
+    }
+
+    /// Visible-thumb request (tier 1). A gen-sweep entry for the same
+    /// artifact is absorbed (promoted to this tier); joining queued or
+    /// in-flight work records an owed foreground result instead of a
+    /// duplicate generation.
+    fn push_thumb(&mut self, p: PathBuf) {
+        if self.in_gen.remove(&p) {
+            let i = self.r#gen.iter().position(|q| q == &p).unwrap();
+            self.r#gen.remove(i);
+            *self.gen_owed.entry(p.clone()).or_default() += 1;
+        }
+        if self.in_thumbs.contains(&p) || self.thumb_busy(&p) {
+            *self.thumb_owed.entry(p).or_default() += 1;
+        } else {
+            self.in_thumbs.insert(p.clone());
+            self.thumbs.push_back(p);
+        }
+    }
+
+    /// Gen-sweep request (tier 4). The same artifact already queued or
+    /// running (either kind of thumb work) just owes one more `GenDone`.
+    fn push_gen(&mut self, p: PathBuf) {
+        if self.in_thumbs.contains(&p) || self.in_gen.contains(&p) || self.thumb_busy(&p) {
+            *self.gen_owed.entry(p).or_default() += 1;
+        } else {
+            self.in_gen.insert(p.clone());
+            self.r#gen.push_back(p);
+        }
+    }
+
+    /// Quickview's on-demand sheet (tier 3). A bulk-tier entry for the
+    /// same sheet is *promoted* — moved up here — rather than duplicated.
+    fn push_anim_now(&mut self, p: PathBuf) {
+        if self.in_anims.remove(&p) {
+            let i = self.anims.iter().position(|q| q == &p).unwrap();
+            self.anims.remove(i);
+            *self.anim_owed.entry(p.clone()).or_default() += 1;
+        }
+        if self.in_anims_now.contains(&p) || self.anim_busy(&p) {
+            *self.anim_owed.entry(p).or_default() += 1;
+        } else {
+            self.in_anims_now.insert(p.clone());
+            self.anims_now.push_back(p);
+        }
+    }
+
+    /// Bulk sheet request (tier 5).
+    fn push_anim(&mut self, p: PathBuf) {
+        if self.in_anims_now.contains(&p) || self.in_anims.contains(&p) || self.anim_busy(&p) {
+            *self.anim_owed.entry(p).or_default() += 1;
+        } else {
+            self.in_anims.insert(p.clone());
+            self.anims.push_back(p);
+        }
+    }
+
     fn pop(&mut self) -> Option<Request> {
         if let Some(p) = self.thumbs.pop_front() {
+            self.in_thumbs.remove(&p);
+            self.inflight.insert((p.clone(), Art::Thumb));
             return Some(Request::Thumb(p));
         }
         if let Some(p) = self.reprobes.pop_front() {
             return Some(Request::Reprobe(p));
         }
         if let Some(p) = self.anims_now.pop_front() {
+            self.in_anims_now.remove(&p);
+            self.inflight.insert((p.clone(), Art::Anim));
             return Some(Request::Anim(p));
         }
         if let Some(p) = self.r#gen.pop_front() {
+            self.in_gen.remove(&p);
+            self.inflight.insert((p.clone(), Art::Thumb));
             return Some(Request::Gen(p));
         }
         if let Some(p) = self.anims.pop_front() {
+            self.in_anims.remove(&p);
+            self.inflight.insert((p.clone(), Art::Anim));
             return Some(Request::Anim(p));
         }
         None
+    }
+
+    /// A worker finished `p`'s `art` job: clear in-flight and collect
+    /// whatever merged requests are owed. Requests arriving after this
+    /// enqueue normally — the artifact is cached now, so they're cheap.
+    fn complete(&mut self, p: &Path, art: Art) -> Owed {
+        self.inflight.remove(&(p.to_path_buf(), art));
+        match art {
+            Art::Thumb => Owed {
+                gens: self.gen_owed.remove(p).unwrap_or(0),
+                thumbs: self.thumb_owed.remove(p).unwrap_or(0),
+                anims: 0,
+            },
+            Art::Anim => Owed {
+                gens: 0,
+                thumbs: 0,
+                anims: self.anim_owed.remove(p).unwrap_or(0),
+            },
+        }
     }
 }
 
@@ -190,7 +317,7 @@ impl MediaService {
 
     pub fn request(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().thumbs.push_back(path);
+        lock.lock().unwrap().push_thumb(path);
         cv.notify_one();
     }
 
@@ -209,13 +336,13 @@ impl MediaService {
     /// Queue background thumb generation (disk cache only, no upload).
     pub fn request_gen(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().r#gen.push_back(path);
+        lock.lock().unwrap().push_gen(path);
         cv.notify_one();
     }
 
     pub fn request_anim(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().anims.push_back(path);
+        lock.lock().unwrap().push_anim(path);
         cv.notify_one();
     }
 
@@ -224,7 +351,7 @@ impl MediaService {
     /// Bulk sheet generation must keep using `request_anim`.
     pub fn request_anim_now(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().anims_now.push_back(path);
+        lock.lock().unwrap().push_anim_now(path);
         cv.notify_one();
     }
 
@@ -539,11 +666,36 @@ fn worker(
                 q = cv.wait(q).unwrap();
             }
         };
-        let result = match req {
-            Request::Thumb(path) => match make_thumb(&path, &root, have_ffmpeg, &recipe) {
-                Some((w, h, rgba)) => ThumbResult::Ready { path, w, h, rgba },
-                None => ThumbResult::Failed { path },
-            },
+        // One generation can settle several merged requests (P1.2): the
+        // job's own result plus whatever `complete()` says is owed to
+        // requests that joined instead of duplicating the work.
+        let mut results: Vec<ThumbResult> = Vec::new();
+        match req {
+            Request::Thumb(path) => {
+                let out = make_thumb(&path, &root, have_ffmpeg, &recipe);
+                let owed = queue.0.lock().unwrap().complete(&path, Art::Thumb);
+                for _ in 0..owed.gens {
+                    results.push(ThumbResult::GenDone { path: path.clone() });
+                }
+                match out {
+                    Some((w, h, rgba)) => {
+                        for _ in 0..owed.thumbs {
+                            results.push(ThumbResult::Ready {
+                                path: path.clone(),
+                                w,
+                                h,
+                                rgba: rgba.clone(),
+                            });
+                        }
+                        results.push(ThumbResult::Ready { path, w, h, rgba });
+                    }
+                    None => {
+                        for _ in 0..=owed.thumbs {
+                            results.push(ThumbResult::Failed { path: path.clone() });
+                        }
+                    }
+                }
+            }
             Request::Reprobe(path) => {
                 if have_ffmpeg {
                     reprobe(&path, &root);
@@ -551,18 +703,60 @@ fn worker(
                 continue; // nothing to upload, no result
             }
             Request::Gen(path) => {
-                ensure_thumb_file(&path, &root, have_ffmpeg, &recipe);
-                ThumbResult::GenDone { path }
+                let jpg = ensure_thumb_file(&path, &root, have_ffmpeg, &recipe);
+                let owed = queue.0.lock().unwrap().complete(&path, Art::Thumb);
+                // Visible requests that joined this generation get their
+                // foreground decode now — the file just landed.
+                if owed.thumbs > 0 {
+                    let decoded = jpg
+                        .as_deref()
+                        .and_then(|j| decode_jpeg(j, recipe.thumb_w, recipe.thumb_h));
+                    for _ in 0..owed.thumbs {
+                        results.push(match &decoded {
+                            Some((w, h, rgba)) => ThumbResult::Ready {
+                                path: path.clone(),
+                                w: *w,
+                                h: *h,
+                                rgba: rgba.clone(),
+                            },
+                            None => ThumbResult::Failed { path: path.clone() },
+                        });
+                    }
+                }
+                for _ in 0..owed.gens {
+                    results.push(ThumbResult::GenDone { path: path.clone() });
+                }
+                results.push(ThumbResult::GenDone { path });
             }
-            Request::Anim(path) => match make_anim(&path, &root, have_ffmpeg, &recipe) {
-                Some((w, h, rgba)) => ThumbResult::AnimReady { path, w, h, rgba },
-                None => ThumbResult::AnimFailed { path },
-            },
-        };
-        if tx.send(result).is_err() {
-            return;
+            Request::Anim(path) => {
+                let out = make_anim(&path, &root, have_ffmpeg, &recipe);
+                let owed = queue.0.lock().unwrap().complete(&path, Art::Anim);
+                match out {
+                    Some((w, h, rgba)) => {
+                        for _ in 0..owed.anims {
+                            results.push(ThumbResult::AnimReady {
+                                path: path.clone(),
+                                w,
+                                h,
+                                rgba: rgba.clone(),
+                            });
+                        }
+                        results.push(ThumbResult::AnimReady { path, w, h, rgba });
+                    }
+                    None => {
+                        for _ in 0..=owed.anims {
+                            results.push(ThumbResult::AnimFailed { path: path.clone() });
+                        }
+                    }
+                }
+            }
         }
-        notify(); // nudge the render loop to drain this result
+        for r in results {
+            if tx.send(r).is_err() {
+                return;
+            }
+        }
+        notify(); // nudge the render loop to drain this batch
     }
 }
 
@@ -1255,6 +1449,76 @@ mod tests {
             (20..=45).contains(&frames),
             "expected ~30 paced frames in 1s, got {frames}"
         );
+    }
+
+    /// A visible-thumb request absorbs the gen sweep's queued entry for
+    /// the same artifact (P1.2): one generation runs, at tier 1, and the
+    /// sweep's `GenDone` is owed to the thumb job.
+    #[test]
+    fn visible_request_absorbs_queued_gen() {
+        let mut q = Queues::default();
+        let p = PathBuf::from("clip.mp4");
+        q.push_gen(p.clone());
+        q.push_thumb(p.clone());
+        let Some(Request::Thumb(popped)) = q.pop() else {
+            panic!("expected the (promoted) thumb job first");
+        };
+        assert_eq!(popped, p);
+        assert!(q.pop().is_none(), "the absorbed gen must not run twice");
+        let owed = q.complete(&p, Art::Thumb);
+        assert_eq!((owed.gens, owed.thumbs), (1, 0), "sweep's GenDone owed");
+    }
+
+    /// A visible request arriving while the gen sweep is ALREADY
+    /// generating that artifact joins it (owed foreground decode) instead
+    /// of launching a duplicate ffprobe/ffmpeg run (P1.2).
+    #[test]
+    fn visible_request_joins_inflight_gen() {
+        let mut q = Queues::default();
+        let p = PathBuf::from("clip.mp4");
+        q.push_gen(p.clone());
+        assert!(matches!(q.pop(), Some(Request::Gen(_)))); // worker took it
+        q.push_thumb(p.clone());
+        assert!(q.pop().is_none(), "no duplicate generation queued");
+        let owed = q.complete(&p, Art::Thumb);
+        assert_eq!(
+            (owed.gens, owed.thumbs),
+            (0, 1),
+            "one foreground decode owed; the job's own GenDone covers the sweep"
+        );
+    }
+
+    /// Duplicate gen requests (D-swap re-ingests the same files) coalesce
+    /// to one queued job that owes the extra `GenDone`s — progress
+    /// accounting stays balanced (P1.2).
+    #[test]
+    fn duplicate_gen_requests_coalesce() {
+        let mut q = Queues::default();
+        let p = PathBuf::from("clip.mp4");
+        q.push_gen(p.clone());
+        q.push_gen(p.clone());
+        assert!(matches!(q.pop(), Some(Request::Gen(_))));
+        assert!(q.pop().is_none());
+        assert_eq!(q.complete(&p, Art::Thumb).gens, 1);
+    }
+
+    /// A quickview sheet request promotes the bulk tier's queued entry
+    /// for the same sheet — it moves ABOVE gen instead of duplicating,
+    /// and the bulk request's result is owed (P1.2).
+    #[test]
+    fn quickview_sheet_promotes_queued_bulk_anim() {
+        let mut q = Queues::default();
+        let p = PathBuf::from("sheet.mp4");
+        q.push_anim(p.clone()); // bulk tier (below gen)
+        q.push_gen(PathBuf::from("other.mp4"));
+        q.push_anim_now(p.clone()); // quickview promotes it
+        let Some(Request::Anim(popped)) = q.pop() else {
+            panic!("promoted sheet must outrank the gen sweep");
+        };
+        assert_eq!(popped, p);
+        assert_eq!(q.complete(&p, Art::Anim).anims, 1, "bulk result owed");
+        assert!(matches!(q.pop(), Some(Request::Gen(_))));
+        assert!(q.pop().is_none(), "bulk entry must not run again");
     }
 
     /// Two generations of the same artifact must never share a staging
