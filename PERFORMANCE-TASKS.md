@@ -273,7 +273,25 @@ UI frame.
 
 ### P0.4 — Reap failed live lanes and park offscreen selection playback
 
-**Status:** Ready
+**Status: DONE (2026-07-16).**
+
+- `update_live` reaps selected/hover/warm players reporting `failed()`
+  (thumbnail takes over; hover slot freed) and records the path in
+  `live_retry`; `start_sel_live`/`start_live` skip cooling paths
+  (`LIVE_RETRY_COOLDOWN_S` = 30s time-cooldown — the "transient recovers"
+  option from the open choice).
+- Offscreen parking: when the selection's row leaves the visible range and
+  neither quickview nor fullview is open, `sel_parked` gates the sel-lane
+  `take_frame` — bounded backpressure stalls the decoder (no decode, copy,
+  upload, or mips) while the stream object and timeline survive — and the
+  `animating` live term ignores a parked lane, so the loop can idle.
+  Panning back resumes the same decoder; no respawn. Only trackpad panning
+  hits this (keyboard moves always scroll to the selection).
+
+Tests: `failed_live_lane_is_reaped_with_cooldown` (garbage file; asserts
+reap + cooldown blocks respawn) and
+`offscreen_selection_parks_and_resumes_without_respawn` (real clip; asserts
+no uploads while parked, loop idles, same `spawned` instant on resume).
 
 **Problem**
 

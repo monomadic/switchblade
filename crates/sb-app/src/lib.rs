@@ -23,6 +23,11 @@ use tuning::{TuningFile, alpha};
 
 /// Rows beyond the viewport to prefetch thumbnails for.
 const PREFETCH_ROWS: usize = 2;
+/// After a live decoder reports failure, don't respawn one for that path
+/// for this long — a permanently broken clip must not enter a rapid
+/// spawn-fail loop, while a transient failure (file busy, network mount
+/// blip) still recovers on a later attempt (P0.4).
+const LIVE_RETRY_COOLDOWN_S: f32 = 30.0;
 /// Thumbnail crossfade duration once pixels arrive.
 const THUMB_FADE_S: f32 = 0.3;
 /// Skip flash bar: hold after a `[`/`]` skip, then a quick fade-out.
@@ -167,6 +172,13 @@ pub struct Switchblade {
     /// playing while the parent-dir listing streams in; when it arrives
     /// it becomes the selection again.
     pending_reselect: Option<PathBuf>,
+    /// Paths whose live decoder failed, and when — spawn attempts wait
+    /// out `LIVE_RETRY_COOLDOWN_S` (P0.4).
+    live_retry: HashMap<PathBuf, Instant>,
+    /// The selected stream is parked: its tile is offscreen and no modal
+    /// shows it, so frames aren't drained (bounded backpressure stalls
+    /// the decoder) and `animating` ignores the lane (P0.4).
+    sel_parked: bool,
     /// Set on `[`/`]` — the skip flash bar shows for a moment after.
     skip_flash_at: Option<Instant>,
     /// Clips already queued for meta.json healing this session (old
@@ -420,6 +432,8 @@ impl Switchblade {
             hires_frame: None,
             hires_shown: None,
             pending_reselect: None,
+            live_retry: HashMap::new(),
+            sel_parked: false,
             skip_flash_at: None,
             reprobed: std::collections::HashSet::new(),
             sel_changed_at: Instant::now(),
@@ -1524,6 +1538,38 @@ impl Switchblade {
         // until its path streams back in and the selection re-lands.
         let pending = self.pending_reselect.is_some();
 
+        // Reap failed lanes (P0.4): an unopenable/undecodable stream never
+        // produces frames — left installed it would keep `animating` true
+        // forever and hold its tile hostage. Drop it (the static thumb
+        // takes over) and cool the path down so the settle logic doesn't
+        // respawn a doomed decoder every frame.
+        if self.live_sel.as_ref().is_some_and(|l| l.player.failed()) {
+            let l = self.live_sel.take().unwrap();
+            log::warn!(
+                "live stream failed — falling back to thumbnail: {}",
+                l.path.display()
+            );
+            self.live_retry.insert(l.path, Instant::now());
+        }
+        if self.live_hover.as_ref().is_some_and(|l| l.player.failed()) {
+            let l = self.live_hover.take().unwrap();
+            self.slots[l.slot] = None;
+            if let Some(c) = self.clips.get(l.clip) {
+                log::warn!("hover stream failed: {}", c.path.display());
+                self.live_retry.insert(c.path.clone(), Instant::now());
+            }
+        }
+        let mut i = 0;
+        while i < self.warm.len() {
+            if self.warm[i].player.failed() {
+                let w = self.warm.remove(i);
+                log::debug!("warm decoder failed: {}", w.path.display());
+                self.live_retry.insert(w.path, Instant::now());
+            } else {
+                i += 1;
+            }
+        }
+
         // Pre-warm decoders for the four movement destinations (±1 and
         // ±row) so a selection move shows video instantly instead of
         // paying a cold spawn (open + decode to the thumb frame — no
@@ -1649,7 +1695,20 @@ impl Switchblade {
                 rgba,
             });
         }
-        if let Some(live) = &mut self.live_sel
+        // Park the selected stream while its tile is offscreen and no
+        // modal shows it (P0.4): stop draining and the bounded queue
+        // stalls the decoder — decode, copy, upload and mip generation
+        // all cease — while the stream object and its timeline survive.
+        // Panning back resumes the same decoder; no respawn. (Keyboard
+        // moves always scroll to the selection, so only trackpad panning
+        // gets here.)
+        self.sel_parked = self.live_sel.is_some() && !self.quickview && !self.fullview && {
+            let (first, last) = self.visible_rows(lay, 0);
+            let row = self.selected / lay.cols.max(1);
+            !(first..=last).contains(&row)
+        };
+        if !self.sel_parked
+            && let Some(live) = &mut self.live_sel
             && let Some(rgba) = live.player.take_frame()
         {
             if live.first_frame.is_none() {
@@ -1669,6 +1728,14 @@ impl Switchblade {
                 rgba,
             });
         }
+    }
+
+    /// A live decoder for `path` failed recently — hold off respawning
+    /// (`LIVE_RETRY_COOLDOWN_S`); transient failures recover after it.
+    fn live_cooling(&self, path: &std::path::Path) -> bool {
+        self.live_retry
+            .get(path)
+            .is_some_and(|at| at.elapsed().as_secs_f32() < LIVE_RETRY_COOLDOWN_S)
     }
 
     /// Cache entries written before `Meta.pix_fmt` existed force the
@@ -1693,6 +1760,9 @@ impl Switchblade {
             }
             _ => return None,
         };
+        if self.live_cooling(&path) {
+            return None;
+        }
         let meta = sb_media::cached_meta(&path);
         let (mut sw, mut sh) = meta
             .as_ref()
@@ -1741,6 +1811,9 @@ impl Switchblade {
             }
             _ => return None,
         };
+        if self.live_cooling(&path) {
+            return None;
+        }
         let slot = self.alloc_slot(lay, SlotKind::Live)?;
         // Start where the thumbnail was taken, so video continues from
         // the frame the tile already shows instead of jolting to 0:00.
@@ -2569,7 +2642,9 @@ impl App for Switchblade {
         let motion = self.motion;
         let sheets = self.anim_rendered;
         let transition = self.transition.is_some();
-        let live = self.live_sel.is_some() || self.live_hover.is_some();
+        // A parked selected stream (offscreen, undrained, decoder stalled
+        // on backpressure) needs no frames — don't let it hold the loop.
+        let live = (self.live_sel.is_some() && !self.sel_parked) || self.live_hover.is_some();
         let timer = Instant::now() < self.wake_until;
         frame.animating = motion || sheets || transition || live || timer;
         self.redraw_stats
@@ -2887,6 +2962,183 @@ mod tests {
             l.position() > target + 1.5,
             "chained skip advances from the previous target, position {}",
             l.position()
+        );
+    }
+
+    /// A live lane whose decoder reports `failed()` is reaped — the tile
+    /// falls back to its static thumbnail — and the path enters a retry
+    /// cooldown so the settle logic doesn't respawn a doomed decoder
+    /// every frame (P0.4).
+    #[test]
+    fn failed_live_lane_is_reaped_with_cooldown() {
+        let dir = std::env::temp_dir().join("sb_app_failed_live_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.mp4");
+        std::fs::write(&bad, b"this is not a video file").unwrap();
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal), // live lanes enabled
+            inputs: vec![bad.clone()],
+            demo: false,
+            ..Options::default()
+        });
+        assert!(pump_until(&mut app, |a| a.clips.len() == 1), "ingest");
+
+        // Spawning on garbage succeeds — the failure surfaces async via
+        // `failed()` — so install the lane the way update_live would.
+        let player = sb_media::SeekablePlayer::spawn(&bad, 64, 36, 0.0, None)
+            .expect("spawn returns a handle; open failure is async");
+        app.live_sel = Some(SelLive {
+            clip: 0,
+            path: bad.clone(),
+            player,
+            spawned: Instant::now(),
+            first_frame: None,
+            duration: None,
+        });
+        assert!(
+            pump_until(&mut app, |a| a.live_sel.is_none()),
+            "failed lane never reaped"
+        );
+        assert!(
+            app.live_retry.contains_key(&bad),
+            "failure recorded for cooldown"
+        );
+
+        // Even with a plausible thumbnail (spawn preconditions met), the
+        // cooldown blocks a respawn — no rapid spawn-fail loop.
+        app.clips[0].thumb = Thumb::Ready {
+            slot: 0,
+            at: Instant::now(),
+            tw: 64,
+            th: 36,
+        };
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        for _ in 0..50 {
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(app.live_sel.is_none(), "cooldown must block respawn");
+    }
+
+    /// Panning the selected tile offscreen parks its decoder: frames stop
+    /// draining (bounded backpressure stalls the reader), hires uploads
+    /// stop, `animating` releases the loop — and scrolling back resumes
+    /// the SAME stream, no respawn (P0.4). Needs ffmpeg.
+    #[test]
+    fn offscreen_selection_parks_and_resumes_without_respawn() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_park_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("park.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=8:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip],
+            demo: false,
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+        let spawned0 = app.live_sel.as_ref().unwrap().spawned;
+
+        // Pad the library so row 0 can actually leave the viewport, then
+        // trackpad-pan away (selection unchanged — keyboard moves always
+        // scroll to the selection, so only panning parks).
+        let now = Instant::now();
+        for i in 0..600 {
+            app.clips.push(Clip {
+                path: PathBuf::from(format!("pad/{i}.mp4")),
+                readable: false,
+                cloud: false,
+                spawned: now,
+                scale: 1.0,
+                emph: 0.0,
+                thumb: Thumb::Failed,
+                anim: Thumb::Failed,
+            });
+        }
+        app.scroll = 1e6;
+        app.scroll_target = 1e6;
+        assert!(
+            pump_until(&mut app, |a| a.sel_parked),
+            "offscreen selection never parked"
+        );
+
+        // Parked: the stream survives, nothing uploads…
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        for _ in 0..30 {
+            let f = app.frame(0.016, vp);
+            assert!(f.hires_upload.is_none(), "parked stream must not upload");
+        }
+        assert!(app.live_sel.is_some(), "parked stream must survive");
+        // …and the loop is allowed to go idle despite the live lane.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut idle = false;
+        while Instant::now() < deadline {
+            if !app.frame(0.016, vp).animating {
+                idle = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(idle, "parked live lane kept Frame.animating true");
+
+        // Pan back: the same decoder resumes serving frames.
+        app.scroll = 0.0;
+        app.scroll_target = 0.0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut resumed = false;
+        while Instant::now() < deadline {
+            if app.frame(0.016, vp).hires_upload.is_some() {
+                resumed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(resumed, "no frames after unparking");
+        assert_eq!(
+            app.live_sel.as_ref().unwrap().spawned,
+            spawned0,
+            "resume must reuse the parked decoder, not respawn"
         );
     }
 
