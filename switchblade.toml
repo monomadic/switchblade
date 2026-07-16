@@ -114,8 +114,8 @@ quickview_fade_ms = 150.0
 # (Playback resolution is quickview_max_width/height, under Startup
 # settings below.)
 
-# The seekbar over the quickview video: pointer motion over the video
-# reveals it, seekbar_hide_s of stillness fades it out over
+# The seekbar over the quickview/fullview video: pointer motion over the
+# video reveals it, seekbar_hide_s of stillness fades it out over
 # seekbar_fade_ms. It thickens from seekbar_height to
 # seekbar_hover_height under the pointer (the click/drag target is a
 # taller invisible band either way). Click to seek; hold and drag to
@@ -124,8 +124,8 @@ quickview_fade_ms = 150.0
 # frame at seekbar_thumb_width px wide (0 hides the preview).
 seekbar_hide_s = 1.0
 seekbar_fade_ms = 250.0
-seekbar_height = 4.0
-seekbar_hover_height = 8.0
+seekbar_height = 6.0
+seekbar_hover_height = 12.0
 seekbar_thumb_width = 190.0
 
 # The filmstrip of neighboring clips along the bottom.

@@ -727,12 +727,43 @@ impl Switchblade {
         Some(((vw - w) * 0.5, (avail_h - h) * 0.5 + 6.0, w, h))
     }
 
-    /// Seekbar line geometry: (left x, width, bottom y). The bar hugs the
-    /// video's bottom edge with the same inset as the skip flash bar.
+    /// Letterboxed video rect for fullview — the same fit `build_frame`
+    /// draws, factored out so the seekbar geometry can't drift from it.
+    fn fullview_video_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        if !self.fullview {
+            return None;
+        }
+        let clip = self.clips.get(self.selected)?;
+        let (_, tw, th, _) = self.selected_video_src(clip)?;
+        let (vw, vh) = (self.viewport.width, self.viewport.height);
+        let a = tw / th.max(1.0);
+        let (mut w, mut h) = (vw, vh);
+        if a > vw / vh.max(1.0) {
+            h = w / a;
+        } else {
+            w = h * a;
+        }
+        Some(((vw - w) * 0.5, (vh - h) * 0.5, w, h))
+    }
+
+    /// Video rect for whichever full-bleed mode owns the seekbar. Fullview
+    /// wins — it draws on top of any quickview underneath.
+    fn active_video_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        if self.fullview {
+            self.fullview_video_rect()
+        } else {
+            self.quickview_video_rect()
+        }
+    }
+
+    /// Seekbar line geometry: (left x, width, bottom y). The bar floats
+    /// inset from the video's edges (side padding scales with the frame),
+    /// shared by the quickview modal and fullview.
     fn seekbar_line(&self) -> Option<(f32, f32, f32)> {
-        let (x, y, w, h) = self.quickview_video_rect()?;
-        let pad = 12.0_f32.min(w * 0.06).max(4.0);
-        Some((x + pad, (w - pad * 2.0).max(8.0), y + h - pad))
+        let (x, y, w, h) = self.active_video_rect()?;
+        let pad_x = (w * 0.05).clamp(16.0, 48.0);
+        let pad_y = (h * 0.05).clamp(14.0, 32.0);
+        Some((x + pad_x, (w - pad_x * 2.0).max(8.0), y + h - pad_y))
     }
 
     /// Fraction of the bar under screen-x (unclamped hit — used while
@@ -750,6 +781,86 @@ impl Switchblade {
             && (bot - 18.0..=bot + 10.0).contains(&y)
             && (bx - 6.0..=bx + bw + 6.0).contains(&x))
         .then(|| ((x - bx) / bw).clamp(0.0, 1.0))
+    }
+
+    /// Draws the seekbar (track + fill + hover storyboard) inset from the
+    /// bottom of the video rect `(rx, .., rw, ..)`. Shared by the quickview
+    /// modal and fullview so the two can't drift. The fill tracks the
+    /// decoder's real position — the seek target while one is in flight, so
+    /// scrubbing feels attached to the pointer even mid-decode.
+    fn push_seekbar(&self, tiles: &mut Vec<Tile>, rx: f32, rw: f32, clip: &Clip, bar_a: f32) {
+        let t = &self.tuning;
+        if bar_a <= 0.005 {
+            return;
+        }
+        let (Some(pos), Some((bx, bw, bot))) = (self.seekbar_pos(), self.seekbar_line()) else {
+            return;
+        };
+        let (cx, cy) = self.cursor;
+        let hot = self.scrubbing || self.seekbar_hit(cx, cy).is_some();
+        let bh = if hot {
+            t.seekbar_hover_height
+        } else {
+            t.seekbar_height
+        }
+        .max(2.0);
+        let bar = |x: f32, w: f32, color: [f32; 4]| Tile {
+            x,
+            y: bot - bh,
+            w,
+            h: bh,
+            color,
+            border_color: [0.0; 4],
+            corner_radius: bh * 0.5,
+            border_width: 0.0,
+            uv: [0.0; 4],
+            uv2: [0.0; 4],
+            frame_fade: 0.0,
+            tex_mix: 0.0,
+            hires: false,
+        };
+        // Track: a translucent-white tint (reads as a bright frosted line
+        // over the video, not a grey slab); the fill is solid white.
+        tiles.push(bar(bx, bw, [1.0, 1.0, 1.0, 0.28 * bar_a]));
+        tiles.push(bar(bx, (bw * pos).max(bh), [1.0, 1.0, 1.0, 0.95 * bar_a]));
+        // Storyboard preview (PLAN.md §14 M8 phase 1): the anim sheet is
+        // already g² frames spread across the duration — hovering the bar
+        // shows the cell nearest that timestamp. A denser dedicated strip
+        // lands later if g² is too coarse.
+        let hover_f = if self.scrubbing {
+            self.seekbar_frac(cx)
+        } else {
+            self.seekbar_hit(cx, cy)
+        };
+        if let (Some(f), &Thumb::Ready { slot, tw, th, .. }) = (hover_f, &clip.anim) {
+            let tw_px = t.seekbar_thumb_width;
+            if tw_px >= 8.0 {
+                let g = self.anim_grid.max(1) as usize;
+                let cells = g * g;
+                let k = ((f * cells as f32) as usize).min(cells - 1);
+                let (fw, fh) = (tw as f32 / g as f32, th as f32 / g as f32);
+                let cuv = self
+                    .atlas_cfg
+                    .uv(slot, (k % g) as f32 * fw, (k / g) as f32 * fh, fw, fh);
+                let cw2 = tw_px.min(rw * 0.5);
+                let ch2 = cw2 * fh / fw.max(1.0);
+                tiles.push(Tile {
+                    x: (bx + f * bw - cw2 * 0.5).clamp(rx + 4.0, rx + rw - cw2 - 4.0),
+                    y: bot - bh - ch2 - 10.0,
+                    w: cw2,
+                    h: ch2,
+                    color: [0.02, 0.02, 0.03, bar_a],
+                    border_color: [0.85, 0.85, 0.9, 0.7 * bar_a],
+                    corner_radius: 4.0,
+                    border_width: 1.0,
+                    uv: cuv,
+                    uv2: [0.0; 4],
+                    frame_fade: 0.0,
+                    tex_mix: bar_a,
+                    hires: false,
+                });
+            }
+        }
     }
 
     /// Seek the selected clip's stream to a fraction of its duration.
@@ -1957,97 +2068,12 @@ impl Switchblade {
                     tiles.push(video);
                     // Seekbar along the video's bottom: revealed by pointer
                     // motion (fades after a short idle) or the skip flash;
-                    // thickens under the pointer; click/drag scrubs. The
-                    // fill tracks the decoder's real position — the seek
-                    // target while one is in flight, so scrubbing feels
-                    // attached to the pointer even mid-decode.
+                    // thickens under the pointer; click/drag scrubs.
                     let bar_a = {
                         let flash = skip_bar.map(|(_, a)| a).unwrap_or(0.0);
                         self.seekbar_alpha().max(flash) * fade
                     };
-                    if bar_a > 0.005 {
-                        if let (Some(pos), Some((bx, bw, bot))) =
-                            (self.seekbar_pos(), self.seekbar_line())
-                        {
-                            let (cx, cy) = self.cursor;
-                            let hot = self.scrubbing || self.seekbar_hit(cx, cy).is_some();
-                            let bh = if hot {
-                                t.seekbar_hover_height
-                            } else {
-                                t.seekbar_height
-                            }
-                            .max(2.0);
-                            let bar = |x: f32, w: f32, color: [f32; 4]| Tile {
-                                x,
-                                y: bot - bh,
-                                w,
-                                h: bh,
-                                color,
-                                border_color: [0.0; 4],
-                                corner_radius: bh * 0.5,
-                                border_width: 0.0,
-                                uv: [0.0; 4],
-                                uv2: [0.0; 4],
-                                frame_fade: 0.0,
-                                tex_mix: 0.0,
-                                hires: false,
-                            };
-                            tiles.push(bar(bx, bw, [0.08, 0.08, 0.10, 0.55 * bar_a]));
-                            tiles.push(bar(
-                                bx,
-                                (bw * pos).max(bh),
-                                [0.95, 0.95, 0.98, 0.95 * bar_a],
-                            ));
-                            // Storyboard preview (PLAN.md §14 M8 phase 1):
-                            // the anim sheet is already g² frames spread
-                            // across the duration — hovering the bar shows
-                            // the cell nearest that timestamp. A denser
-                            // dedicated strip lands later if g² is too
-                            // coarse.
-                            let hover_f = if self.scrubbing {
-                                self.seekbar_frac(cx)
-                            } else {
-                                self.seekbar_hit(cx, cy)
-                            };
-                            if let (Some(f), &Thumb::Ready { slot, tw, th, .. }) =
-                                (hover_f, &clip.anim)
-                            {
-                                let tw_px = t.seekbar_thumb_width;
-                                if tw_px >= 8.0 {
-                                    let g = self.anim_grid.max(1) as usize;
-                                    let cells = g * g;
-                                    let k = ((f * cells as f32) as usize).min(cells - 1);
-                                    let (fw, fh) =
-                                        (tw as f32 / g as f32, th as f32 / g as f32);
-                                    let cuv = self.atlas_cfg.uv(
-                                        slot,
-                                        (k % g) as f32 * fw,
-                                        (k / g) as f32 * fh,
-                                        fw,
-                                        fh,
-                                    );
-                                    let cw2 = tw_px.min(rw * 0.5);
-                                    let ch2 = cw2 * fh / fw.max(1.0);
-                                    tiles.push(Tile {
-                                        x: (bx + f * bw - cw2 * 0.5)
-                                            .clamp(rx + 4.0, rx + rw - cw2 - 4.0),
-                                        y: bot - bh - ch2 - 10.0,
-                                        w: cw2,
-                                        h: ch2,
-                                        color: [0.02, 0.02, 0.03, bar_a],
-                                        border_color: [0.85, 0.85, 0.9, 0.7 * bar_a],
-                                        corner_radius: 4.0,
-                                        border_width: 1.0,
-                                        uv: cuv,
-                                        uv2: [0.0; 4],
-                                        frame_fade: 0.0,
-                                        tex_mix: bar_a,
-                                        hires: false,
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    self.push_seekbar(&mut tiles, rx, rw, clip, bar_a);
                 } else {
                     // Nothing decoded yet: big dots in the middle.
                     let stage = full(
@@ -2159,9 +2185,10 @@ impl Switchblade {
 
         // Fullview (internal `fullview` action): the selected clip fills
         // the whole window, letterboxed on an opaque black backdrop — no
-        // filmstrip, seekbar, or blur. Reuses the same hires stream the
-        // tile plays, so it opens instantly with no handoff. Drawn over
-        // everything (including any quickview underneath); Esc/tab exits.
+        // filmstrip or blur, but the same pointer-revealed seekbar as the
+        // quickview modal. Reuses the same hires stream the tile plays, so
+        // it opens instantly with no handoff. Drawn over everything
+        // (including any quickview underneath); Esc/tab exits.
         if self.fullview {
             let (vw, vh) = (self.viewport.width, self.viewport.height);
             let full = |x, y, w, h, color| Tile {
@@ -2182,20 +2209,14 @@ impl Switchblade {
             // Opaque black covers the grid (and any quickview) behind it.
             tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 1.0]));
             if let Some(clip) = self.clips.get(self.selected) {
-                if let Some((uv, tw, th, hires)) = self.selected_video_src(clip) {
-                    // Letterbox: fit the frame's aspect inside the window.
-                    let a = tw / th.max(1.0);
-                    let (mut w, mut h) = (vw, vh);
-                    if a > vw / vh.max(1.0) {
-                        h = w / a;
-                    } else {
-                        w = h * a;
-                    }
+                if let (Some((uv, _, _, hires)), Some((rx, ry, rw, rh))) =
+                    (self.selected_video_src(clip), self.fullview_video_rect())
+                {
                     tiles.push(Tile {
-                        x: (vw - w) * 0.5,
-                        y: (vh - h) * 0.5,
-                        w,
-                        h,
+                        x: rx,
+                        y: ry,
+                        w: rw,
+                        h: rh,
                         color: [0.0, 0.0, 0.0, 1.0],
                         border_color: [0.0; 4],
                         corner_radius: 0.0,
@@ -2206,6 +2227,8 @@ impl Switchblade {
                         tex_mix: 1.0,
                         hires,
                     });
+                    let bar_a = self.seekbar_alpha().max(skip_bar.map(|(_, a)| a).unwrap_or(0.0));
+                    self.push_seekbar(&mut tiles, rx, rw, clip, bar_a);
                 } else {
                     // Nothing decoded yet: loading dots on the black stage.
                     let stage = full((vw - 300.0) * 0.5, (vh - 100.0) * 0.5, 300.0, 100.0, [0.0; 4]);
@@ -2324,12 +2347,11 @@ impl App for Switchblade {
                     if let Some(f) = self.seekbar_frac(x) {
                         self.scrub_seek(f, false);
                     }
-                } else if self.quickview
-                    && self
-                        .quickview_video_rect()
-                        .is_some_and(|(vx, vy, vw, vh)| {
-                            (vx..=vx + vw).contains(&x) && (vy..=vy + vh + 12.0).contains(&y)
-                        })
+                } else if self
+                    .active_video_rect()
+                    .is_some_and(|(vx, vy, vw, vh)| {
+                        (vx..=vx + vw).contains(&x) && (vy..=vy + vh + 12.0).contains(&y)
+                    })
                 {
                     self.seekbar_seen = Some(Instant::now());
                     // Stay awake through the idle-hide and the fade tail.
@@ -2342,9 +2364,16 @@ impl App for Switchblade {
                 self.focused = focused;
             }
             InputEvent::MouseDown { x, y } => {
-                // In fullview a click exits — the grid it would select is
-                // hidden behind the black backdrop.
+                // In fullview the seekbar grabs first (click = seek, hold =
+                // scrub); any other click exits — the grid it would select
+                // is hidden behind the black backdrop.
                 if self.fullview {
+                    if let Some(f) = self.seekbar_hit(x, y) {
+                        self.scrubbing = true;
+                        self.seekbar_seen = Some(Instant::now());
+                        self.scrub_seek(f, false);
+                        return;
+                    }
                     self.fullview = false;
                     return;
                 }

@@ -144,8 +144,9 @@ pub struct Tuning {
     /// they draw above their neighbors, like the grid).
     pub strip_selection_scale: f32,
     pub strip_hover_scale: f32,
-    /// Quickview seekbar: pointer motion over the video reveals it; after
-    /// this many seconds without motion it fades out over seekbar_fade_ms.
+    /// Quickview/fullview seekbar: pointer motion over the video reveals
+    /// it; after this many seconds without motion it fades over
+    /// seekbar_fade_ms.
     pub seekbar_hide_s: f32,
     pub seekbar_fade_ms: f32,
     /// Bar thickness at rest and when the pointer is on it (click target
@@ -232,8 +233,8 @@ impl Default for Tuning {
             strip_hover_scale: 1.15,
             seekbar_hide_s: 1.0,
             seekbar_fade_ms: 250.0,
-            seekbar_height: 4.0,
-            seekbar_hover_height: 8.0,
+            seekbar_height: 6.0,
+            seekbar_hover_height: 12.0,
             seekbar_thumb_width: 190.0,
             strip_scroll_sensitivity: 1.0,
             quickview_dim: 0.90,
