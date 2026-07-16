@@ -128,6 +128,12 @@ struct Clip {
     /// iCloud placeholder — shown with a cloud badge, never read (reading
     /// would trigger a download).
     cloud: bool,
+    /// The clip's thumbnail is known to be in the disk cache — set when
+    /// its gen-sweep job completes or any artifact delivers. jump_random
+    /// and shuffle_library restrict themselves to cached clips so a jump
+    /// into unswept territory can't detonate a screenful of on-demand
+    /// ffmpeg work.
+    cached: bool,
     spawned: Instant,
     scale: f32,
     /// 0..1 emphasis spring: morphs the tile between its grid shape and
@@ -532,6 +538,7 @@ impl Switchblade {
                     path: PathBuf::from(format!("demo/clip_{i:04}.mp4")),
                     readable: true,
                     cloud: false,
+                    cached: true, // fake tiles cost nothing to land on
                     // Staggered spawn cascades the fade-in across the field.
                     spawned: now + Duration::from_millis(i as u64 * 2),
                     scale: 1.0,
@@ -669,23 +676,25 @@ impl Switchblade {
         self.wake(0.6);
     }
 
-    /// `jump_random`: select a uniformly random clip other than the
-    /// current one.
+    /// `jump_random`: select a uniformly random other clip — but only
+    /// among clips whose thumbnail is already in the disk cache, so a
+    /// jump into unswept territory can't queue a screenful of on-demand
+    /// ffmpeg work (the gen sweep widens the candidate pool as it runs).
     fn jump_random(&mut self) {
-        let n = self.clips.len();
-        if n < 2 {
+        let candidates: Vec<usize> = (0..self.clips.len())
+            .filter(|&i| i != self.selected && self.clips[i].cached)
+            .collect();
+        if candidates.is_empty() {
+            log::info!("jump_random: no cached clips to jump to yet");
             return;
         }
         let mut s = rng_seed();
-        // Draw from n-1 and step over the selection.
-        let mut idx = (next_rand(&mut s) % (n as u64 - 1)) as usize;
-        if idx >= self.selected {
-            idx += 1;
-        }
+        let idx = candidates[(next_rand(&mut s) % candidates.len() as u64) as usize];
         self.select_index(idx);
     }
 
-    /// `shuffle_library`: Fisher–Yates the grid in place. All per-clip
+    /// `shuffle_library`: Fisher–Yates the cached clips to the front of
+    /// the grid (uncached ones keep their order after them). All per-clip
     /// state rides inside `Clip` and moves with it; everything keyed by
     /// clip *index* — the path→index map, atlas slot owners, the live/
     /// warm/hover lanes, the selection — is remapped through the
@@ -697,12 +706,23 @@ impl Switchblade {
         if n < 2 {
             return;
         }
-        let mut s = rng_seed();
-        let mut order: Vec<usize> = (0..n).collect(); // order[new] = old
-        for i in (1..n).rev() {
-            let j = (next_rand(&mut s) % (i as u64 + 1)) as usize;
-            order.swap(i, j);
+        // Only cached clips shuffle; they move to the FRONT of the
+        // library and the unswept remainder follows in its original
+        // order. Shuffling uncached clips onto the visible screen would
+        // queue a top-priority gen job per tile — the cached-first
+        // partition keeps the viewport serving from disk.
+        let mut cached: Vec<usize> = (0..n).filter(|&i| self.clips[i].cached).collect();
+        if cached.len() < 2 {
+            log::info!("shuffle_library: fewer than two cached clips — nothing to shuffle");
+            return;
         }
+        let mut s = rng_seed();
+        for i in (1..cached.len()).rev() {
+            let j = (next_rand(&mut s) % (i as u64 + 1)) as usize;
+            cached.swap(i, j);
+        }
+        let mut order = cached; // order[new] = old
+        order.extend((0..n).filter(|&i| !self.clips[i].cached));
         let mut new_of_old = vec![0usize; n];
         for (new, &old) in order.iter().enumerate() {
             new_of_old[old] = new;
@@ -1290,6 +1310,9 @@ impl Switchblade {
                         path: item.path,
                         readable: item.readable,
                         cloud: item.cloud,
+                        // Unknown until its gen-sweep job reports back (a
+                        // cache hit completes near-instantly).
+                        cached: false,
                         spawned: Instant::now(),
                         scale: 1.0,
                         emph: 0.0,
@@ -1599,6 +1622,9 @@ impl Switchblade {
                     let Some(&i) = self.index.get(&path) else {
                         continue;
                     };
+                    // Decoded pixels arrived, so the artifact is on disk —
+                    // cached even if the atlas drops it below.
+                    self.clips[i].cached = true;
                     let Some(slot) = self.alloc_slot(lay, SlotKind::Static) else {
                         // Atlas momentarily full: drop the pixels but stay
                         // retryable — the disk cache makes the redo cheap.
@@ -1648,9 +1674,14 @@ impl Switchblade {
                         self.clips[i].anim = Thumb::Failed;
                     }
                 }
-                ThumbResult::GenDone { .. } => {
+                ThumbResult::GenDone { path } => {
                     // Counted once at the top of the loop like every other
                     // result — a second increment here overran jobs_total.
+                    // The sweep just proved (or wrote) this clip's cache
+                    // entry: it becomes fair game for jump/shuffle.
+                    if let Some(&i) = self.index.get(&path) {
+                        self.clips[i].cached = true;
+                    }
                 }
             }
         }
@@ -3388,6 +3419,7 @@ mod tests {
                 path: PathBuf::from(format!("pad/{i}.mp4")),
                 readable: false,
                 cloud: false,
+                cached: false,
                 spawned: now,
                 scale: 1.0,
                 emph: 0.0,
@@ -3624,12 +3656,26 @@ mod tests {
             th: 36,
         };
         app.slots[0] = Some((3, SlotKind::Static));
+        // A few unswept clips: they must sink to the tail, in order.
+        let uncached: Vec<PathBuf> = [7usize, 11, 40]
+            .iter()
+            .map(|&i| {
+                app.clips[i].cached = false;
+                app.clips[i].path.clone()
+            })
+            .collect();
 
         app.shuffle_library();
 
         assert_eq!(
             app.clips[app.selected].path, sel_path,
             "selection follows its clip"
+        );
+        let n = app.clips.len();
+        let tail: Vec<PathBuf> = app.clips[n - 3..].iter().map(|c| c.path.clone()).collect();
+        assert_eq!(
+            tail, uncached,
+            "uncached clips end up last, original order preserved"
         );
         for (i, c) in app.clips.iter().enumerate() {
             assert_eq!(
@@ -3681,9 +3727,10 @@ mod tests {
         assert_eq!(app.selected, 0, "wraps to the first clip");
     }
 
-    /// `jump_random` always lands somewhere else (given >1 clip).
+    /// `jump_random` always lands somewhere else, and only ever on a clip
+    /// whose thumbnail is already cached (no on-demand gen explosions).
     #[test]
-    fn jump_random_never_lands_on_the_selection() {
+    fn jump_random_lands_only_on_cached_clips() {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
@@ -3694,5 +3741,26 @@ mod tests {
             app.jump_random();
             assert_ne!(app.selected, before, "random jump moved the selection");
         }
+        // Only two cached clips: every jump lands on one of them.
+        for c in &mut app.clips {
+            c.cached = false;
+        }
+        app.clips[10].cached = true;
+        app.clips[20].cached = true;
+        for _ in 0..20 {
+            app.jump_random();
+            assert!(
+                [10, 20].contains(&app.selected),
+                "jump landed on an uncached clip: {}",
+                app.selected
+            );
+        }
+        // No cached candidates at all: the jump is a no-op.
+        for c in &mut app.clips {
+            c.cached = false;
+        }
+        let before = app.selected;
+        app.jump_random();
+        assert_eq!(app.selected, before, "nothing cached: selection holds");
     }
 }
