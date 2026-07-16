@@ -225,7 +225,22 @@ Separate three concepts:
 
 ### P0.3 — Bound ingest queues and per-frame drains
 
-**Status:** Ready
+**Status: DONE (2026-07-16).**
+
+- All three ingest sources use `mpsc::sync_channel(1024)` — a full channel
+  parks the reader thread (stdin stays sacred: backpressure lands on the
+  producer, never the UI).
+- `drain_ingest` takes at most `INGEST_DRAIN_BUDGET` (256) items per frame;
+  `drain_media` accepts at most `MEDIA_UPLOAD_BUDGET` (64) texture uploads
+  per frame (pixel-free results don't count). Hitting either budget fires
+  the P0.2 waker, so the backlog continues next frame with no idle gap.
+- Order, `pending_reselect`, and disconnect handling unchanged
+  (`open_parent_swaps_to_siblings_and_reselects` still green).
+
+Test: `ingest_drains_with_a_per_frame_budget` (1000-item prefilled backlog:
+first frame takes exactly the budget, the rest lands over later frames, in
+order). Live: 5000 paths flooded over stdin ingest fully within ~1s of
+budgeted frames, then the loop idles at the 10Hz tick.
 
 **Problem**
 

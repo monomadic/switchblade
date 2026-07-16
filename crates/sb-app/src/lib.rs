@@ -28,6 +28,14 @@ const PREFETCH_ROWS: usize = 2;
 /// spawn-fail loop, while a transient failure (file busy, network mount
 /// blip) still recovers on a later attempt (P0.4).
 const LIVE_RETRY_COOLDOWN_S: f32 = 30.0;
+/// Ingest items accepted per frame (P0.3): a fast directory walk must
+/// not stall one frame appending thousands of clips — the backlog
+/// catches up over the next frames (the waker schedules them).
+const INGEST_DRAIN_BUDGET: usize = 256;
+/// Texture uploads accepted from media results per frame (P0.3): a
+/// warm-cache burst must not issue hundreds of texture writes in one
+/// frame. Results without pixels (Failed/GenDone) don't count.
+const MEDIA_UPLOAD_BUDGET: usize = 64;
 /// Thumbnail crossfade duration once pixels arrive.
 const THUMB_FADE_S: f32 = 0.3;
 /// Skip flash bar: hold after a `[`/`]` skip, then a quick fade-out.
@@ -1070,6 +1078,12 @@ impl Switchblade {
         let mut reselect: Option<usize> = None;
         let first_new = self.clips.len();
         loop {
+            // Per-frame budget (P0.3): leave the rest for the next frame
+            // — which the wake guarantees — instead of stalling this one.
+            if self.clips.len() - first_new >= INGEST_DRAIN_BUDGET {
+                self.waker.wake();
+                break;
+            }
             match rx.try_recv() {
                 Ok(item) => {
                     if self.pending_reselect.as_deref() == Some(item.path.as_path()) {
@@ -1386,7 +1400,10 @@ impl Switchblade {
     fn drain_media(&mut self, lay: &Layout) -> Vec<ThumbUpload> {
         let mut uploads = Vec::new();
         let was_pending = self.jobs_total > self.jobs_done;
-        while let Some(result) = self.media.try_recv() {
+        while uploads.len() < MEDIA_UPLOAD_BUDGET {
+            let Some(result) = self.media.try_recv() else {
+                break;
+            };
             self.jobs_done += 1;
             // Visual results (a tile crossfades in) keep the loop hot for
             // the fade; GenDone is disk-cache-only — the waker-driven
@@ -1455,6 +1472,11 @@ impl Switchblade {
                     // result — a second increment here overran jobs_total.
                 }
             }
+        }
+        // Budget hit — more results are likely waiting; take them next
+        // frame (P0.3).
+        if uploads.len() >= MEDIA_UPLOAD_BUDGET {
+            self.waker.wake();
         }
         // Batch just completed: the progress bar lingers, then fades over
         // 0.7s (build_frame) — keep the loop hot through it, once, on the
@@ -2962,6 +2984,49 @@ mod tests {
             l.position() > target + 1.5,
             "chained skip advances from the previous target, position {}",
             l.position()
+        );
+    }
+
+    /// A pre-filled ingest backlog drains under the per-frame budget —
+    /// no single frame stalls appending thousands of clips — while the
+    /// full set still lands, in source order, over later frames (P0.3).
+    #[test]
+    fn ingest_drains_with_a_per_frame_budget() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            ..Options::default()
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..1000 {
+            tx.send(ingest::Ingested {
+                path: PathBuf::from(format!("bulk/{i:04}.mp4")),
+                readable: false, // no media jobs in this test
+                cloud: false,
+            })
+            .unwrap();
+        }
+        app.rx = Some(rx);
+        let before = app.clips.len();
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let _ = app.frame(0.016, vp);
+        assert_eq!(
+            app.clips.len() - before,
+            INGEST_DRAIN_BUDGET,
+            "one frame takes exactly the budget, deferring the rest"
+        );
+        for _ in 0..10 {
+            let _ = app.frame(0.016, vp);
+        }
+        assert_eq!(app.clips.len() - before, 1000, "backlog fully lands");
+        assert!(
+            app.clips[before..].iter().enumerate().all(|(i, c)| {
+                c.path.as_path() == std::path::Path::new(&format!("bulk/{i:04}.mp4"))
+            }),
+            "streamed order preserved across budget boundaries"
         );
     }
 

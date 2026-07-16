@@ -1,7 +1,13 @@
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SendError, Sender};
+use std::sync::mpsc::{self, Receiver, SendError, SyncSender};
 use std::thread;
+
+/// Ingest channels are bounded (P0.3): a fast directory walk during GPU
+/// init used to queue every entry in memory at once. A full channel now
+/// parks the *reader thread* — never the UI, which drains with a
+/// per-frame budget and catches up frame by frame.
+const CHANNEL_CAP: usize = 1024;
 
 /// Extensions we treat as video. Anything else piped/passed in is
 /// silently skipped — unsupported files never become tiles.
@@ -34,7 +40,7 @@ pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// Channel to the app plus the render-loop nudge, so no send site can
 /// forget the wake.
 struct Tx {
-    tx: Sender<Ingested>,
+    tx: SyncSender<Ingested>,
     notify: Notify,
 }
 
@@ -54,7 +60,7 @@ pub fn spawn_stdin_reader(recurse: bool, notify: Notify) -> Option<Receiver<Inge
     if io::stdin().is_terminal() {
         return None;
     }
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
     let tx = Tx { tx, notify };
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
@@ -92,7 +98,7 @@ pub fn spawn_stdin_reader(recurse: bool, notify: Notify) -> Option<Receiver<Inge
 /// CLI-argument source: same semantics as stdin, but from `argv`. Takes
 /// priority over stdin when both are present.
 pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool, notify: Notify) -> Receiver<Ingested> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
     let tx = Tx { tx, notify };
     thread::spawn(move || {
         for p in paths {
@@ -109,7 +115,7 @@ pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool, notify: Notify) -> 
 /// dir" (siblings) view. Streams like every other source; iCloud stubs
 /// in the directory still resolve to placeholders.
 pub fn spawn_dir_reader(dir: PathBuf, notify: Notify) -> Receiver<Ingested> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
     let tx = Tx { tx, notify };
     thread::spawn(move || {
         let _ = walk_dir(&tx, &dir, 0, 0);
