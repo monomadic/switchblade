@@ -304,7 +304,30 @@ struct Pump<'a> {
     anchor: Option<(Instant, f64)>,
 }
 
+/// libav's default log callback prints straight to the process's stderr,
+/// and this in-process reader is the only lane that runs it — so its
+/// chatter bypasses the `Stdio::null()` the CLI lanes use. The loudest of
+/// it is the benign swscale note "No accelerated colorspace conversion
+/// found from yuv420p to rgba": the software `format=rgba` chain has no
+/// SIMD path for that pair, so swscale falls back to a C converter and
+/// says so once per slice-thread context. It is not an error; the reader
+/// already surfaces real failures via `failed` + `log::warn`. Clamp libav
+/// to ERROR by default, but honor `RUST_LOG=debug` for decode diagnosis.
+fn quiet_libav_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let level = if log::log_enabled!(log::Level::Debug) {
+            ffi::AV_LOG_WARNING
+        } else {
+            ffi::AV_LOG_ERROR
+        };
+        unsafe { ffi::av_log_set_level(level as i32) };
+    });
+}
+
 unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
+    quiet_libav_once();
     unsafe {
         let mut fmt_raw: *mut ffi::AVFormatContext = ptr::null_mut();
         if ffi::avformat_open_input(&mut fmt_raw, cfg.cpath.as_ptr(), ptr::null(), ptr::null_mut())
