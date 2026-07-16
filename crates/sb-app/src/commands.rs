@@ -65,6 +65,13 @@ pub enum Action {
     },
     /// Re-ingest from the selected clip's parent directory (siblings view).
     OpenParent,
+    /// Select a uniformly random other clip in the library.
+    JumpRandom,
+    /// Shuffle the whole grid in place (Fisher–Yates over the clip order).
+    ShuffleLibrary,
+    /// Auto-advance: once the selected clip has played `skip_timer_s`,
+    /// selection moves to the next clip (wraps at the end).
+    ToggleSkipTimer,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +101,9 @@ impl Default for KeyMap {
             ("[", "skip_back"),
             ("]", "skip_forward"),
             ("D", "open_parent"),
+            ("x", "jump_random"),
+            ("s", "shuffle_library"),
+            ("t", "toggle_skip_timer"),
         ] {
             keys.insert(k.to_string(), v.to_string());
         }
@@ -197,6 +207,9 @@ fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
             amount,
         },
         "open_parent" | "browse_parent" => Action::OpenParent,
+        "jump_random" | "jump_to_random" => Action::JumpRandom,
+        "shuffle_library" | "shuffle" => Action::ShuffleLibrary,
+        "toggle_skip_timer" | "skip_timer" => Action::ToggleSkipTimer,
         other => {
             log::warn!(
                 "unknown command '{other}': no [commands.{other}] entry and not a built-in action"
@@ -310,7 +323,7 @@ mod tests {
             map.action_for(&Key::Enter),
             Some(Action::Spawn { ref program, .. }) if program == "mpv"
         ));
-        assert!(map.action_for(&Key::Char('x')).is_none());
+        assert!(map.action_for(&Key::Char('y')).is_none());
         assert!(map.action_for(&Key::Left).is_none());
     }
 
@@ -334,6 +347,32 @@ mod tests {
         assert!(matches!(
             map.action_for(&Key::Char('D')),
             Some(Action::OpenParent)
+        ));
+    }
+
+    #[test]
+    fn random_shuffle_and_skip_timer_defaults_resolve() {
+        let map = KeyMap::default();
+        assert!(matches!(
+            map.action_for(&Key::Char('x')),
+            Some(Action::JumpRandom)
+        ));
+        assert!(matches!(
+            map.action_for(&Key::Char('s')),
+            Some(Action::ShuffleLibrary)
+        ));
+        assert!(matches!(
+            map.action_for(&Key::Char('t')),
+            Some(Action::ToggleSkipTimer)
+        ));
+        // The alias spellings resolve too.
+        assert!(matches!(
+            internal_action("jump_to_random", None),
+            Some(Action::JumpRandom)
+        ));
+        assert!(matches!(
+            internal_action("shuffle", None),
+            Some(Action::ShuffleLibrary)
         ));
     }
 

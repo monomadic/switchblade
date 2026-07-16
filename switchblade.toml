@@ -89,6 +89,12 @@ live_delay_ms = 100.0
 # the ends). A binding can override the amount per key — see [keys] below.
 skip_fraction = 0.10
 
+# Skip timer ('t' toggles): once the selected clip has PLAYED this many
+# seconds, selection auto-advances to the next clip (wraps at the end) —
+# a hands-free slideshow. The countdown starts when video actually
+# appears, so decoder spin-up doesn't eat watch time.
+skip_timer_s = 5.0
+
 # Pause live playback + sheet animation while the window is unfocused
 # (the grid stays visible, just still — big CPU saver). Toggle at
 # runtime with 'p'.
@@ -242,6 +248,9 @@ r = "reveal"             # reveal in Finder (open -R)
 "[" = "skip_back"        # jump by skip_fraction; wraps at the ends
 "]" = "skip_forward"
 D = "open_parent"        # re-ingest from the selected clip's parent dir
+x = "jump_random"        # select a random clip ("jump_to_random" also works)
+s = "shuffle_library"    # shuffle the whole grid in place ("shuffle" also works)
+t = "toggle_skip_timer"  # auto-advance every skip_timer_s of playback
 # n = "rename_script"    # any key -> any launched program; example below
 # "{" = "skip_back_big"  # a skip with its own amount; see below
 

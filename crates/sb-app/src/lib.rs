@@ -41,6 +41,11 @@ const THUMB_FADE_S: f32 = 0.3;
 /// Skip flash bar: hold after a `[`/`]` skip, then a quick fade-out.
 const SKIP_BAR_HOLD_S: f32 = 1.0;
 const SKIP_BAR_FADE_S: f32 = 0.25;
+/// Skip-timer stall guard: when a live stream is expected but hasn't
+/// delivered a first frame (cold spawn, failed decode, cloud placeholder),
+/// the timer still advances after `skip_timer_s` plus this grace — a
+/// slideshow must never freeze on one bad clip.
+const SKIP_TIMER_SPAWN_GRACE_S: f32 = 3.0;
 
 const DEMO_TILES: usize = 480;
 
@@ -189,6 +194,10 @@ pub struct Switchblade {
     sel_parked: bool,
     /// Set on `[`/`]` — the skip flash bar shows for a moment after.
     skip_flash_at: Option<Instant>,
+    /// Skip timer (`toggle_skip_timer`): when armed, holds the arming
+    /// instant so a clip already mid-play gets a full countdown from the
+    /// toggle, not an instant advance. None = off.
+    skip_timer_since: Option<Instant>,
     /// Clips already queued for meta.json healing this session (old
     /// cache entries lack pix_fmt, so live spawns fall back to the
     /// software chain until a background reprobe rewrites them — see
@@ -458,6 +467,7 @@ impl Switchblade {
             live_retry: HashMap::new(),
             sel_parked: false,
             skip_flash_at: None,
+            skip_timer_since: None,
             reprobed: std::collections::HashSet::new(),
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
@@ -636,6 +646,145 @@ impl Switchblade {
         self.chase = self.tuning.key_snap_strength;
     }
 
+    /// Move the selection to an arbitrary index (random jump, skip-timer
+    /// advance) — the same bookkeeping as `move_selection`, plus a
+    /// filmstrip snap on far jumps: sliding the strip across half the
+    /// library reads as a smear, single steps still glide.
+    fn select_index(&mut self, idx: usize) {
+        if idx >= self.clips.len() {
+            return;
+        }
+        if idx != self.selected {
+            self.selected = idx;
+            self.sel_changed_at = Instant::now();
+            self.pending_reselect = None;
+        }
+        self.scroll_to_selected();
+        if self.quickview && (idx as f32 - self.strip_pos).abs() > 4.0 {
+            self.strip_pos = idx as f32;
+            self.strip_target = self.strip_pos;
+        }
+        // Not always an input event (the skip timer calls this): keep the
+        // loop awake through the settle timers, like event() does.
+        self.wake(0.6);
+    }
+
+    /// `jump_random`: select a uniformly random clip other than the
+    /// current one.
+    fn jump_random(&mut self) {
+        let n = self.clips.len();
+        if n < 2 {
+            return;
+        }
+        let mut s = rng_seed();
+        // Draw from n-1 and step over the selection.
+        let mut idx = (next_rand(&mut s) % (n as u64 - 1)) as usize;
+        if idx >= self.selected {
+            idx += 1;
+        }
+        self.select_index(idx);
+    }
+
+    /// `shuffle_library`: Fisher–Yates the grid in place. All per-clip
+    /// state rides inside `Clip` and moves with it; everything keyed by
+    /// clip *index* — the path→index map, atlas slot owners, the live/
+    /// warm/hover lanes, the selection — is remapped through the
+    /// permutation, so the selected clip keeps playing and lands
+    /// somewhere new. Hover clears (the pointer is over a different clip
+    /// now); mid-ingest arrivals simply append after the shuffled block.
+    fn shuffle_library(&mut self) {
+        let n = self.clips.len();
+        if n < 2 {
+            return;
+        }
+        let mut s = rng_seed();
+        let mut order: Vec<usize> = (0..n).collect(); // order[new] = old
+        for i in (1..n).rev() {
+            let j = (next_rand(&mut s) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        let mut new_of_old = vec![0usize; n];
+        for (new, &old) in order.iter().enumerate() {
+            new_of_old[old] = new;
+        }
+        let mut old: Vec<Option<Clip>> = self.clips.drain(..).map(Some).collect();
+        self.clips = order.iter().map(|&o| old[o].take().unwrap()).collect();
+        let remap = |i: &mut usize| {
+            if let Some(&ni) = new_of_old.get(*i) {
+                *i = ni;
+            }
+        };
+        self.index.values_mut().for_each(remap);
+        for slot in self.slots.iter_mut().flatten() {
+            remap(&mut slot.0);
+        }
+        if let Some(l) = &mut self.live_sel {
+            remap(&mut l.clip);
+        }
+        if let Some(h) = &mut self.live_hover {
+            remap(&mut h.clip);
+        }
+        for w in &mut self.warm {
+            remap(&mut w.clip);
+        }
+        remap(&mut self.selected);
+        self.hovered = None;
+        self.strip_hover = None;
+        if self.quickview {
+            self.strip_pos = self.selected as f32;
+            self.strip_target = self.strip_pos;
+        }
+        // Crossfade the old arrangement out, like the zoom reflow / D swap.
+        if !self.last_tiles.is_empty() {
+            self.transition = Some((std::mem::take(&mut self.last_tiles), Instant::now()));
+        }
+        self.scroll_to_selected();
+        self.wake(1.0);
+    }
+
+    /// Skip timer: with the timer armed, advance to the next clip
+    /// (wrapping) once the current one has played `skip_timer_s`. "Played"
+    /// means live frames on screen — the countdown starts at first frame,
+    /// not at selection, so cold-spawn latency doesn't eat watch time. At
+    /// levels without live video it counts from the selection change; a
+    /// stream that never delivers gets `SKIP_TIMER_SPAWN_GRACE_S` before
+    /// the slideshow moves on anyway.
+    fn tick_skip_timer(&mut self) {
+        let Some(since) = self.skip_timer_since else {
+            return;
+        };
+        // Paused, parked (user scrolled away), scrubbing, or mid-swap:
+        // hold the countdown rather than yank the view around.
+        if self.clips.is_empty()
+            || self.paused()
+            || self.sel_parked
+            || self.scrubbing
+            || self.pending_reselect.is_some()
+        {
+            return;
+        }
+        let limit = Duration::from_secs_f32(self.tuning.skip_timer_s.max(0.05));
+        let first_frame = self
+            .live_sel
+            .as_ref()
+            .filter(|l| l.clip == self.selected)
+            .and_then(|l| l.first_frame);
+        let due = match first_frame {
+            Some(ff) => ff.max(since).elapsed() >= limit,
+            None if !self.level().live() => self.sel_changed_at.max(since).elapsed() >= limit,
+            None => {
+                self.sel_changed_at.max(since).elapsed()
+                    >= limit + Duration::from_secs_f32(SKIP_TIMER_SPAWN_GRACE_S)
+            }
+        };
+        if due {
+            let next = (self.selected + 1) % self.clips.len();
+            if next != self.selected {
+                self.select_index(next);
+            }
+        }
+    }
+
     // --- input ---
 
     fn key(&mut self, key: Key) {
@@ -691,6 +840,23 @@ impl Switchblade {
             Action::Fullview => self.fullview = !self.fullview,
             Action::Skip { forward, amount } => self.skip(forward, amount),
             Action::OpenParent => self.open_parent(),
+            Action::JumpRandom => self.jump_random(),
+            Action::ShuffleLibrary => self.shuffle_library(),
+            Action::ToggleSkipTimer => {
+                self.skip_timer_since = match self.skip_timer_since {
+                    Some(_) => None,
+                    None => Some(Instant::now()),
+                };
+                log::info!(
+                    "skip timer {} ({}s per clip)",
+                    if self.skip_timer_since.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    self.tuning.skip_timer_s
+                );
+            }
             Action::CopyPath => {
                 if let Some(clip) = self.clips.get(self.selected) {
                     commands::copy_path(&clip.path);
@@ -2508,7 +2674,7 @@ impl Switchblade {
                     tex_mix: 0.0,
                     hires: false,
                 };
-                tiles.push(bar(bx, bw, 0.06)); // track
+                tiles.push(bar(bx, bw, 0.03)); // track
                 tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
             }
         }
@@ -2664,6 +2830,7 @@ impl App for Switchblade {
             self.keymap = cfg.keymap;
         }
         self.drain_ingest();
+        self.tick_skip_timer();
         self.step(dt);
         let lay = self.layout();
         self.request_visible_thumbs(&lay);
@@ -2826,6 +2993,24 @@ fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: b
             hires: false,
         });
     }
+}
+
+/// Cheap non-crypto randomness (jump_random / shuffle_library) with no new
+/// dependency: std's HashMap hasher is seeded from system entropy per
+/// instance, so one finish() makes a seed; xorshift stretches it.
+fn rng_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+        | 1 // xorshift must never see zero
+}
+
+fn next_rand(s: &mut u64) -> u64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s
 }
 
 #[cfg(test)]
@@ -3412,5 +3597,102 @@ mod tests {
         assert_eq!(app.selected, 2, "the strip clamps at the ends");
         // Grid pan must not have moved under the modal.
         assert_eq!(app.scroll_target, 0.0, "the backdrop grid never pans");
+    }
+
+    /// Shuffle reorders the clip vector and remaps EVERY index-keyed
+    /// reference through the permutation: the path→index map, atlas slot
+    /// owners, and the selection (which must stay on the same clip).
+    #[test]
+    fn shuffle_remaps_every_index_keyed_reference() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            ..Options::default()
+        });
+        // Demo mode skips the index map (no media routing); build it the
+        // way real ingest does so the remap invariant is checkable.
+        for (i, c) in app.clips.iter().enumerate() {
+            app.index.insert(c.path.clone(), i);
+        }
+        app.selected = 5;
+        let sel_path = app.clips[5].path.clone();
+        // A resident thumb: clip 3 owns slot 0.
+        app.clips[3].thumb = Thumb::Ready {
+            slot: 0,
+            at: Instant::now(),
+            tw: 64,
+            th: 36,
+        };
+        app.slots[0] = Some((3, SlotKind::Static));
+
+        app.shuffle_library();
+
+        assert_eq!(
+            app.clips[app.selected].path, sel_path,
+            "selection follows its clip"
+        );
+        for (i, c) in app.clips.iter().enumerate() {
+            assert_eq!(
+                app.index.get(&c.path),
+                Some(&i),
+                "path→index stays consistent after the permutation"
+            );
+        }
+        let (owner, _) = app.slots[0].expect("slot survives the shuffle");
+        assert!(
+            matches!(app.clips[owner].thumb, Thumb::Ready { slot: 0, .. }),
+            "the slot's owner pointer moved with its clip"
+        );
+    }
+
+    /// The skip timer advances the selection once the current clip's time
+    /// is up, wraps at the end of the library, and holds while off.
+    #[test]
+    fn skip_timer_advances_and_wraps() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None), // no live: counts from selection
+            demo: true,
+            ..Options::default()
+        });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let expired = Instant::now() - Duration::from_secs(60);
+        app.tuning.skip_timer_s = 5.0;
+
+        // Off: an expired countdown does nothing.
+        app.sel_changed_at = expired;
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.selected, 0, "timer off: selection holds");
+
+        // On: it advances…
+        app.skip_timer_since = Some(expired);
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.selected, 1, "timer on: selection advances");
+        // …and re-arms (the new clip gets its own countdown).
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.selected, 1, "fresh selection: countdown restarts");
+
+        // Wraps from the last clip back to the first.
+        app.selected = app.clips.len() - 1;
+        app.sel_changed_at = expired;
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.selected, 0, "wraps to the first clip");
+    }
+
+    /// `jump_random` always lands somewhere else (given >1 clip).
+    #[test]
+    fn jump_random_never_lands_on_the_selection() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            ..Options::default()
+        });
+        for _ in 0..50 {
+            let before = app.selected;
+            app.jump_random();
+            assert_ne!(app.selected, before, "random jump moved the selection");
+        }
     }
 }

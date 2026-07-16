@@ -103,6 +103,10 @@ pub struct Tuning {
     /// Fraction of the clip's duration that `[`/`]` jump (0..1). A binding
     /// can override it per key via `amount` on an internal command.
     pub skip_fraction: f32,
+    /// Auto-advance ("skip timer", `toggle_skip_timer`): once the selected
+    /// clip has played this many seconds, selection moves to the next clip
+    /// (wraps at the end of the library).
+    pub skip_timer_s: f32,
     /// Media quality — read once at startup (restart to apply).
     /// Thumbnails generate at exactly this size; any resolution works.
     /// The GPU atlas is carved into fixed slots of this same size, so
@@ -215,6 +219,7 @@ impl Default for Tuning {
             recurse: true,
             live_delay_ms: 100.0,
             skip_fraction: 0.10,
+            skip_timer_s: 5.0,
             thumb_width: 640,
             thumb_height: 360,
             thumb_quality: 7,
