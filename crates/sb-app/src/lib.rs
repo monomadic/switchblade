@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use sb_media::{MediaService, Recipe, ThumbResult};
 use sb_window::{
-    App, AtlasCfg, Blur, Frame, HiresFrame, InputEvent, Key, ThumbUpload, Tile, Viewport,
+    App, AtlasCfg, Blur, Frame, HiresFrame, InputEvent, Key, ThumbUpload, Tile, Viewport, Waker,
     WindowCommand,
 };
 
@@ -240,10 +240,85 @@ pub struct Switchblade {
     anim_rendered: bool,
     /// Stay awake at least until this instant (input, fades, fresh uploads).
     wake_until: Instant,
+    /// Render-loop wake handle; worker threads fire it (via `notify`)
+    /// when they deliver work, so background completions repaint promptly
+    /// without keeping the loop in continuous animation (P0.2).
+    waker: Waker,
+    /// `waker.wake()` as a plain closure, cloned into media workers and
+    /// ingest reader threads.
+    notify: ingest::Notify,
+    /// Redraw-reason telemetry (debug log level only).
+    redraw_stats: RedrawStats,
     last_scroll_event: Instant,
     viewport: Viewport,
     cmds: Vec<WindowCommand>,
     title: String,
+}
+
+/// Once-a-second debug log of how many frames ran and which condition
+/// kept `Frame.animating` true — the acceptance instrument for idle-
+/// throttling work (PERFORMANCE-TASKS.md P0.2): it distinguishes visual
+/// animation, live playback, and explicit wake timers as redraw causes.
+/// Negligible when debug logging is off (one `log_enabled!` check).
+struct RedrawStats {
+    at: Instant,
+    frames: u32,
+    idle: u32,
+    motion: u32,
+    sheets: u32,
+    transition: u32,
+    live: u32,
+    timer: u32,
+}
+
+impl RedrawStats {
+    fn new() -> Self {
+        Self {
+            at: Instant::now(),
+            frames: 0,
+            idle: 0,
+            motion: 0,
+            sheets: 0,
+            transition: 0,
+            live: 0,
+            timer: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        motion: bool,
+        sheets: bool,
+        transition: bool,
+        live: bool,
+        timer: bool,
+        animating: bool,
+    ) {
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        self.frames += 1;
+        self.idle += u32::from(!animating);
+        self.motion += u32::from(motion);
+        self.sheets += u32::from(sheets);
+        self.transition += u32::from(transition);
+        self.live += u32::from(live);
+        self.timer += u32::from(timer);
+        if self.at.elapsed() >= Duration::from_secs(1) {
+            log::debug!(
+                "redraw: {} frames/s ({} idle; causes: motion {} sheets {} transition {} live {} timer {})",
+                self.frames,
+                self.idle,
+                self.motion,
+                self.sheets,
+                self.transition,
+                self.live,
+                self.timer,
+            );
+            *self = Self::new();
+        }
+    }
 }
 
 impl Default for Switchblade {
@@ -295,17 +370,26 @@ impl Switchblade {
         // cache without splitting entries across two keyings.
         sb_media::set_cache_key(tuning.cache_key);
 
+        // Worker threads (ingest, media) fire this after delivering work;
+        // the window layer arms it and turns each burst into one redraw.
+        let waker = Waker::new();
+        let notify: ingest::Notify = {
+            let w = waker.clone();
+            std::sync::Arc::new(move || w.wake())
+        };
+
         // CLI paths beat stdin; --demo beats both; a TTY stdin with
         // neither also falls back to the demo grid.
         let rx = if !opts.inputs.is_empty() && !opts.demo {
             Some(ingest::spawn_args_reader(
                 opts.inputs.clone(),
                 tuning.recurse,
+                notify.clone(),
             ))
         } else if opts.demo {
             None
         } else {
-            ingest::spawn_stdin_reader(tuning.recurse)
+            ingest::spawn_stdin_reader(tuning.recurse, notify.clone())
         };
         let demo = rx.is_none();
         let recipe = recipe_from(&tuning);
@@ -328,7 +412,7 @@ impl Switchblade {
             clips: Vec::new(),
             index: HashMap::new(),
             rx,
-            media: MediaService::new(recipe),
+            media: MediaService::new(recipe, notify.clone()),
             slots: vec![None; atlas_cfg.slots()],
             live_sel: None,
             live_hover: None,
@@ -377,6 +461,9 @@ impl Switchblade {
             motion: true,
             anim_rendered: false,
             wake_until: Instant::now() + Duration::from_secs(1),
+            waker,
+            notify,
+            redraw_stats: RedrawStats::new(),
             last_scroll_event: Instant::now(),
             viewport: Viewport {
                 width: 1280.0,
@@ -907,7 +994,10 @@ impl Switchblade {
             return;
         };
         log::info!("browsing siblings of {}", path.display());
-        self.rx = Some(ingest::spawn_dir_reader(dir.to_path_buf()));
+        self.rx = Some(ingest::spawn_dir_reader(
+            dir.to_path_buf(),
+            self.notify.clone(),
+        ));
         // All per-clip state is index-keyed; drop it and let the new
         // listing stream in (thumbs re-serve from the disk cache).
         self.clips.clear();
@@ -964,13 +1054,10 @@ impl Switchblade {
         // updates are legal while `rx` borrows self; the selection move
         // happens after the loop).
         let mut reselect: Option<usize> = None;
+        let first_new = self.clips.len();
         loop {
             match rx.try_recv() {
                 Ok(item) => {
-                    // spawn fade-in (field update: `rx` is borrowed here)
-                    self.wake_until = self
-                        .wake_until
-                        .max(Instant::now() + Duration::from_millis(600));
                     if self.pending_reselect.as_deref() == Some(item.path.as_path()) {
                         self.pending_reselect = None;
                         reselect = Some(self.clips.len());
@@ -1014,6 +1101,17 @@ impl Switchblade {
                     self.pending_reselect = None;
                     break;
                 }
+            }
+        }
+        // Spawn fade-in only needs the loop hot if a newcomer is actually
+        // on screen — a bulk stream appending offscreen rows must not keep
+        // the GPU presenting (P0.2). Offscreen arrivals still repaint once
+        // (their send fired the waker) so the title count stays fresh.
+        if first_new < self.clips.len() {
+            let lay = self.layout();
+            let (_, last_vis) = self.visible_rows(&lay, PREFETCH_ROWS);
+            if first_new / lay.cols.max(1) <= last_vis {
+                self.wake(0.6);
             }
         }
         if let Some(i) = reselect {
@@ -1273,9 +1371,17 @@ impl Switchblade {
     /// Collect finished thumbnails into atlas uploads for this frame.
     fn drain_media(&mut self, lay: &Layout) -> Vec<ThumbUpload> {
         let mut uploads = Vec::new();
+        let was_pending = self.jobs_total > self.jobs_done;
         while let Some(result) = self.media.try_recv() {
             self.jobs_done += 1;
-            self.wake(0.6); // thumb crossfade + progress bar linger
+            // Visual results (a tile crossfades in) keep the loop hot for
+            // the fade; GenDone is disk-cache-only — the waker-driven
+            // redraw that delivered it already repainted the progress
+            // bar, and a multi-hour sweep must not animate continuously
+            // between completions (P0.2).
+            if !matches!(result, ThumbResult::GenDone { .. }) {
+                self.wake(0.6); // thumb crossfade
+            }
             match result {
                 ThumbResult::Ready { path, w, h, rgba } => {
                     let Some(&i) = self.index.get(&path) else {
@@ -1333,9 +1439,14 @@ impl Switchblade {
                 ThumbResult::GenDone { .. } => {
                     // Counted once at the top of the loop like every other
                     // result — a second increment here overran jobs_total.
-                    self.wake(0.3); // progress bar tick
                 }
             }
+        }
+        // Batch just completed: the progress bar lingers, then fades over
+        // 0.7s (build_frame) — keep the loop hot through it, once, on the
+        // transition only.
+        if was_pending && self.jobs_total > 0 && self.jobs_done >= self.jobs_total {
+            self.wake(1.0);
         }
         uploads
     }
@@ -2448,22 +2559,30 @@ impl App for Switchblade {
         let mut frame = self.build_frame();
         frame.uploads = uploads;
         frame.hires_upload = self.hires_frame.take();
-        // Idle throttling: with nothing in motion — springs settled, no
-        // sheets cycling (e.g. animation toggled off), no live video, no
-        // background jobs, stdin closed — the loop drops to a slow tick.
-        frame.animating = self.motion
-            || self.anim_rendered
-            || self.transition.is_some()
-            || self.live_sel.is_some()
-            || self.live_hover.is_some()
-            || self.jobs_total > 0
-            || self.rx.is_some()
-            || Instant::now() < self.wake_until;
+        // Idle throttling: with nothing VISUALLY in motion — springs
+        // settled, no sheets cycling, no live video, no fade in flight —
+        // the loop drops to a slow tick. Pending background jobs and an
+        // open ingest producer deliberately do NOT keep the loop hot
+        // (P0.2): their worker threads fire `waker` per delivery, so each
+        // completion repaints once, and the idle tick still services them
+        // at 10Hz as a safety net.
+        let motion = self.motion;
+        let sheets = self.anim_rendered;
+        let transition = self.transition.is_some();
+        let live = self.live_sel.is_some() || self.live_hover.is_some();
+        let timer = Instant::now() < self.wake_until;
+        frame.animating = motion || sheets || transition || live || timer;
+        self.redraw_stats
+            .record(motion, sheets, transition, live, timer, frame.animating);
         frame
     }
 
     fn commands(&mut self) -> Vec<WindowCommand> {
         std::mem::take(&mut self.cmds)
+    }
+
+    fn waker(&self) -> Waker {
+        self.waker.clone()
     }
 }
 
@@ -2621,6 +2740,69 @@ mod tests {
             dir.join("b.mp4"),
             "the clip re-finds itself among its siblings"
         );
+    }
+
+    /// Pending background jobs must not force continuous rendering: the
+    /// gen sweep can run for hours on a big library while the grid is
+    /// static — each completion wakes the loop via `Waker` instead
+    /// (PERFORMANCE-TASKS.md P0.2).
+    #[test]
+    fn background_jobs_do_not_force_continuous_animation() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            ..Options::default()
+        });
+        app.jobs_total = 500;
+        app.jobs_done = 3;
+        app.wake_until = Instant::now(); // skip the startup grace period
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let idle = (0..600).any(|_| !app.frame(0.016, vp).animating);
+        assert!(
+            idle,
+            "pending background jobs alone kept Frame.animating true"
+        );
+        assert!(app.jobs_total > app.jobs_done, "jobs still pending");
+    }
+
+    /// An open-but-quiet ingest producer (a pipe that stays open, a slow
+    /// stdin feeder) must not keep the GPU presenting; arriving items
+    /// still ingest on the frame their send wakes (P0.2).
+    #[test]
+    fn open_ingest_pipe_does_not_force_continuous_animation() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            ..Options::default()
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rx = Some(rx);
+        app.wake_until = Instant::now();
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let idle = (0..600).any(|_| !app.frame(0.016, vp).animating);
+        assert!(idle, "an open, idle ingest pipe kept Frame.animating true");
+
+        // The pipe is still serviced: a late arrival lands next frame…
+        let before = app.clips.len();
+        tx.send(ingest::Ingested {
+            path: PathBuf::from("late/arrival.mp4"),
+            readable: false, // no media jobs in this test
+            cloud: false,
+        })
+        .unwrap();
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.clips.len(), before + 1, "late arrival ingested");
+
+        // …and producer exit closes out ingest state.
+        drop(tx);
+        let _ = app.frame(0.016, vp);
+        assert!(app.rx.is_none(), "disconnect noticed without a hot loop");
     }
 
     /// `]` seeks the selected stream in place — the SAME decoder jumps

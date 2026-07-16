@@ -56,6 +56,11 @@ impl Recipe {
 }
 
 const WORKERS: usize = 3;
+
+/// Fired after each result lands in the channel, so the render loop can
+/// wake for it instead of polling (PERFORMANCE-TASKS.md P0.2). The app
+/// passes its window-layer wake handle wrapped in a closure.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
 /// Extract the frame this far into the clip (PLAN.md §6 initial policy).
 /// Public so live playback can start from the same frame the thumb shows.
 pub const SEEK_FRACTION: f64 = 0.10;
@@ -160,7 +165,7 @@ pub struct MediaService {
 }
 
 impl MediaService {
-    pub fn new(recipe: Recipe) -> Self {
+    pub fn new(recipe: Recipe, notify: Notify) -> Self {
         let queue: SharedQueue = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
         let (tx_done, rx_done) = mpsc::channel::<ThumbResult>();
 
@@ -177,7 +182,8 @@ impl MediaService {
             let q = queue.clone();
             let tx = tx_done.clone();
             let root = root.clone();
-            thread::spawn(move || worker(q, tx, root, have_ffmpeg, recipe));
+            let notify = notify.clone();
+            thread::spawn(move || worker(q, tx, notify, root, have_ffmpeg, recipe));
         }
         Self { queue, rx: rx_done }
     }
@@ -515,6 +521,7 @@ impl Drop for LivePlayer {
 fn worker(
     queue: SharedQueue,
     tx: Sender<ThumbResult>,
+    notify: Notify,
     root: PathBuf,
     have_ffmpeg: bool,
     recipe: Recipe,
@@ -555,6 +562,7 @@ fn worker(
         if tx.send(result).is_err() {
             return;
         }
+        notify(); // nudge the render loop to drain this result
     }
 }
 

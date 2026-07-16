@@ -136,7 +136,29 @@ large architectural work from being justified by intuition alone.
 
 ### P0.2 — Stop background work from forcing continuous redraw
 
-**Status:** Ready
+**Status: DONE (2026-07-16).** Approach A (event-driven wakeups) landed:
+
+- `sb-window` owns a new `Waker` (coalescing wake handle; `App::waker()`
+  returns the app's instance, `run()` arms it with an event-loop proxy;
+  each wake becomes ONE redraw via `user_event`, latch cleared per redraw).
+  No winit types cross the boundary — workers see a plain closure.
+- Media workers notify after each result; ingest readers notify per
+  delivered item and once on producer exit (prompt `Disconnected`).
+- `frame.animating` dropped `jobs_total > 0` and `rx.is_some()`; ingest
+  arrival wakes only when a newcomer lands in the visible+prefetch rows;
+  `GenDone` no longer wakes (the delivering wake repaints the bar), with a
+  one-shot wake on batch completion for the bar's 0.7s fade-out.
+- The redraw-reason counter (carved from P0.1) logs once a second at debug
+  level: frames/s, idle count, and cause tallies (motion / sheets /
+  transition / live / timer).
+
+Validated live: demo idles at the 10Hz tick after ~1s of startup animation;
+an open silent stdin pipe idles at 10Hz (previously display-rate); slowly
+streamed clips ingest + thumb promptly, with the remaining 60fps correctly
+attributed to live playback (P1.4's territory). Tests:
+`background_jobs_do_not_force_continuous_animation`,
+`open_ingest_pipe_does_not_force_continuous_animation`, plus `Waker`
+coalescing/pre-arm/unarmed unit tests in `sb-window`.
 
 **Problem**
 

@@ -25,15 +25,37 @@ pub struct Ingested {
     pub cloud: bool,
 }
 
+/// Fired after each delivered item (and once when a producer finishes),
+/// so the render loop wakes for streamed paths instead of polling for
+/// them (PERFORMANCE-TASKS.md P0.2). Wakes coalesce window-side, so
+/// per-item calls are cheap even on a fast directory walk.
+pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// Channel to the app plus the render-loop nudge, so no send site can
+/// forget the wake.
+struct Tx {
+    tx: Sender<Ingested>,
+    notify: Notify,
+}
+
+impl Tx {
+    fn send(&self, item: Ingested) -> Result<(), SendError<Ingested>> {
+        self.tx.send(item)?;
+        (self.notify)();
+        Ok(())
+    }
+}
+
 /// Streams paths from stdin as they arrive — newline- or NUL-delimited,
 /// never waiting for EOF (PLAN.md §3 pillar 3). Returns None when stdin is
 /// a TTY. Directories walk recursively when `recurse` is on and are
 /// skipped otherwise; non-video files are skipped either way.
-pub fn spawn_stdin_reader(recurse: bool) -> Option<Receiver<Ingested>> {
+pub fn spawn_stdin_reader(recurse: bool, notify: Notify) -> Option<Receiver<Ingested>> {
     if io::stdin().is_terminal() {
         return None;
     }
     let (tx, rx) = mpsc::channel();
+    let tx = Tx { tx, notify };
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut pending: Vec<u8> = Vec::new();
@@ -62,20 +84,23 @@ pub fn spawn_stdin_reader(recurse: bool) -> Option<Receiver<Ingested>> {
         // Flush an unterminated final path at EOF.
         let remainder = std::mem::take(&mut pending);
         let _ = send_path(&tx, &remainder, recurse);
+        finish(tx);
     });
     Some(rx)
 }
 
 /// CLI-argument source: same semantics as stdin, but from `argv`. Takes
 /// priority over stdin when both are present.
-pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool) -> Receiver<Ingested> {
+pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool, notify: Notify) -> Receiver<Ingested> {
     let (tx, rx) = mpsc::channel();
+    let tx = Tx { tx, notify };
     thread::spawn(move || {
         for p in paths {
             if handle_path(&tx, p, recurse).is_err() {
                 return;
             }
         }
+        finish(tx);
     });
     rx
 }
@@ -83,19 +108,26 @@ pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool) -> Receiver<Ingeste
 /// One directory's own video files, no recursion — the "browse parent
 /// dir" (siblings) view. Streams like every other source; iCloud stubs
 /// in the directory still resolve to placeholders.
-pub fn spawn_dir_reader(dir: PathBuf) -> Receiver<Ingested> {
+pub fn spawn_dir_reader(dir: PathBuf, notify: Notify) -> Receiver<Ingested> {
     let (tx, rx) = mpsc::channel();
+    let tx = Tx { tx, notify };
     thread::spawn(move || {
         let _ = walk_dir(&tx, &dir, 0, 0);
+        finish(tx);
     });
     rx
 }
 
-fn send_path(
-    tx: &Sender<Ingested>,
-    mut bytes: &[u8],
-    recurse: bool,
-) -> Result<(), SendError<Ingested>> {
+/// Producer done: drop the sender first, then nudge the loop once so the
+/// app sees `Disconnected` promptly (closes the ingest state, clears
+/// `pending_reselect`) instead of on the next idle tick.
+fn finish(tx: Tx) {
+    let notify = tx.notify.clone();
+    drop(tx);
+    notify();
+}
+
+fn send_path(tx: &Tx, mut bytes: &[u8], recurse: bool) -> Result<(), SendError<Ingested>> {
     if bytes.last() == Some(&b'\r') {
         bytes = &bytes[..bytes.len() - 1];
     }
@@ -116,11 +148,7 @@ fn send_path(
 /// Route one input path: videos ingest, directories walk (when recurse
 /// is on) or vanish, everything else vanishes. All stat calls happen
 /// here, off the main thread, so the UI never blocks on slow disks.
-fn handle_path(
-    tx: &Sender<Ingested>,
-    path: PathBuf,
-    recurse: bool,
-) -> Result<(), SendError<Ingested>> {
+fn handle_path(tx: &Tx, path: PathBuf, recurse: bool) -> Result<(), SendError<Ingested>> {
     let meta = std::fs::metadata(&path);
     if meta.as_ref().is_ok_and(|m| m.is_dir()) {
         if recurse {
@@ -144,7 +172,7 @@ fn handle_path(
 /// resolve back to their original video name as cloud placeholders.
 /// `max_depth` 0 lists only the directory's own files (siblings view).
 fn walk_dir(
-    tx: &Sender<Ingested>,
+    tx: &Tx,
     dir: &Path,
     depth: usize,
     max_depth: usize,
@@ -241,7 +269,7 @@ mod tests {
         }
         std::fs::write(sub.join("c.mp4"), b"").unwrap();
 
-        let rx = spawn_dir_reader(dir.clone());
+        let rx = spawn_dir_reader(dir.clone(), std::sync::Arc::new(|| {}));
         let mut names: Vec<String> = rx
             .iter()
             .map(|i| i.path.file_name().unwrap().to_string_lossy().into_owned())

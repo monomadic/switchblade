@@ -6,7 +6,8 @@
 
 mod render;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
@@ -210,6 +211,77 @@ pub trait App {
     fn frame(&mut self, dt: f32, viewport: Viewport) -> Frame;
     /// Drain pending window commands (quit, fullscreen, title).
     fn commands(&mut self) -> Vec<WindowCommand>;
+    /// The wake handle the app's worker threads fire when they deliver
+    /// something the next frame should service (media result, ingested
+    /// path). [`run`] arms it with the event loop; apps that keep one
+    /// must return a clone of the *same* instance every call. The
+    /// default is a fresh handle nobody fires — pure-polling apps need
+    /// nothing more.
+    fn waker(&self) -> Waker {
+        Waker::new()
+    }
+}
+
+/// Cross-thread render-loop wake handle (PERFORMANCE-TASKS.md P0.2).
+///
+/// Worker threads call [`Waker::wake`] after delivering work; the window
+/// layer turns that into a single redraw, so background completions repaint
+/// promptly *without* the app having to stay in continuous-animation mode
+/// while a sweep or an open stdin producer is merely alive. Wakes coalesce:
+/// between redraws only the first notifies, so a burst of results costs one
+/// event-loop nudge. Before [`run`] arms the handle (or in headless tests)
+/// `wake` just sets the flag — nothing is lost, the first armed/serviced
+/// frame sees it.
+#[derive(Clone)]
+pub struct Waker {
+    inner: Arc<WakerInner>,
+}
+
+struct WakerInner {
+    pending: AtomicBool,
+    notify: Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl Waker {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(WakerInner {
+                pending: AtomicBool::new(false),
+                notify: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Nudge the render loop: one redraw will follow (coalesced).
+    /// Callable from any thread, any time.
+    pub fn wake(&self) {
+        if !self.inner.pending.swap(true, Ordering::AcqRel)
+            && let Some(f) = &*self.inner.notify.lock().unwrap()
+        {
+            f();
+        }
+    }
+
+    /// Install the event-loop nudge. Fires immediately if a wake raced
+    /// ahead of arming (worker finished during GPU init).
+    fn arm(&self, f: impl Fn() + Send + 'static) {
+        *self.inner.notify.lock().unwrap() = Some(Box::new(f));
+        if self.inner.pending.load(Ordering::Acquire) {
+            (self.inner.notify.lock().unwrap().as_ref().unwrap())();
+        }
+    }
+
+    /// Clear the coalescing latch (the redraw that services this batch is
+    /// underway); returns whether a wake had arrived.
+    fn take_pending(&self) -> bool {
+        self.inner.pending.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Default for Waker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Give the bare binary a real Dock / cmd-tab icon. Any process whose
@@ -236,8 +308,16 @@ fn set_dock_icon() {}
 pub fn run(app: impl App) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
+    // Arm the app's wake handle: worker-thread wakes become user events,
+    // which become single redraws (see `user_event`).
+    let waker = app.waker();
+    let proxy = event_loop.create_proxy();
+    waker.arm(move || {
+        let _ = proxy.send_event(()); // closed loop = shutting down
+    });
     let mut runner = Runner {
         app,
+        waker,
         window: None,
         gpu: None,
         last_frame: Instant::now(),
@@ -263,6 +343,9 @@ const MIN_FRAME: std::time::Duration = std::time::Duration::from_millis(4);
 
 struct Runner<A: App> {
     app: A,
+    /// The app's wake handle (same instance its workers fire) — cleared
+    /// each redraw so the next background delivery notifies again.
+    waker: Waker,
     window: Option<Arc<Window>>,
     gpu: Option<render::Gpu>,
     last_frame: Instant,
@@ -444,6 +527,9 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 self.apply_commands(event_loop);
             }
             WindowEvent::RedrawRequested => {
+                // This frame services whatever the wake batched; clear the
+                // latch so the next background delivery notifies again.
+                self.waker.take_pending();
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
@@ -462,6 +548,21 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 self.apply_commands(event_loop);
             }
             _ => {}
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        // A worker delivered work (media result, ingested path): one
+        // redraw services and shows it; the frame's own `animating`
+        // verdict decides whether the loop stays hot afterwards. While
+        // occluded, skip — the pending latch stays set (suppressing event
+        // spam), the 10Hz idle tick keeps draining, and un-occlusion
+        // repaints promptly anyway.
+        if self.occluded {
+            return;
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -493,5 +594,51 @@ impl<A: App> ApplicationHandler for Runner<A> {
         } else {
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_frame + IDLE_TICK));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn waker_coalesces_until_serviced() {
+        let w = Waker::new();
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        w.arm(move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        // A burst notifies once…
+        w.wake();
+        w.wake();
+        w.wake();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // …until the redraw clears the latch, then the next wake notifies.
+        assert!(w.take_pending());
+        w.wake();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(w.take_pending());
+        assert!(!w.take_pending());
+    }
+
+    #[test]
+    fn wake_before_arm_fires_on_arm() {
+        let w = Waker::new();
+        w.wake(); // worker finished during GPU init
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        w.arm(move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unarmed_wake_is_a_noop_flag() {
+        let w = Waker::new();
+        w.wake();
+        assert!(w.take_pending()); // headless apps just see the flag
     }
 }
