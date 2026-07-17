@@ -5,7 +5,7 @@ mod commands;
 mod ingest;
 mod tuning;
 
-pub use tuning::{AnimLevel, Tuning, config_path};
+pub use tuning::{AnimLevel, BackdropStyle, Tuning, config_path};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1766,8 +1766,12 @@ impl Switchblade {
         // While a scroll/scrub gesture is live the strip eases toward the
         // free-float `strip_target`; once the gesture settles the target homes
         // on the selected chip, so wheel input flows and then snaps magnetic.
+        // In peek mode (strip_scroll_selects = false) a peeked strip HOLDS
+        // where the user left it — it only homes once the selection moves
+        // again (chip click, keyboard), which is what re-centers the strip.
         if self.quickview {
-            if self.last_scroll_event.elapsed().as_secs_f32() > 0.12 {
+            let home = t.strip_scroll_selects || self.sel_changed_at >= self.last_scroll_event;
+            if home && self.last_scroll_event.elapsed().as_secs_f32() > 0.12 {
                 self.strip_target = self.selected as f32;
             }
             self.strip_pos += (self.strip_target - self.strip_pos) * a_of(t.strip_snap_strength);
@@ -2569,9 +2573,19 @@ impl Switchblade {
         {
             self.frozen_grid = None;
         }
+        // Whether the active view wants the grid drawn at all: flat
+        // backdrops (fullview's default, quickview's opt-in) cover it
+        // with an opaque stage, so building it is invisible churn.
+        let backdrop_grid = if self.fullview {
+            self.tuning.fullview_backdrop == BackdropStyle::Blur
+        } else if self.quickview {
+            self.tuning.quickview_backdrop == BackdropStyle::Blur
+        } else {
+            true
+        };
         if let Some((_, _, frozen)) = &self.frozen_grid {
             tiles = frozen.clone();
-        } else if !self.fullview {
+        } else if backdrop_grid {
             for row in first_row..=last_row {
                 for col in 0..lay.cols {
                     let i = row * lay.cols + col;
@@ -2618,7 +2632,13 @@ impl Switchblade {
                     // The selected tile shows the hires stream (GPU-downscaled
                     // via mips); hovered tiles show their tile-size atlas lane.
                     let mut live_hires: Option<(f32, f32)> = None;
-                    if selected {
+                    // Never inside a frozen-backdrop capture (modal): the
+                    // hires texture keeps updating as the modal plays the
+                    // same stream, so a captured hires reference is a
+                    // live window in a supposedly frozen snapshot — the
+                    // selected tile visibly animated behind the blur.
+                    // The static thumb is the honest frozen stand-in.
+                    if selected && !modal {
                         if let Some(l) = &self.live_sel {
                             // Path (not index) match: indices churn during the
                             // D swap. A skip-respawned stream with no frame yet
@@ -2913,7 +2933,8 @@ impl Switchblade {
                     .min(1.0)
             };
             let (vw, vh) = (self.viewport.width, self.viewport.height);
-            if t.quickview_blur >= 0.5 {
+            let flat = t.quickview_backdrop == BackdropStyle::Flat;
+            if !flat && t.quickview_blur >= 0.5 {
                 blur = Some(Blur {
                     split: tiles.len(),
                     levels: t.quickview_blur.round() as u32,
@@ -2935,13 +2956,22 @@ impl Switchblade {
                 tex_mix: 0.0,
                 hires: false,
             };
-            tiles.push(full(
-                0.0,
-                0.0,
-                vw,
-                vh,
-                [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0) * fade],
-            ));
+            // Flat backdrop: an opaque stage instead of the tinted dim —
+            // the grid behind it was never built, so nothing shows
+            // through even mid-fade (the fade starts from the window
+            // clear color).
+            let bc = t.backdrop_color;
+            tiles.push(if flat {
+                full(0.0, 0.0, vw, vh, [bc[0], bc[1], bc[2], fade])
+            } else {
+                full(
+                    0.0,
+                    0.0,
+                    vw,
+                    vh,
+                    [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0) * fade],
+                )
+            });
 
             // The modal shows the same hires stream the tile plays —
             // already running, already sharp, no handoff. Static thumb
@@ -3111,8 +3141,30 @@ impl Switchblade {
                 tex_mix: 0.0,
                 hires: false,
             };
-            // Opaque black covers the grid (and any quickview) behind it.
-            tiles.push(full(0.0, 0.0, vw, vh, [0.0, 0.0, 0.0, 1.0]));
+            // Flat (default): an opaque backdrop_color stage covers the
+            // grid (and any quickview) behind it. Blur: the frozen grid
+            // is already in `tiles` — frost it and lay quickview's
+            // tinted dim on top instead, so fullview can wear the same
+            // backdrop as the quickview modal.
+            if self.tuning.fullview_backdrop == BackdropStyle::Blur {
+                if t.quickview_blur >= 0.5 {
+                    blur = Some(Blur {
+                        split: tiles.len(),
+                        levels: t.quickview_blur.round() as u32,
+                        fade: 1.0,
+                    });
+                }
+                tiles.push(full(
+                    0.0,
+                    0.0,
+                    vw,
+                    vh,
+                    [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0)],
+                ));
+            } else {
+                let bc = t.backdrop_color;
+                tiles.push(full(0.0, 0.0, vw, vh, [bc[0], bc[1], bc[2], 1.0]));
+            }
             if let Some(clip) = self.clips.get(self.selected) {
                 if let (Some((uv, _, _, hires)), Some((rx, ry, rw, rh))) =
                     (self.selected_video_src(clip), self.fullview_video_rect())
@@ -3404,9 +3456,13 @@ impl App for Switchblade {
                 }
                 if self.quickview {
                     // Wheel/trackpad scrubs the filmstrip: the strip slides
-                    // freely under the gesture and the selection commits to
-                    // the nearest chip — the snap spring then centers it,
-                    // so it reads as magnetic, chip-by-chip flow. The grid
+                    // freely under the gesture and (strip_scroll_selects,
+                    // the default) the selection commits to the nearest
+                    // chip — the snap spring then centers it, so it reads
+                    // as magnetic, chip-by-chip flow. With it off the
+                    // scroll is a PEEK: the strip pans while the selected
+                    // clip keeps playing, and only a chip click (or a
+                    // keyboard move) changes the selection. The grid
                     // backdrop never pans under the modal.
                     let (cw, _, _) = self.strip_geom();
                     let step = cw + self.tuning.strip_gap;
@@ -3417,12 +3473,14 @@ impl App for Switchblade {
                             - d * self.tuning.strip_scroll_sensitivity / step)
                             .clamp(0.0, (n - 1) as f32);
                         self.last_scroll_event = Instant::now();
-                        let i = self.strip_target.round() as usize;
-                        if i != self.selected {
-                            self.selected = i;
-                            self.sel_changed_at = Instant::now();
-                            self.pending_reselect = None; // scroll outranks the D reselect
-                            self.scroll_to_selected();
+                        if self.tuning.strip_scroll_selects {
+                            let i = self.strip_target.round() as usize;
+                            if i != self.selected {
+                                self.selected = i;
+                                self.sel_changed_at = Instant::now();
+                                self.pending_reselect = None; // scroll outranks the D reselect
+                                self.scroll_to_selected();
+                            }
                         }
                     }
                     return;
@@ -4369,6 +4427,112 @@ mod tests {
         assert_eq!(app.selected, 2, "the strip clamps at the ends");
         // Grid pan must not have moved under the modal.
         assert_eq!(app.scroll_target, 0.0, "the backdrop grid never pans");
+    }
+
+    /// With strip_scroll_selects off, scrolling the filmstrip only
+    /// peeks: the strip pans, the selection stays put (the video keeps
+    /// playing), a chip click selects, and the strip re-centers on the
+    /// new selection instead of holding the peek.
+    #[test]
+    fn filmstrip_scroll_peeks_without_selecting() {
+        let dir = std::env::temp_dir().join("sb_app_strip_peek_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["a.mp4", "b.mp4", "c.mp4"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None), // no live decoders in tests
+            inputs: vec![dir.clone()],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(pump_until(&mut app, |a| a.clips.len() == 3), "ingest");
+        app.tuning.strip_scroll_selects = false;
+        app.quickview = true;
+        app.quickview_at = Instant::now();
+        app.strip_pos = 0.0;
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+
+        let (cw, _, _) = app.strip_geom();
+        let step = cw + app.tuning.strip_gap;
+        app.event(InputEvent::Scroll {
+            dx: -step * 2.0,
+            dy: 0.0,
+        });
+        assert_eq!(app.selected, 0, "peeking never moves the selection");
+        assert!(
+            app.strip_target > 1.5,
+            "the strip itself panned to the peeked chips"
+        );
+        // The peek holds: settle time passes and the strip must NOT home
+        // back onto the (unchanged) selection.
+        std::thread::sleep(Duration::from_millis(140));
+        let _ = app.frame(0.016, vp);
+        assert!(
+            app.strip_target > 1.5,
+            "a peeked strip holds until the selection moves"
+        );
+
+        // Clicking the peeked chip selects it, and the strip re-centers.
+        let (_, ch, sy) = app.strip_geom();
+        let hit = app
+            .strip_layout(app.strip_pos)
+            .into_iter()
+            .find(|&(i, _, _)| i == 2)
+            .expect("peeked chip on screen");
+        app.event(InputEvent::MouseDown {
+            x: hit.1,
+            y: sy + ch * 0.5,
+        });
+        assert_eq!(app.selected, 2, "a chip click selects the peeked clip");
+        std::thread::sleep(Duration::from_millis(140));
+        let _ = app.frame(0.016, vp);
+        assert!(
+            (app.strip_target - 2.0).abs() < 0.01,
+            "the strip homes onto the new selection"
+        );
+    }
+
+    /// Backdrop styles: a flat quickview never builds (or freezes) the
+    /// grid behind its opaque stage, while a blurred fullview does —
+    /// each modal can wear either backdrop.
+    #[test]
+    fn backdrop_styles_gate_the_grid() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let _ = app.frame(0.016, vp);
+
+        app.tuning.quickview_backdrop = BackdropStyle::Flat;
+        app.quickview = true;
+        app.quickview_at = Instant::now();
+        let _ = app.frame(0.016, vp);
+        assert!(
+            app.frozen_grid.is_none(),
+            "flat quickview: the hidden grid is never built or frozen"
+        );
+
+        // Same session, fullview goes tinted: the grid IS the backdrop
+        // again, so the freeze snapshot must exist.
+        app.tuning.fullview_backdrop = BackdropStyle::Blur;
+        app.fullview = true;
+        let _ = app.frame(0.016, vp);
+        assert!(
+            app.frozen_grid.is_some(),
+            "blurred fullview: the frozen grid backs the frost"
+        );
     }
 
     /// Shuffle reorders the clip vector and remaps EVERY index-keyed

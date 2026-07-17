@@ -114,6 +114,12 @@ anim_min_tile_w = 140.0
 # 4 = heavy frost, 0 = no blur. GPU-cheap either way.
 quickview_dim = 0.90
 quickview_blur = 3.0
+# Backdrop styles: "blur" = the frosted, dimmed gallery above; "flat" =
+# an opaque backdrop_color stage that hides the gallery entirely.
+# Quickview defaults to "blur", fullview (Tab) to "flat" — swap either.
+quickview_backdrop = "blur"
+fullview_backdrop = "flat"
+backdrop_color = [0.0, 0.0, 0.0]  # the flat stage color
 # Fade-in when quickview opens (dim + blur + the modal); 0 ≈ instant.
 quickview_fade_ms = 150.0
 # (Playback resolution is quickview_max_width/height, under Startup
@@ -150,6 +156,11 @@ strip_hover_scale = 1.15
 # are divided by this, and the selection follows the nearest chip.
 # Bigger = faster; negative flips direction.
 strip_scroll_sensitivity = 1.0
+# true (default): scrolling commits the selection to the nearest chip —
+# magnetic, chip-by-chip flow. false: scrolling only PEEKS — the strip
+# pans while the selected clip keeps playing (hover still previews);
+# click a chip to play it. The strip re-centers when the selection moves.
+strip_scroll_selects = true
 
 # ── Chapter bar (g, inside fullview) ────────────────────────────────────
 # Filmstrip-style chapter chips slide up from the bottom of fullview
@@ -252,23 +263,22 @@ quickview_max_height = 1440
 
 [keys]
 enter = "open"
-o = "open"
 space = "quickview"  # internal preview; Esc or Space closes, arrows browse
-# space = "preview"      # alternative: external looping mpv (defined below)
 tab = "fullview"  # selected clip fills the window on black; Esc or Tab exits
-c = "copy_path"
+"[" = "skip_back"  # jump by skip_fraction; wraps at the ends
+# "{" = "skip_back_big"  # a skip with its own amount; see below
+"]" = "skip_forward"
+D = "open_parent"  # re-ingest from the selected clip's parent dir
 a = "toggle_anim"  # animated thumbnails on/off
+c = "copy_path"
+g = "chapter_mode"  # chapter bar in fullview ("chapters" also works)
+j = "jump_random"  # random clip with a cached thumbnail ("jump_to_random" too)
+o = "open"
 p = "toggle_focus_pause"  # pause-when-unfocused on/off
 r = "reveal"  # reveal in Finder (open -R)
-"[" = "skip_back"  # jump by skip_fraction; wraps at the ends
-"]" = "skip_forward"
-g = "chapter_mode"  # chapter bar in fullview ("chapters" also works)
-D = "open_parent"  # re-ingest from the selected clip's parent dir
-j = "jump_random"  # random clip with a cached thumbnail ("jump_to_random" too)
 s = "shuffle_library"  # shuffle cached clips to the front ("shuffle" also works)
 t = "toggle_skip_timer"  # auto-advance every skip_timer_s of playback
 # n = "rename_script"    # any key -> any launched program; example below
-# "{" = "skip_back_big"  # a skip with its own amount; see below
 
 # "open" is just a command like any other — swap mpv for whatever you
 # like, or add more commands and bind keys to them.

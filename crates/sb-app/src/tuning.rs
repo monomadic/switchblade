@@ -44,6 +44,17 @@ impl AnimLevel {
     }
 }
 
+/// What a modal draws behind its video: `blur` = the frosted, dimmed
+/// gallery (quickview's classic backdrop); `flat` = an opaque
+/// `backdrop_color` stage that hides the grid entirely (fullview's
+/// classic backdrop). Both modals accept either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackdropStyle {
+    Blur,
+    Flat,
+}
+
 /// Every feel-related constant lives here and hot-reloads from
 /// `switchblade.toml` (PLAN.md §10). Don't hardcode feel values elsewhere.
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +174,20 @@ pub struct Tuning {
     /// Wheel/trackpad over the quickview filmstrip: pixels of scroll per
     /// chip-step are divided by this. Negative flips direction.
     pub strip_scroll_sensitivity: f32,
+    /// Scrolling the filmstrip commits the selection to the nearest chip
+    /// (magnetic, chip-by-chip flow — the default). false = peek mode:
+    /// the strip pans freely so you can look at what's around while the
+    /// selected clip keeps playing; click a chip to select it, and the
+    /// strip re-centers whenever the selection actually changes.
+    pub strip_scroll_selects: bool,
+    /// Quickview's backdrop: "blur" (frosted, dimmed gallery — default)
+    /// or "flat" (opaque backdrop_color; the gallery is hidden).
+    pub quickview_backdrop: BackdropStyle,
+    /// Fullview's backdrop: "flat" (opaque backdrop_color — default) or
+    /// "blur" (the same tinted frosted-gallery backdrop quickview uses).
+    pub fullview_backdrop: BackdropStyle,
+    /// Stage color behind flat-backdrop modals.
+    pub backdrop_color: [f32; 3],
     /// Quickview backdrop: black-overlay strength (0..1) and frosted-glass
     /// blur level. The grid renders offscreen and is downsampled 2^level×
     /// before drawing back — a few tiny GPU passes, only while quickview
@@ -242,6 +267,10 @@ impl Default for Tuning {
             seekbar_hover_height: 12.0,
             seekbar_thumb_width: 190.0,
             strip_scroll_sensitivity: 1.0,
+            strip_scroll_selects: true,
+            quickview_backdrop: BackdropStyle::Blur,
+            fullview_backdrop: BackdropStyle::Flat,
+            backdrop_color: [0.0, 0.0, 0.0],
             quickview_dim: 0.90,
             quickview_blur: 3.0,
             quickview_fade_ms: 150.0,
