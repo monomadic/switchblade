@@ -80,6 +80,26 @@ enum SlotKind {
     Anim,
     /// The live-playback frame for the selected clip; never evicted.
     Live,
+    /// A chapter-overlay chip. The owner index is the CHIP index, not a
+    /// clip index (shuffle's remap must skip these). Never evicted while
+    /// resident; all freed together when the overlay closes.
+    Chapter,
+}
+
+/// The chapter overlay (`chapter_mode`, `g`): a floating grid of moments
+/// across the selected clip over the quickview-style frosted backdrop —
+/// real chapter starts when the file has them, evenly spaced timestamps
+/// otherwise. Frames extract on demand (never cached) and land in
+/// Chapter-class atlas slots; clicking a chip seeks the playing stream.
+#[derive(Clone)]
+struct ChapterView {
+    /// The clip the overlay describes; closes if the selection leaves it.
+    path: PathBuf,
+    opened: Instant,
+    /// Chip timestamps (the click targets). Empty until the plan arrives.
+    times: Vec<f64>,
+    /// Per-chip atlas slot + pixel dims + arrival (for the fade-in).
+    chips: Vec<Option<(usize, u32, u32, Instant)>>,
 }
 
 /// The hovered tile's video playback: tile-sized, into an atlas slot.
@@ -229,6 +249,8 @@ pub struct Switchblade {
     /// black — no filmstrip/seekbar/blur. Reuses the selected clip's live
     /// hires stream (the same one the tile plays). Toggled by `fullview`.
     fullview: bool,
+    /// The chapter overlay, when open (`chapter_mode`).
+    chapters: Option<ChapterView>,
     /// Filmstrip slide position (in clip-index units), springing toward
     /// the selected index with the keyboard chase curve.
     strip_pos: f32,
@@ -487,6 +509,7 @@ impl Switchblade {
             quickview: false,
             quickview_at: Instant::now(),
             fullview: false,
+            chapters: None,
             strip_pos: 0.0,
             strip_target: 0.0,
             strip_hover: None,
@@ -736,7 +759,11 @@ impl Switchblade {
         };
         self.index.values_mut().for_each(remap);
         for slot in self.slots.iter_mut().flatten() {
-            remap(&mut slot.0);
+            // Chapter slots hold CHIP indices, not clip indices — a
+            // remap through the permutation would corrupt them.
+            if !matches!(slot.1, SlotKind::Chapter) {
+                remap(&mut slot.0);
+            }
         }
         if let Some(l) = &mut self.live_sel {
             remap(&mut l.clip);
@@ -780,6 +807,7 @@ impl Switchblade {
             || self.sel_parked
             || self.scrubbing
             || self.pending_reselect.is_some()
+            || self.chapters.is_some()
         {
             return;
         }
@@ -808,6 +836,18 @@ impl Switchblade {
     // --- input ---
 
     fn key(&mut self, key: Key) {
+        // The chapter overlay owns the keyboard while open: Esc closes,
+        // movement is swallowed (the selection is what the overlay
+        // describes), other actions still dispatch (g toggles it shut).
+        if self.chapters.is_some() {
+            match key {
+                Key::Escape => return self.close_chapters(),
+                Key::Char('h' | 'l' | 'k' | 'j') | Key::Left | Key::Right | Key::Up | Key::Down => {
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Movement keys are reserved; everything else goes through the keymap.
         match key {
             Key::Escape if self.fullview => {
@@ -858,6 +898,7 @@ impl Switchblade {
                 }
             }
             Action::Fullview => self.fullview = !self.fullview,
+            Action::ChapterMode => self.toggle_chapters(),
             Action::Skip { forward, amount } => self.skip(forward, amount),
             Action::OpenParent => self.open_parent(),
             Action::JumpRandom => self.jump_random(),
@@ -1223,6 +1264,7 @@ impl Switchblade {
         ));
         // All per-clip state is index-keyed; drop it and let the new
         // listing stream in (thumbs re-serve from the disk cache).
+        self.close_chapters(); // its slots die with the wipe below
         self.clips.clear();
         self.index.clear();
         self.slots.fill(None);
@@ -1237,6 +1279,115 @@ impl Switchblade {
             self.transition = Some((std::mem::take(&mut self.last_tiles), Instant::now()));
         }
         self.wake(1.0);
+    }
+
+    /// `chapter_mode` (g): toggle the chapter overlay for the selected
+    /// clip. Opening queues the extraction (tier just under visible
+    /// thumbs — the user is staring at the overlay); the plan and frames
+    /// stream back through drain_media.
+    fn toggle_chapters(&mut self) {
+        if self.chapters.is_some() {
+            return self.close_chapters();
+        }
+        let Some(clip) = self.clips.get(self.selected) else {
+            return;
+        };
+        if self.demo || !clip.readable || clip.cloud {
+            return;
+        }
+        // Fallback chip count when the file has no chapters: three rows
+        // of however many columns the window is wide enough for (9–18).
+        let count = (self.chapter_cols() * 3).clamp(9, 18) as u32;
+        self.media.request_chapters(clip.path.clone(), count);
+        self.chapters = Some(ChapterView {
+            path: clip.path.clone(),
+            opened: Instant::now(),
+            times: Vec::new(),
+            chips: Vec::new(),
+        });
+        self.wake(0.6);
+    }
+
+    /// Close the chapter overlay and free its atlas slots.
+    fn close_chapters(&mut self) {
+        if self.chapters.take().is_some() {
+            for s in self.slots.iter_mut() {
+                if matches!(s, Some((_, SlotKind::Chapter))) {
+                    *s = None;
+                }
+            }
+            self.wake(0.4);
+        }
+    }
+
+    /// Chapter-grid columns: 4 on a 16:9 window, growing on wide screens
+    /// (5 on ultrawide, 6 on super-ultrawide), never fewer than 3.
+    fn chapter_cols(&self) -> usize {
+        let aspect = self.viewport.width / self.viewport.height.max(1.0);
+        (aspect * 2.25).round().clamp(3.0, 6.0) as usize
+    }
+
+    /// Chapter grid layout for `n` chips: (cols, chip_w, chip_h, pad,
+    /// top y). Chips are 16:9, sized to fit within a margin of the
+    /// window; the block centers vertically.
+    fn chapter_layout(&self, n: usize) -> (usize, f32, f32, f32, f32) {
+        let n = n.max(1);
+        let cols = self.chapter_cols().min(n);
+        let rows = n.div_ceil(cols);
+        let pad = self.tuning.chapter_pad.max(0.0);
+        let (vw, vh) = (self.viewport.width, self.viewport.height);
+        let (avail_w, avail_h) = (vw * 0.86, vh * 0.86);
+        let w_fit = (avail_w - pad * (cols as f32 - 1.0)) / cols as f32;
+        let h_fit = (avail_h - pad * (rows as f32 - 1.0)) / rows as f32 * 16.0 / 9.0;
+        let chip_w = w_fit.min(h_fit).max(40.0);
+        let chip_h = chip_w * 9.0 / 16.0;
+        let y0 = (vh - (rows as f32 * chip_h + (rows as f32 - 1.0) * pad)) * 0.5;
+        (cols, chip_w, chip_h, pad, y0)
+    }
+
+    /// Rect of chapter chip `i` (of `n`): rows fill left to right, every
+    /// row — including a partial last one — centered horizontally.
+    fn chapter_chip_rect(&self, i: usize, n: usize) -> (f32, f32, f32, f32) {
+        let (cols, cw, ch, pad, y0) = self.chapter_layout(n);
+        let (row, col) = (i / cols, i % cols);
+        let row_n = cols.min(n - row * cols);
+        let x0 = (self.viewport.width - (row_n as f32 * cw + (row_n as f32 - 1.0) * pad)) * 0.5;
+        (
+            x0 + col as f32 * (cw + pad),
+            y0 + row as f32 * (ch + pad),
+            cw,
+            ch,
+        )
+    }
+
+    /// Which chapter chip is under (x, y), if any.
+    fn chapter_chip_at(&self, x: f32, y: f32) -> Option<usize> {
+        let n = self.chapters.as_ref()?.times.len();
+        (0..n).find(|&i| {
+            let (cx, cy, cw, ch) = self.chapter_chip_rect(i, n);
+            (cx..=cx + cw).contains(&x) && (cy..=cy + ch).contains(&y)
+        })
+    }
+
+    /// Click on a chapter chip: jump the playing stream to that
+    /// timestamp — an exact in-place seek, flashing the position bar
+    /// like a `[`/`]` skip.
+    fn chapter_seek(&mut self, i: usize) {
+        let Some(v) = &self.chapters else { return };
+        let Some(&t) = v.times.get(i) else { return };
+        let Some(l) = &self.live_sel else { return };
+        if l.path != v.path {
+            return;
+        }
+        // Stay a frame short of the end, like scrub_seek: an exact seek
+        // to the tail lands on EOF and loops back to 0:00.
+        let target = match l.duration.filter(|d| *d > 0.05) {
+            Some(d) => t.clamp(0.0, (d - 0.05).max(0.0)),
+            None => t.max(0.0),
+        };
+        l.player.seek(target, true);
+        self.skip_flash_at = Some(Instant::now());
+        self.wake(1.5);
     }
 
     /// True while animation/live playback should rest because the window
@@ -1411,12 +1562,18 @@ impl Switchblade {
         // Camera chases its target (key moves use a gentler chase).
         self.scroll += (self.scroll_target - self.scroll) * a_of(self.chase);
 
-        let hover_now = self.tile_at(&lay, self.cursor.0, self.cursor.1);
+        // No hover under the chapter overlay: the cursor is picking a
+        // chip, and hover-play beneath the frost would waste a decoder.
+        let hover_now = if self.chapters.is_some() {
+            None
+        } else {
+            self.tile_at(&lay, self.cursor.0, self.cursor.1)
+        };
         if hover_now != self.hovered {
             self.hovered = hover_now;
             self.hover_changed_at = Instant::now();
         }
-        let strip_hover_now = if self.quickview {
+        let strip_hover_now = if self.quickview && self.chapters.is_none() {
             self.strip_chip_at(self.cursor.0, self.cursor.1)
         } else {
             None
@@ -1608,6 +1765,49 @@ impl Switchblade {
             let Some(result) = self.media.try_recv() else {
                 break;
             };
+            // Chapter-overlay results live outside the jobs ledger: one
+            // request fans out to many results (a plan + a frame per
+            // chip) and none of it is cached background work.
+            let result = match result {
+                ThumbResult::ChapterTimes { path, times } => {
+                    if let Some(v) = &mut self.chapters
+                        && v.path == path
+                    {
+                        v.chips = vec![None; times.len()];
+                        v.times = times;
+                        self.wake(0.6);
+                    }
+                    continue;
+                }
+                ThumbResult::ChapterFrame {
+                    path,
+                    index,
+                    w,
+                    h,
+                    rgba,
+                } => {
+                    let live = self
+                        .chapters
+                        .as_ref()
+                        .is_some_and(|v| v.path == path && index < v.chips.len());
+                    if live && let Some(slot) = self.alloc_slot(lay, SlotKind::Chapter) {
+                        self.slots[slot] = Some((index, SlotKind::Chapter));
+                        self.chapters.as_mut().unwrap().chips[index] =
+                            Some((slot, w, h, Instant::now()));
+                        uploads.push(ThumbUpload { slot, w, h, rgba });
+                        self.wake(0.6);
+                    }
+                    continue;
+                }
+                ThumbResult::ChaptersFailed { path } => {
+                    if self.chapters.as_ref().is_some_and(|v| v.path == path) {
+                        log::info!("chapter overlay unavailable for {}", path.display());
+                        self.close_chapters();
+                    }
+                    continue;
+                }
+                other => other,
+            };
             self.jobs_done += 1;
             // Visual results (a tile crossfades in) keep the loop hot for
             // the fade; GenDone is disk-cache-only — the waker-driven
@@ -1683,6 +1883,10 @@ impl Switchblade {
                         self.clips[i].cached = true;
                     }
                 }
+                // Chapter results were consumed before the ledger above.
+                ThumbResult::ChapterTimes { .. }
+                | ThumbResult::ChapterFrame { .. }
+                | ThumbResult::ChaptersFailed { .. } => {}
             }
         }
         // Budget hit — more results are likely waiting; take them next
@@ -1716,6 +1920,9 @@ impl Switchblade {
             let in_zone = row >= zone_first && row <= zone_last;
             let class: u8 = match (in_zone, kind) {
                 (_, SlotKind::Live) => 0, // never evicted
+                // Chapter chips free en masse when the overlay closes;
+                // while it's open they're what the user is looking at.
+                (_, SlotKind::Chapter) => 0,
                 (true, SlotKind::Static) => 0,
                 (true, SlotKind::Anim) => 1,
                 (false, SlotKind::Static) => 2,
@@ -1727,9 +1934,10 @@ impl Switchblade {
         }
         let (j, class, _) = best.expect("atlas has at least one slot");
         let min_class = match incoming {
-            // A static or the live frame may displace in-zone anims;
-            // an anim sheet may not displace anything in-zone.
-            SlotKind::Static | SlotKind::Live => 1,
+            // A static, the live frame or a chapter chip may displace
+            // in-zone anims; an anim sheet may not displace anything
+            // in-zone.
+            SlotKind::Static | SlotKind::Live | SlotKind::Chapter => 1,
             SlotKind::Anim => 2,
         };
         if class < min_class {
@@ -1740,7 +1948,7 @@ impl Switchblade {
             match kind {
                 SlotKind::Static => self.clips[victim].thumb = Thumb::None,
                 SlotKind::Anim => self.clips[victim].anim = Thumb::None,
-                SlotKind::Live => {}
+                SlotKind::Live | SlotKind::Chapter => {}
             }
         }
         self.slots[j] = None;
@@ -2320,9 +2528,11 @@ impl Switchblade {
                 } else if !clip.readable {
                     ([0.16, 0.05, 0.06], ease)
                 } else if selected {
-                    // The selected tile always has a visible body, even
-                    // before its thumbnail exists.
-                    ([0.055, 0.055, 0.07], ease)
+                    // The selected tile always has a body, even before
+                    // its thumbnail exists — but in the window's own
+                    // background color: a lighter grey read as a bright
+                    // flash whenever a tile waited on live video.
+                    (t.background, ease)
                 } else {
                     ([0.0, 0.0, 0.0], ease * mix)
                 };
@@ -2584,7 +2794,10 @@ impl Switchblade {
                     y: strip_y + (chip_h - h) * 0.5,
                     w,
                     h,
-                    color: [0.03, 0.03, 0.04, fade],
+                    // Unloaded chips show the window background, not a
+                    // lighter grey — a chip waiting on its thumb (or its
+                    // hover video) must not flash bright.
+                    color: [t.background[0], t.background[1], t.background[2], fade],
                     border_color,
                     corner_radius: t.strip_corner_radius,
                     border_width,
@@ -2668,6 +2881,129 @@ impl Switchblade {
             }
         }
 
+        // Chapter overlay (`chapter_mode`): floating chips over the same
+        // frosted/dimmed backdrop as quickview, drawn above quickview AND
+        // fullview so `g` works inside either. Chips fill in one by one
+        // as their frames extract; unloaded chips show the window
+        // background (never a lighter placeholder) plus loading dots.
+        if let Some(view) = self.chapters.clone() {
+            let fade = if !ui {
+                1.0
+            } else {
+                (view.opened.elapsed().as_secs_f32() * 1000.0 / t.quickview_fade_ms.max(1.0))
+                    .min(1.0)
+            };
+            let (vw, vh) = (self.viewport.width, self.viewport.height);
+            // Frost the scene below — unless quickview already did, or
+            // fullview's opaque black backdrop makes blurring pointless.
+            if blur.is_none() && !self.fullview && t.quickview_blur >= 0.5 {
+                blur = Some(Blur {
+                    split: tiles.len(),
+                    levels: t.quickview_blur.round() as u32,
+                    fade,
+                });
+            }
+            let full = |x, y, w, h, color| Tile {
+                x,
+                y,
+                w,
+                h,
+                color,
+                border_color: [0.0; 4],
+                corner_radius: 0.0,
+                border_width: 0.0,
+                uv: [0.0; 4],
+                uv2: [0.0; 4],
+                frame_fade: 0.0,
+                tex_mix: 0.0,
+                hires: false,
+            };
+            tiles.push(full(
+                0.0,
+                0.0,
+                vw,
+                vh,
+                [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0) * fade],
+            ));
+
+            let n = view.times.len();
+            if n == 0 {
+                // Plan still probing: big dots center-screen.
+                let stage = full(
+                    (vw - 300.0) * 0.5,
+                    (vh - 100.0) * 0.5,
+                    300.0,
+                    100.0,
+                    [0.0; 4],
+                );
+                push_loading_dots(&mut tiles, &stage, fade, anim_t, true);
+                self.wake(0.3); // keep the dots breathing
+            }
+            let hover = self.chapter_chip_at(self.cursor.0, self.cursor.1);
+            // Highlight the chapter currently playing (selection border).
+            let current = self
+                .live_sel
+                .as_ref()
+                .filter(|l| l.path == view.path && n > 0)
+                .map(|l| {
+                    let p = match l.duration.filter(|d| *d > 0.05) {
+                        Some(d) => l.position().rem_euclid(d),
+                        None => l.position(),
+                    };
+                    view.times.partition_point(|&t0| t0 <= p).saturating_sub(1)
+                });
+            let (sb, hb, bg) = (t.selection_border, t.hover_border, t.background);
+            for i in 0..n {
+                let (x, y, w, h) = self.chapter_chip_rect(i, n);
+                let chip = view.chips.get(i).copied().flatten();
+                let (uv, mix) = match chip {
+                    Some((slot, tw, th, at)) => {
+                        let m = if !ui {
+                            1.0
+                        } else {
+                            (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
+                                .min(1.0)
+                        };
+                        (
+                            self.atlas_cfg.uv(slot, 0.0, 0.0, tw as f32, th as f32),
+                            (1.0 - (1.0 - m) * (1.0 - m)) * fade,
+                        )
+                    }
+                    None => ([0.0; 4], 0.0),
+                };
+                let (border_color, border_width) = if current == Some(i) {
+                    ([sb[0], sb[1], sb[2], fade], t.strip_border_width)
+                } else if hover == Some(i) {
+                    (
+                        [hb[0], hb[1], hb[2], fade],
+                        (t.strip_border_width * 0.5).max(1.0),
+                    )
+                } else {
+                    ([0.30, 0.30, 0.34, 0.55 * fade], 1.0)
+                };
+                let tile = Tile {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color: [bg[0], bg[1], bg[2], fade],
+                    border_color,
+                    corner_radius: t.strip_corner_radius,
+                    border_width,
+                    uv,
+                    uv2: [0.0; 4],
+                    frame_fade: 0.0,
+                    tex_mix: mix,
+                    hires: false,
+                };
+                tiles.push(tile);
+                if chip.is_none() {
+                    push_loading_dots(&mut tiles, &tile, fade, anim_t, false);
+                    self.wake(0.3);
+                }
+            }
+        }
+
         // Background-jobs indicator: a hairline progress bar, bottom-right.
         // Drawn last — above the quickview dim — so "still working" stays
         // visible whenever it's true. Lingers a moment when the batch
@@ -2734,6 +3070,9 @@ impl App for Switchblade {
         match event {
             InputEvent::Key { key, .. } => self.key(key),
             InputEvent::Scroll { dx, dy } => {
+                if self.chapters.is_some() {
+                    return; // the overlay floats still; nothing scrolls under it
+                }
                 if self.quickview {
                     // Wheel/trackpad scrubs the filmstrip: the strip slides
                     // freely under the gesture and the selection commits to
@@ -2793,6 +3132,15 @@ impl App for Switchblade {
                 self.focused = focused;
             }
             InputEvent::MouseDown { x, y } => {
+                // Chapter overlay first: a chip click jumps the playing
+                // clip there; any other click just closes the overlay.
+                if self.chapters.is_some() {
+                    if let Some(i) = self.chapter_chip_at(x, y) {
+                        self.chapter_seek(i);
+                    }
+                    self.close_chapters();
+                    return;
+                }
                 // In fullview the seekbar grabs first (click = seek, hold =
                 // scrub); any other click exits — the grid it would select
                 // is hidden behind the black backdrop.
@@ -2861,6 +3209,16 @@ impl App for Switchblade {
             self.keymap = cfg.keymap;
         }
         self.drain_ingest();
+        // The chapter overlay describes one clip: if the selection left
+        // it (random jump, shuffle landing elsewhere, D swap churn),
+        // close rather than show stale moments over the wrong video.
+        if self.chapters.as_ref().is_some_and(|v| {
+            self.clips
+                .get(self.selected)
+                .is_none_or(|c| c.path != v.path)
+        }) {
+            self.close_chapters();
+        }
         self.tick_skip_timer();
         self.step(dt);
         let lay = self.layout();
@@ -3725,6 +4083,72 @@ mod tests {
         app.sel_changed_at = expired;
         let _ = app.frame(0.016, vp);
         assert_eq!(app.selected, 0, "wraps to the first clip");
+    }
+
+    /// Chapter overlay: hit-tests agree with the drawn geometry, Esc
+    /// closes it (freeing its atlas slots), and the overlay closes on
+    /// its own when the selection leaves its clip.
+    #[test]
+    fn chapter_overlay_hit_tests_and_lifecycle() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            ..Options::default()
+        });
+        let open = |app: &mut Switchblade, n: usize| {
+            app.chapters = Some(ChapterView {
+                path: app.clips[app.selected].path.clone(),
+                opened: Instant::now(),
+                times: (0..n).map(|k| k as f64 * 10.0).collect(),
+                chips: vec![None; n],
+            });
+        };
+        // Every chip's center maps back to itself; the pad between two
+        // chips maps to nothing (12 chips = a partial-row-free grid;
+        // 14 exercises the centered partial last row).
+        for n in [12usize, 14] {
+            open(&mut app, n);
+            for i in 0..n {
+                let (x, y, w, h) = app.chapter_chip_rect(i, n);
+                assert_eq!(
+                    app.chapter_chip_at(x + w * 0.5, y + h * 0.5),
+                    Some(i),
+                    "chip {i} of {n} center hit"
+                );
+            }
+            let (x, y, _, h) = app.chapter_chip_rect(1, n);
+            assert_eq!(
+                app.chapter_chip_at(x - app.tuning.chapter_pad * 0.5, y + h * 0.5),
+                None,
+                "the gap between chips is dead space"
+            );
+            app.chapters = None;
+        }
+
+        // Esc closes and frees the overlay's atlas slots.
+        open(&mut app, 12);
+        app.slots[0] = Some((3, SlotKind::Chapter));
+        app.event(InputEvent::Key {
+            key: Key::Escape,
+            repeat: false,
+        });
+        assert!(app.chapters.is_none(), "Esc closes the overlay");
+        assert!(app.slots[0].is_none(), "chapter slots freed on close");
+
+        // Selection leaving the overlay's clip closes it next frame.
+        open(&mut app, 12);
+        app.selected += 1;
+        let _ = app.frame(
+            0.016,
+            Viewport {
+                width: 1280.0,
+                height: 800.0,
+            },
+        );
+        assert!(
+            app.chapters.is_none(),
+            "overlay closes when the selection moves off its clip"
+        );
     }
 
     /// `jump_random` always lands somewhere else, and only ever on a clip

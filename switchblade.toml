@@ -149,6 +149,14 @@ strip_hover_scale = 1.15
 # Bigger = faster; negative flips direction.
 strip_scroll_sensitivity = 1.0
 
+# ── Chapter overlay (g) ─────────────────────────────────────────────────
+# A floating grid of moments across the selected clip, over the same
+# frosted/dimmed backdrop as quickview: real chapter frames when the file
+# has chapters, evenly spaced frames otherwise — extracted on demand,
+# never cached. Wide windows get more columns. Click a chip to jump the
+# playing clip there; Esc or any other click closes.
+chapter_pad = 18.0  # gap between the floating chips
+
 # ── Startup settings (restart to apply) ─────────────────────────────────
 # Everything above this line hot-reloads; everything below is read once
 # at launch.
@@ -222,8 +230,10 @@ quickview_max_height = 1440
 # parent dir. Entries here override them.
 #
 # A key can name an internal action (quit, fullscreen, fast_fullscreen,
-# copy_path, quickview, fullview, toggle_anim, toggle_focus_pause,
-# zoom_in, zoom_out, zoom_reset, skip_forward, skip_back, open_parent) or any
+# copy_path, quickview, fullview, chapter_mode, toggle_anim,
+# toggle_focus_pause, zoom_in, zoom_out, zoom_reset, skip_forward,
+# skip_back, open_parent, jump_random, shuffle_library,
+# toggle_skip_timer) or any
 # [commands.*] entry below. In command args, {path}, {dir} and {name}
 # expand against the selected clip.
 #
@@ -246,6 +256,7 @@ p = "toggle_focus_pause"  # pause-when-unfocused on/off
 r = "reveal"  # reveal in Finder (open -R)
 "[" = "skip_back"  # jump by skip_fraction; wraps at the ends
 "]" = "skip_forward"
+g = "chapter_mode"  # chapter grid over the playing clip ("chapters" too)
 D = "open_parent"  # re-ingest from the selected clip's parent dir
 j = "jump_random"  # random clip with a cached thumbnail ("jump_to_random" too)
 s = "shuffle_library"  # shuffle cached clips to the front ("shuffle" also works)

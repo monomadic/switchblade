@@ -57,6 +57,10 @@ pub enum Action {
     /// Toggle fullview: the selected clip fills the whole window,
     /// letterboxed on black. Esc or the same key exits.
     Fullview,
+    /// Toggle the chapter overlay: a floating grid of frames across the
+    /// selected clip (chapter starts when the file has them, evenly
+    /// spaced otherwise); clicking one jumps the playing clip there.
+    ChapterMode,
     /// Jump the playing clip by a fraction of its duration; `None` falls
     /// back to the tuning `skip_fraction`.
     Skip {
@@ -100,6 +104,7 @@ impl Default for KeyMap {
             ("r", "reveal"),
             ("[", "skip_back"),
             ("]", "skip_forward"),
+            ("g", "chapter_mode"),
             ("D", "open_parent"),
             ("x", "jump_random"),
             ("s", "shuffle_library"),
@@ -198,6 +203,7 @@ fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
         "toggle_focus_pause" => Action::ToggleFocusPause,
         "quickview" => Action::Quickview,
         "fullview" | "toggle_fullview" => Action::Fullview,
+        "chapter_mode" | "chapters" => Action::ChapterMode,
         "skip_forward" => Action::Skip {
             forward: true,
             amount,
@@ -380,6 +386,20 @@ mod tests {
     fn fullview_binds_to_tab() {
         let map = KeyMap::default();
         assert!(matches!(map.action_for(&Key::Tab), Some(Action::Fullview)));
+    }
+
+    #[test]
+    fn chapter_mode_binds_to_g() {
+        let map = KeyMap::default();
+        assert!(matches!(
+            map.action_for(&Key::Char('g')),
+            Some(Action::ChapterMode)
+        ));
+        // Alias spelling resolves too.
+        assert!(matches!(
+            internal_action("chapters", None),
+            Some(Action::ChapterMode)
+        ));
     }
 
     #[test]

@@ -70,6 +70,15 @@ enum Request {
     /// Re-run ffprobe and rewrite meta.json — heals cache entries
     /// written before a `Meta` field existed. No result is sent.
     Reprobe(PathBuf),
+    /// Chapter-overlay frames: probe the clip's chapters, then stream one
+    /// single-frame extract per chip back (chapter starts when the file
+    /// has them, `count` evenly spaced timestamps otherwise). Never
+    /// cached — the extracts are cheap seeked single frames and the
+    /// overlay is transient.
+    Chapters {
+        path: PathBuf,
+        count: u32,
+    },
     /// Generate the thumb (+ meta) on disk without decoding/uploading —
     /// the library-wide background sweep.
     Gen(PathBuf),
@@ -123,6 +132,11 @@ struct Owed {
 struct Queues {
     thumbs: VecDeque<PathBuf>,
     reprobes: VecDeque<PathBuf>,
+    /// The chapter overlay's frame request (tier 3, beside `anims_now`:
+    /// the user is looking at the open overlay RIGHT NOW). Only one
+    /// overlay exists, so a new request supersedes any queued one and
+    /// tells an in-flight extraction to stop early.
+    chapters: VecDeque<(PathBuf, u32)>,
     anims_now: VecDeque<PathBuf>,
     r#gen: VecDeque<PathBuf>,
     anims: VecDeque<PathBuf>,
@@ -214,6 +228,9 @@ impl Queues {
         if let Some(p) = self.reprobes.pop_front() {
             return Some(Request::Reprobe(p));
         }
+        if let Some((path, count)) = self.chapters.pop_front() {
+            return Some(Request::Chapters { path, count });
+        }
         if let Some(p) = self.anims_now.pop_front() {
             self.in_anims_now.remove(&p);
             self.inflight.insert((p.clone(), Art::Anim));
@@ -282,6 +299,25 @@ pub enum ThumbResult {
     GenDone {
         path: PathBuf,
     },
+    /// Chapter overlay: the timestamps the grid will show (chapter starts
+    /// when the file has ≥2 chapters, evenly spaced otherwise). One
+    /// `ChapterFrame` per index follows as each extract lands.
+    ChapterTimes {
+        path: PathBuf,
+        times: Vec<f64>,
+    },
+    /// One chapter chip's pixels — crop-filled to the recipe's thumb box.
+    ChapterFrame {
+        path: PathBuf,
+        index: usize,
+        w: u32,
+        h: u32,
+        rgba: Vec<u8>,
+    },
+    /// The chapter plan itself failed (unprobeable clip / no ffmpeg).
+    ChaptersFailed {
+        path: PathBuf,
+    },
 }
 
 /// Async thumbnail service. `request` from the UI thread, results arrive
@@ -330,6 +366,20 @@ impl MediaService {
     pub fn request_reprobe(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
         lock.lock().unwrap().reprobes.push_back(path);
+        cv.notify_one();
+    }
+
+    /// Queue the chapter overlay's frame extraction: `count` is the chip
+    /// count to fall back to when the file has no chapters. A new request
+    /// replaces any queued one and aborts an in-flight extraction between
+    /// frames — only one overlay is ever open.
+    pub fn request_chapters(&self, path: PathBuf, count: u32) {
+        let (lock, cv) = &*self.queue;
+        {
+            let mut q = lock.lock().unwrap();
+            q.chapters.clear();
+            q.chapters.push_back((path, count));
+        }
         cv.notify_one();
     }
 
@@ -702,6 +752,12 @@ fn worker(
                 }
                 continue; // nothing to upload, no result
             }
+            Request::Chapters { path, count } => {
+                // Streams its own results progressively (chips fill in
+                // one by one) — nothing to batch here.
+                chapter_frames(&queue, &tx, &notify, &path, count, have_ffmpeg, &recipe);
+                continue;
+            }
             Request::Gen(path) => {
                 let jpg = ensure_thumb_file(&path, &root, have_ffmpeg, &recipe);
                 let owed = queue.0.lock().unwrap().complete(&path, Art::Thumb);
@@ -992,6 +1048,165 @@ fn reprobe(src: &Path, root: &Path) {
     if let Ok(json) = serde_json::to_vec_pretty(&m) {
         let _ = write_atomic(&file, &json);
         log::debug!("meta healed: {}", src.display());
+    }
+}
+
+/// Chip cap for the chapter overlay (a file with 40 chapters still shows
+/// a readable grid — an evenly spaced subset of its chapters).
+const CHAPTER_MAX_CHIPS: usize = 18;
+
+/// Chapter starts + duration + codec in one ffprobe run. The chapter
+/// list is NOT in the cached `Meta` (old entries would wrongly report
+/// "no chapters" forever); the overlay is transient enough that one
+/// fresh probe per open is fine.
+fn probe_chapter_info(src: &Path) -> Option<(Vec<f64>, Option<f64>, Option<String>)> {
+    let out = media_cmd("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_chapters",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(src)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let mut chapters: Vec<f64> = v["chapters"]
+        .as_array()
+        .map(|cs| {
+            cs.iter()
+                .filter_map(|c| c["start_time"].as_str().and_then(|s| s.parse().ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    chapters.sort_by(|a: &f64, b: &f64| a.total_cmp(b));
+    let duration = v["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse().ok());
+    let codec = v["streams"]
+        .as_array()
+        .and_then(|ss| ss.iter().find(|s| s["codec_type"] == "video"))
+        .and_then(|s| s["codec_name"].as_str().map(String::from));
+    Some((chapters, duration, codec))
+}
+
+/// The chapter overlay's worker job: probe once, announce the chip
+/// timestamps (`ChapterTimes`), then stream one crop-filled frame per
+/// chip (`ChapterFrame`) — plain seeked single-frame extracts straight
+/// to rawvideo, no disk artifacts. A newer chapters request appearing in
+/// the queue aborts the remainder: the overlay it fed is gone.
+fn chapter_frames(
+    queue: &SharedQueue,
+    tx: &Sender<ThumbResult>,
+    notify: &Notify,
+    src: &Path,
+    count: u32,
+    have_ffmpeg: bool,
+    recipe: &Recipe,
+) {
+    let fail = || {
+        let _ = tx.send(ThumbResult::ChaptersFailed {
+            path: src.to_path_buf(),
+        });
+        notify();
+    };
+    if !have_ffmpeg {
+        return fail();
+    }
+    let Some((chapters, duration, codec)) = probe_chapter_info(src) else {
+        return fail();
+    };
+    // (click target, extraction seek) per chip. Real chapters thumbnail
+    // 10% into the chapter (start frames are often black transitions,
+    // mirroring SEEK_FRACTION's rationale); the evenly-spaced fallback
+    // shows exactly the frame a click jumps to.
+    let plan: Vec<(f64, f64)> = if chapters.len() >= 2 {
+        let n = chapters.len().min(CHAPTER_MAX_CHIPS);
+        (0..n)
+            .map(|k| {
+                // Evenly spaced subset when the file has more chapters
+                // than chips (identity when it fits).
+                let i = k * (chapters.len() - 1) / (n - 1).max(1);
+                let start = chapters[i].max(0.0);
+                let end = chapters
+                    .get(i + 1)
+                    .copied()
+                    .or(duration)
+                    .unwrap_or(start)
+                    .max(start);
+                (start, start + (end - start) * 0.10)
+            })
+            .collect()
+    } else {
+        let Some(d) = duration.filter(|d| *d > 0.05) else {
+            return fail();
+        };
+        let n = count.clamp(1, CHAPTER_MAX_CHIPS as u32) as usize;
+        (0..n)
+            .map(|k| {
+                let t = d * (k as f64 + 0.5) / n as f64;
+                (t, t)
+            })
+            .collect()
+    };
+    let _ = tx.send(ThumbResult::ChapterTimes {
+        path: src.to_path_buf(),
+        times: plan.iter().map(|p| p.0).collect(),
+    });
+    notify();
+
+    let (fw, fh) = (recipe.thumb_w.max(2), recipe.thumb_h.max(2));
+    let vf = format!("scale={fw}:{fh}:force_original_aspect_ratio=increase,crop={fw}:{fh}");
+    let frame_bytes = (fw * fh * 4) as usize;
+    for (i, &(_, seek0)) in plan.iter().enumerate() {
+        // Superseded (the user opened another clip's overlay): stop —
+        // the remaining frames would be extracted for nobody.
+        if !queue.0.lock().unwrap().chapters.is_empty() {
+            return;
+        }
+        let mut seek = seek0;
+        loop {
+            let mut cmd = media_cmd("ffmpeg");
+            cmd.args(["-v", "error"]);
+            if vt_accel(codec.as_deref()) {
+                cmd.args(["-hwaccel", "videotoolbox"]);
+            }
+            let out = cmd
+                .args(["-ss", &format!("{seek:.3}")])
+                .arg("-i")
+                .arg(src)
+                .args(["-frames:v", "1", "-vf", &vf])
+                .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok();
+            match out {
+                Some(o) if o.status.success() && o.stdout.len() == frame_bytes => {
+                    let _ = tx.send(ThumbResult::ChapterFrame {
+                        path: src.to_path_buf(),
+                        index: i,
+                        w: fw,
+                        h: fh,
+                        rgba: o.stdout,
+                    });
+                    notify();
+                    break;
+                }
+                // A seek past EOF (VFR tails, wrong duration) produces
+                // nothing: retry this chip from the clip's start.
+                _ if seek > 0.0 => seek = 0.0,
+                // This chip stays a placeholder; the rest still extract.
+                _ => break,
+            }
+        }
     }
 }
 
@@ -1354,6 +1569,7 @@ mod tests {
         q.anims.push_back("bulk-sheet".into());
         q.r#gen.push_back("sweep".into());
         q.anims_now.push_back("storyboard".into());
+        q.chapters.push_back(("overlay".into(), 12));
         q.reprobes.push_back("heal".into());
         q.thumbs.push_back("visible".into());
         let order: Vec<String> = std::iter::from_fn(|| q.pop())
@@ -1361,6 +1577,7 @@ mod tests {
                 let (kind, p) = match r {
                     Request::Thumb(p) => ("thumb", p),
                     Request::Reprobe(p) => ("reprobe", p),
+                    Request::Chapters { path, .. } => ("chapters", path),
                     Request::Gen(p) => ("gen", p),
                     Request::Anim(p) => ("anim", p),
                 };
@@ -1372,6 +1589,7 @@ mod tests {
             [
                 "thumb:visible",
                 "reprobe:heal",
+                "chapters:overlay",
                 "anim:storyboard",
                 "gen:sweep",
                 "anim:bulk-sheet",
@@ -1449,6 +1667,109 @@ mod tests {
             (20..=45).contains(&frames),
             "expected ~30 paced frames in 1s, got {frames}"
         );
+    }
+
+    /// The chapter-overlay extraction end to end: a chapterless clip
+    /// yields `count` evenly spaced chips; a chaptered clip yields one
+    /// chip per chapter, thumbnailed a little inside each chapter. Every
+    /// announced chip delivers real pixels, uncached. Needs ffmpeg.
+    #[test]
+    fn chapter_frames_extract_plan_and_pixels() {
+        if !have_binary("ffmpeg") || !have_binary("ffprobe") {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_chapter_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.mp4");
+        if !plain.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&plain)
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "failed to generate test clip");
+        }
+        // Same clip with three chapters muxed in via ffmetadata.
+        let chaptered = dir.join("chaptered.mp4");
+        if !chaptered.exists() {
+            let metafile = dir.join("chapters.txt");
+            std::fs::write(
+                &metafile,
+                ";FFMETADATA1\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=one\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2500\ntitle=two\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=2500\nEND=4000\ntitle=three\n",
+            )
+            .unwrap();
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error"])
+                .arg("-i")
+                .arg(&plain)
+                .arg("-i")
+                .arg(&metafile)
+                .args(["-map_metadata", "1", "-codec", "copy"])
+                .arg(&chaptered)
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "failed to mux chapters");
+        }
+
+        let recipe = Recipe {
+            thumb_w: 64,
+            thumb_h: 36,
+            quality: 5,
+            anim_grid: 3,
+        };
+        let run = |src: &Path, count: u32| {
+            let queue: SharedQueue = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
+            let (tx, rx) = mpsc::channel();
+            let notify: Notify = Arc::new(|| {});
+            chapter_frames(&queue, &tx, &notify, src, count, true, &recipe);
+            drop(tx);
+            let mut times: Option<Vec<f64>> = None;
+            let mut frames = 0usize;
+            while let Ok(r) = rx.recv() {
+                match r {
+                    ThumbResult::ChapterTimes { times: t, .. } => times = Some(t),
+                    ThumbResult::ChapterFrame { w, h, rgba, .. } => {
+                        assert_eq!(rgba.len(), (w * h * 4) as usize, "full RGBA frame");
+                        frames += 1;
+                    }
+                    other => panic!(
+                        "unexpected result kind: {}",
+                        match other {
+                            ThumbResult::ChaptersFailed { .. } => "ChaptersFailed",
+                            _ => "non-chapter",
+                        }
+                    ),
+                }
+            }
+            (times.expect("a plan was announced"), frames)
+        };
+
+        // No chapters: `count` evenly spaced chips, each with pixels.
+        let (times, frames) = run(&plain, 6);
+        assert_eq!(times.len(), 6, "evenly spaced fallback honors count");
+        assert_eq!(frames, 6, "every announced chip delivered pixels");
+        assert!(times.windows(2).all(|w| w[0] < w[1]), "times ascend");
+
+        // Chapters: one chip per chapter, at the chapter starts.
+        let (times, frames) = run(&chaptered, 12);
+        assert_eq!(times.len(), 3, "one chip per chapter, not count");
+        assert_eq!(frames, 3);
+        assert!((times[0] - 0.0).abs() < 0.05, "first chapter start");
+        assert!((times[1] - 1.0).abs() < 0.05, "second chapter start");
+        assert!((times[2] - 2.5).abs() < 0.05, "third chapter start");
     }
 
     /// A visible-thumb request absorbs the gen sweep's queued entry for
