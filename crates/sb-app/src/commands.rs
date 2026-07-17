@@ -57,9 +57,9 @@ pub enum Action {
     /// Toggle fullview: the selected clip fills the whole window,
     /// letterboxed on black. Esc or the same key exits.
     Fullview,
-    /// Toggle the chapter overlay: a floating grid of frames across the
-    /// selected clip (chapter starts when the file has them, evenly
-    /// spaced otherwise); clicking one jumps the playing clip there.
+    /// Toggle the fullview chapter bar (entering fullview if needed):
+    /// filmstrip-style chips — real chapters or synthesized checkpoints
+    /// — slide up from the bottom; clicking one jumps the video there.
     ChapterMode,
     /// Jump the playing clip by a fraction of its duration; `None` falls
     /// back to the tuning `skip_fraction`.

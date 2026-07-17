@@ -46,6 +46,9 @@ OPTIONS:
                     (bind the `fullscreen` / `fast_fullscreen` internal
                     actions in [keys] to toggle either at runtime)
     --init          write the default config to ~/.config/switchblade.toml
+    --no-config     ignore every config file: run on the internal
+                    defaults, with hot-reload off (tests, triage —
+                    behavior can't be steered by a stray config)
     --demo          fake-tile demo grid (no media needed)
     -h, --help      print this help
     -V, --version   print version
@@ -94,6 +97,7 @@ fn main() -> anyhow::Result<()> {
             "--fullscreen" => opts.fullscreen = Some(false),
             "--fast-fullscreen" => opts.fullscreen = Some(true),
             "--init" => return init_config(),
+            "--no-config" => opts.no_config = true,
             "--demo" => opts.demo = true,
             "--clear-cache" => return clear_cache(),
             "--cleanup-cache" => return cleanup_cache(),

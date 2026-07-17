@@ -133,8 +133,10 @@ seekbar_height = 6.0
 seekbar_hover_height = 12.0
 seekbar_thumb_width = 190.0
 
-# The filmstrip of neighboring clips along the bottom.
-strip_height = 92.0  # chip height; chips are 16:9
+# The filmstrip of neighboring clips along the bottom. Chips share this
+# fixed height and take each clip's true aspect for width — portrait
+# clips get narrower chips, never taller ones.
+strip_height = 92.0  # chip height (width follows the clip's aspect)
 strip_gap = 10.0
 strip_snap_strength = 0.5  # strip chasing the selection (0.99 ≈ instant)
 strip_corner_radius = 10.0
@@ -149,13 +151,17 @@ strip_hover_scale = 1.15
 # Bigger = faster; negative flips direction.
 strip_scroll_sensitivity = 1.0
 
-# ── Chapter overlay (g) ─────────────────────────────────────────────────
-# A floating grid of moments across the selected clip, over the same
-# frosted/dimmed backdrop as quickview: real chapter frames when the file
-# has chapters, evenly spaced frames otherwise — extracted on demand,
-# never cached. Wide windows get more columns. Click a chip to jump the
-# playing clip there; Esc or any other click closes.
-chapter_pad = 18.0  # gap between the floating chips
+# ── Chapter bar (g, inside fullview) ────────────────────────────────────
+# Filmstrip-style chapter chips slide up from the bottom of fullview
+# (pressing g anywhere enters fullview first). Real chapters when the
+# file has them; otherwise checkpoints: none under a minute, 4 over a
+# minute (every 25%), 8 over three minutes, 10 over ten. Chips share the
+# strip height at the clip's true aspect. Entering fullview pre-warms
+# both the chapter probe and the animated-thumbnail sheet the chips are
+# imaged from, so the bar usually opens fully populated. Wheel/trackpad
+# pans the strip; clicking a chip jumps the video there and slides the
+# bar down; Esc closes the bar first, then fullview. The bar shares the
+# filmstrip's strip_* tuning above.
 
 # ── Startup settings (restart to apply) ─────────────────────────────────
 # Everything above this line hot-reloads; everything below is read once
@@ -256,7 +262,7 @@ p = "toggle_focus_pause"  # pause-when-unfocused on/off
 r = "reveal"  # reveal in Finder (open -R)
 "[" = "skip_back"  # jump by skip_fraction; wraps at the ends
 "]" = "skip_forward"
-g = "chapter_mode"  # chapter grid over the playing clip ("chapters" too)
+g = "chapter_mode"  # chapter bar in fullview ("chapters" also works)
 D = "open_parent"  # re-ingest from the selected clip's parent dir
 j = "jump_random"  # random clip with a cached thumbnail ("jump_to_random" too)
 s = "shuffle_library"  # shuffle cached clips to the front ("shuffle" also works)

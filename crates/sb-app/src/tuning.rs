@@ -171,9 +171,6 @@ pub struct Tuning {
     pub quickview_blur: f32,
     /// Fade-in duration when quickview opens (dim + blur + the modal).
     pub quickview_fade_ms: f32,
-    /// Gap between the chapter overlay's floating chips (the "moderate
-    /// padding" of the grid; the outer margin scales with the window).
-    pub chapter_pad: f32,
     /// Seconds for one full pass through an anim sheet's frames.
     pub anim_cycle_s: f32,
     /// Portion (0..1) of each frame interval spent crossfading into the
@@ -248,7 +245,6 @@ impl Default for Tuning {
             quickview_dim: 0.90,
             quickview_blur: 3.0,
             quickview_fade_ms: 150.0,
-            chapter_pad: 18.0,
             anim_cycle_s: 2.8,
             anim_crossfade: 0.35,
             anim_min_tile_w: 140.0,

@@ -36,6 +36,17 @@ const INGEST_DRAIN_BUDGET: usize = 256;
 /// warm-cache burst must not issue hundreds of texture writes in one
 /// frame. Results without pixels (Failed/GenDone) don't count.
 const MEDIA_UPLOAD_BUDGET: usize = 64;
+/// The much tighter upload budget while the selected stream is actively
+/// playing: 64 thumbs at the default recipe stage ~80MB of texture
+/// writes between two video presents — a visible hitch. The backlog
+/// trickles in over a few frames instead (still ~700/s at 60fps); the
+/// full budget returns the moment nothing is playing.
+const MEDIA_UPLOAD_BUDGET_LIVE: usize = 12;
+/// Background prewarms (fullview's chapter probe + anim sheet) normally
+/// wait for the selected stream's first frame; a stream that never
+/// delivers (failed decode, retry cooldown) releases them after this
+/// grace instead of starving the storyboard forever.
+const PREWARM_GRACE_S: f32 = 3.0;
 /// Thumbnail crossfade duration once pixels arrive.
 const THUMB_FADE_S: f32 = 0.3;
 /// Skip flash bar: hold after a `[`/`]` skip, then a quick fade-out.
@@ -80,26 +91,37 @@ enum SlotKind {
     Anim,
     /// The live-playback frame for the selected clip; never evicted.
     Live,
-    /// A chapter-overlay chip. The owner index is the CHIP index, not a
-    /// clip index (shuffle's remap must skip these). Never evicted while
-    /// resident; all freed together when the overlay closes.
-    Chapter,
 }
 
-/// The chapter overlay (`chapter_mode`, `g`): a floating grid of moments
-/// across the selected clip over the quickview-style frosted backdrop —
-/// real chapter starts when the file has them, evenly spaced timestamps
-/// otherwise. Frames extract on demand (never cached) and land in
-/// Chapter-class atlas slots; clicking a chip seeks the playing stream.
+/// A chapter probe's answer: (real chapter starts, container duration).
+type ChapterPlan = (Vec<f64>, Option<f64>);
+
+/// The fullview chapter bar (`chapter_mode`, `g`): filmstrip-style chips
+/// that slide up from the bottom of fullview — one per chapter when the
+/// file has real chapters, synthesized checkpoints otherwise (none under
+/// a minute, 4 over a minute, 8 over three, 10 over ten). Chip images
+/// come from the clip's cached anim sheet (the same frames the seekbar
+/// storyboard shows) — nothing is extracted for the bar. Clicking a chip
+/// seeks the playing stream to that chapter and slides the bar back down.
 #[derive(Clone)]
-struct ChapterView {
-    /// The clip the overlay describes; closes if the selection leaves it.
+struct ChapterBar {
+    /// The clip the bar describes; dropped if the selection leaves it.
     path: PathBuf,
-    opened: Instant,
-    /// Chip timestamps (the click targets). Empty until the plan arrives.
-    times: Vec<f64>,
-    /// Per-chip atlas slot + pixel dims + arrival (for the fade-in).
-    chips: Vec<Option<(usize, u32, u32, Instant)>>,
+    /// Clip duration (cached meta at open, refined by the probe) — maps
+    /// chapter times onto anim-sheet cells and finds the playing chapter.
+    duration: Option<f64>,
+    /// Chapter start times, ascending: None until the probe answers,
+    /// then real chapters or synthesized checkpoints.
+    times: Option<Vec<f64>>,
+    /// True while the bar wants to be up; false slides it out, and the
+    /// state drops once the slide lands.
+    open: bool,
+    /// 0..1 slide-in from below the bottom edge (also the bar's alpha).
+    slide: f32,
+    /// Strip scroll position/target in chip units, like the filmstrip —
+    /// but panning only: chapters seek on click, never on scroll.
+    pos: f32,
+    target: f32,
 }
 
 /// The hovered tile's video playback: tile-sized, into an atlas slot.
@@ -180,6 +202,10 @@ pub struct Options {
     /// is the fast flag (borderless desktop-sized window instead of
     /// macOS native fullscreen).
     pub fullscreen: Option<bool>,
+    /// `--no-config`: run on the internal defaults — no config search,
+    /// no hot-reload. For tests and triage, where behavior must not be
+    /// steerable by a stray ./switchblade.toml or ~/.config file.
+    pub no_config: bool,
 }
 
 pub struct Switchblade {
@@ -249,8 +275,14 @@ pub struct Switchblade {
     /// black — no filmstrip/seekbar/blur. Reuses the selected clip's live
     /// hires stream (the same one the tile plays). Toggled by `fullview`.
     fullview: bool,
-    /// The chapter overlay, when open (`chapter_mode`).
-    chapters: Option<ChapterView>,
+    /// The fullview chapter bar, while up or sliding (`chapter_mode`).
+    chapters: Option<ChapterBar>,
+    /// Chapter-probe answers per clip: `None` = probe in flight, `Some`
+    /// = (real chapter starts, container duration). Fullview pre-warms
+    /// an entry for the selected clip so the bar opens with its plan
+    /// already in hand; chapters don't change, so entries live for the
+    /// session.
+    chapter_probe: HashMap<PathBuf, Option<ChapterPlan>>,
     /// Filmstrip slide position (in clip-index units), springing toward
     /// the selected index with the keyboard chase curve.
     strip_pos: f32,
@@ -274,7 +306,8 @@ pub struct Switchblade {
     jobs_finished_at: Option<Instant>,
     tuning: Tuning,
     keymap: KeyMap,
-    tuning_file: TuningFile,
+    /// None under `--no-config`: internal defaults, no hot-reload.
+    tuning_file: Option<TuningFile>,
     selected: usize,
     hovered: Option<usize>,
     cursor: (f32, f32),
@@ -285,6 +318,11 @@ pub struct Switchblade {
     zoom_target: f32,
     /// Active camera chase strength: keyboard moves glide gentler than pans.
     chase: f32,
+    /// The static grid snapshot drawn behind modal views (quickview's
+    /// frosted backdrop): `(viewport w, viewport h, tiles)`, captured on
+    /// the first modal frame and reused until every modal closes (or the
+    /// window resizes). While it stands, no grid simulation runs at all.
+    frozen_grid: Option<(f32, f32, Vec<Tile>)>,
     /// Previous frame's tiles + column count, for the reflow crossfade.
     last_cols: usize,
     last_tiles: Vec<Tile>,
@@ -431,9 +469,10 @@ impl Switchblade {
     pub fn with_options(opts: Options) -> Self {
         // Load config up front: atlas geometry, the media recipe, and the
         // ingest recurse flag are startup-only (the rest keeps
-        // hot-reloading per frame).
-        let mut tuning_file = TuningFile::new(tuning::config_path());
-        let (tuning, keymap) = match tuning_file.poll() {
+        // hot-reloading per frame). `--no-config` skips the file entirely
+        // — internal defaults, nothing watched.
+        let mut tuning_file = (!opts.no_config).then(|| TuningFile::new(tuning::config_path()));
+        let (tuning, keymap) = match tuning_file.as_mut().and_then(|f| f.poll()) {
             Some(cfg) => (cfg.tuning, cfg.keymap),
             None => (Tuning::default(), KeyMap::default()),
         };
@@ -510,6 +549,7 @@ impl Switchblade {
             quickview_at: Instant::now(),
             fullview: false,
             chapters: None,
+            chapter_probe: HashMap::new(),
             strip_pos: 0.0,
             strip_target: 0.0,
             strip_hover: None,
@@ -530,6 +570,7 @@ impl Switchblade {
             zoom: 1.0,
             zoom_target: 1.0,
             chase: 0.22,
+            frozen_grid: None,
             last_cols: 0,
             last_tiles: Vec::new(),
             transition: None,
@@ -759,11 +800,7 @@ impl Switchblade {
         };
         self.index.values_mut().for_each(remap);
         for slot in self.slots.iter_mut().flatten() {
-            // Chapter slots hold CHIP indices, not clip indices — a
-            // remap through the permutation would corrupt them.
-            if !matches!(slot.1, SlotKind::Chapter) {
-                remap(&mut slot.0);
-            }
+            remap(&mut slot.0);
         }
         if let Some(l) = &mut self.live_sel {
             remap(&mut l.clip);
@@ -836,20 +873,13 @@ impl Switchblade {
     // --- input ---
 
     fn key(&mut self, key: Key) {
-        // The chapter overlay owns the keyboard while open: Esc closes,
-        // movement is swallowed (the selection is what the overlay
-        // describes), other actions still dispatch (g toggles it shut).
-        if self.chapters.is_some() {
-            match key {
-                Key::Escape => return self.close_chapters(),
-                Key::Char('h' | 'l' | 'k' | 'j') | Key::Left | Key::Right | Key::Up | Key::Down => {
-                    return;
-                }
-                _ => {}
-            }
-        }
         // Movement keys are reserved; everything else goes through the keymap.
         match key {
+            // Esc peels layers: the chapter bar slides down first, then
+            // fullview exits, then quickview.
+            Key::Escape if self.chapters.as_ref().is_some_and(|b| b.open) => {
+                return self.close_chapter_bar();
+            }
             Key::Escape if self.fullview => {
                 self.fullview = false;
                 return;
@@ -1264,7 +1294,7 @@ impl Switchblade {
         ));
         // All per-clip state is index-keyed; drop it and let the new
         // listing stream in (thumbs re-serve from the disk cache).
-        self.close_chapters(); // its slots die with the wipe below
+        self.chapters = None; // the bar's clip context is gone
         self.clips.clear();
         self.index.clear();
         self.slots.fill(None);
@@ -1281,102 +1311,161 @@ impl Switchblade {
         self.wake(1.0);
     }
 
-    /// `chapter_mode` (g): toggle the chapter overlay for the selected
-    /// clip. Opening queues the extraction (tier just under visible
-    /// thumbs — the user is staring at the overlay); the plan and frames
-    /// stream back through drain_media.
+    /// `chapter_mode` (g): toggle the chapter bar — a fullview add-on.
+    /// Opening from anywhere enters fullview first. Fullview pre-warms
+    /// the probe (and the anim sheet), so the plan is usually cached and
+    /// the bar opens fully populated; a cold open waits one cheap
+    /// ffprobe. Chip images come from the clip's anim sheet, requested
+    /// on demand like the seekbar storyboard.
     fn toggle_chapters(&mut self) {
-        if self.chapters.is_some() {
-            return self.close_chapters();
+        if self.chapters.as_ref().is_some_and(|b| b.open) {
+            return self.close_chapter_bar();
         }
-        let Some(clip) = self.clips.get(self.selected) else {
-            return;
+        let path = match self.clips.get(self.selected) {
+            Some(c) if !self.demo && c.readable && !c.cloud => c.path.clone(),
+            _ => return,
         };
-        if self.demo || !clip.readable || clip.cloud {
+        self.fullview = true;
+        let duration = self
+            .live_sel
+            .as_ref()
+            .filter(|l| l.path == path)
+            .and_then(|l| l.duration);
+        self.chapters = Some(ChapterBar {
+            path: path.clone(),
+            duration,
+            times: None,
+            open: true,
+            slide: 0.0,
+            pos: 0.0,
+            target: 0.0,
+        });
+        match self.chapter_probe.get(&path).cloned() {
+            // Pre-warmed answer: the plan installs this same tick.
+            Some(Some((times, d))) => self.apply_chapter_plan(&path, &times, d),
+            Some(None) => {} // probe already in flight
+            None => {
+                self.chapter_probe.insert(path.clone(), None);
+                self.media.request_chapters(path);
+            }
+        }
+        self.wake(0.8);
+    }
+
+    /// Install a probe answer into the open bar: real chapters win, a
+    /// chapterless clip gets checkpoints synthesized from its duration,
+    /// and a too-short chapterless clip sends the bar back down. The
+    /// strip starts centered on the chapter that's already playing.
+    fn apply_chapter_plan(&mut self, path: &std::path::Path, times: &[f64], duration: Option<f64>) {
+        let applies = self
+            .chapters
+            .as_ref()
+            .is_some_and(|b| b.path == path && b.times.is_none());
+        if !applies {
             return;
         }
-        // Fallback chip count when the file has no chapters: three rows
-        // of however many columns the window is wide enough for (9–18).
-        let count = (self.chapter_cols() * 3).clamp(9, 18) as u32;
-        self.media.request_chapters(clip.path.clone(), count);
-        self.chapters = Some(ChapterView {
-            path: clip.path.clone(),
-            opened: Instant::now(),
-            times: Vec::new(),
-            chips: Vec::new(),
-        });
-        self.wake(0.6);
+        let d = duration
+            .or(self.chapters.as_ref().unwrap().duration)
+            .filter(|d| *d > 0.05);
+        let times: Vec<f64> = if times.len() >= 2 {
+            times.to_vec()
+        } else {
+            d.map(|d| {
+                let n = checkpoint_count(d);
+                (0..n).map(|k| d * k as f64 / n.max(1) as f64).collect()
+            })
+            .unwrap_or_default()
+        };
+        if times.is_empty() {
+            log::info!(
+                "no chapters (and under a minute) — chapter bar hidden: {}",
+                path.display()
+            );
+            self.close_chapter_bar();
+        } else {
+            let (lo, hi) = self.chapter_pos_bounds(times.len());
+            let b = self.chapters.as_mut().unwrap();
+            b.duration = d.or(b.duration);
+            b.times = Some(times);
+            b.pos = 0.0f32.clamp(lo, hi);
+            b.target = b.pos;
+            let bar = self.chapters.as_ref().unwrap().clone();
+            if let Some(cur) = self.current_chapter(&bar) {
+                let b = self.chapters.as_mut().unwrap();
+                b.pos = (cur as f32).clamp(lo, hi);
+                b.target = b.pos;
+            }
+        }
+        self.wake(0.8);
     }
 
-    /// Close the chapter overlay and free its atlas slots.
-    fn close_chapters(&mut self) {
-        if self.chapters.take().is_some() {
-            for s in self.slots.iter_mut() {
-                if matches!(s, Some((_, SlotKind::Chapter))) {
-                    *s = None;
-                }
-            }
-            self.wake(0.4);
+    /// Slide the chapter bar down; its state drops once the slide lands.
+    fn close_chapter_bar(&mut self) {
+        if let Some(b) = &mut self.chapters
+            && b.open
+        {
+            b.open = false;
+            self.wake(0.8);
         }
     }
 
-    /// Chapter-grid columns: 4 on a 16:9 window, growing on wide screens
-    /// (5 on ultrawide, 6 on super-ultrawide), never fewer than 3.
-    fn chapter_cols(&self) -> usize {
-        let aspect = self.viewport.width / self.viewport.height.max(1.0);
-        (aspect * 2.25).round().clamp(3.0, 6.0) as usize
+    /// Chapter chip width: the strip's fixed height at the SELECTED
+    /// clip's true aspect — every chapter chip shares the clip's shape
+    /// (portrait clips get narrower chips, never taller ones).
+    fn chapter_chip_w(&self) -> f32 {
+        let (_, ch, _) = self.strip_geom();
+        ch * self.chip_aspect(self.selected)
     }
 
-    /// Chapter grid layout for `n` chips: (cols, chip_w, chip_h, pad,
-    /// top y). Chips are 16:9, sized to fit within a margin of the
-    /// window; the block centers vertically.
-    fn chapter_layout(&self, n: usize) -> (usize, f32, f32, f32, f32) {
-        let n = n.max(1);
-        let cols = self.chapter_cols().min(n);
-        let rows = n.div_ceil(cols);
-        let pad = self.tuning.chapter_pad.max(0.0);
-        let (vw, vh) = (self.viewport.width, self.viewport.height);
-        let (avail_w, avail_h) = (vw * 0.86, vh * 0.86);
-        let w_fit = (avail_w - pad * (cols as f32 - 1.0)) / cols as f32;
-        let h_fit = (avail_h - pad * (rows as f32 - 1.0)) / rows as f32 * 16.0 / 9.0;
-        let chip_w = w_fit.min(h_fit).max(40.0);
-        let chip_h = chip_w * 9.0 / 16.0;
-        let y0 = (vh - (rows as f32 * chip_h + (rows as f32 - 1.0) * pad)) * 0.5;
-        (cols, chip_w, chip_h, pad, y0)
+    /// How far the strip center may pan (in chip units) so the row's
+    /// ends never over-shoot the window: when every chip fits, the row
+    /// pins centered; otherwise scrolling spans first-to-last chip.
+    fn chapter_pos_bounds(&self, n: usize) -> (f32, f32) {
+        let cw = self.chapter_chip_w();
+        let step = (cw + self.tuning.strip_gap).max(1.0);
+        let edge = ((self.viewport.width - cw) * 0.5 - 24.0).max(0.0) / step;
+        let last = n.saturating_sub(1) as f32;
+        if last <= edge * 2.0 {
+            let mid = last * 0.5;
+            (mid, mid)
+        } else {
+            (edge, last - edge)
+        }
     }
 
-    /// Rect of chapter chip `i` (of `n`): rows fill left to right, every
-    /// row — including a partial last one — centered horizontally.
-    fn chapter_chip_rect(&self, i: usize, n: usize) -> (f32, f32, f32, f32) {
-        let (cols, cw, ch, pad, y0) = self.chapter_layout(n);
-        let (row, col) = (i / cols, i % cols);
-        let row_n = cols.min(n - row * cols);
-        let x0 = (self.viewport.width - (row_n as f32 * cw + (row_n as f32 - 1.0) * pad)) * 0.5;
-        (
-            x0 + col as f32 * (cw + pad),
-            y0 + row as f32 * (ch + pad),
-            cw,
-            ch,
-        )
-    }
-
-    /// Which chapter chip is under (x, y), if any.
+    /// Which chapter chip is under (x, y) — the filmstrip hit-test, at
+    /// the bar's current slide position.
     fn chapter_chip_at(&self, x: f32, y: f32) -> Option<usize> {
-        let n = self.chapters.as_ref()?.times.len();
-        (0..n).find(|&i| {
-            let (cx, cy, cw, ch) = self.chapter_chip_rect(i, n);
-            (cx..=cx + cw).contains(&x) && (cy..=cy + ch).contains(&y)
-        })
+        let bar = self.chapters.as_ref().filter(|b| b.open)?;
+        let n = bar.times.as_ref()?.len();
+        if n == 0 {
+            return None;
+        }
+        let cw = self.chapter_chip_w();
+        let (_, ch, base_y) = self.strip_geom();
+        let sy = base_y + (1.0 - bar.slide) * (ch + 44.0);
+        if y < sy - 8.0 || y > sy + ch + 8.0 {
+            return None;
+        }
+        let step = cw + self.tuning.strip_gap;
+        let rel = (x - self.viewport.width * 0.5) / step + bar.pos;
+        let i = rel.round();
+        if i < 0.0 || i as usize >= n {
+            return None;
+        }
+        ((rel - i).abs() * step <= cw * 0.5).then_some(i as usize)
     }
 
     /// Click on a chapter chip: jump the playing stream to that
     /// timestamp — an exact in-place seek, flashing the position bar
     /// like a `[`/`]` skip.
     fn chapter_seek(&mut self, i: usize) {
-        let Some(v) = &self.chapters else { return };
-        let Some(&t) = v.times.get(i) else { return };
+        let Some(b) = &self.chapters else { return };
+        let Some(&t) = b.times.as_ref().and_then(|ts| ts.get(i)) else {
+            return;
+        };
         let Some(l) = &self.live_sel else { return };
-        if l.path != v.path {
+        if l.path != b.path {
             return;
         }
         // Stay a frame short of the end, like scrub_seek: an exact seek
@@ -1390,10 +1479,53 @@ impl Switchblade {
         self.wake(1.5);
     }
 
+    /// The chapter the stream is currently inside (index of the last
+    /// start ≤ position), for the bar's highlight.
+    fn current_chapter(&self, bar: &ChapterBar) -> Option<usize> {
+        let times = bar.times.as_ref().filter(|ts| !ts.is_empty())?;
+        let l = self.live_sel.as_ref().filter(|l| l.path == bar.path)?;
+        let p = match bar.duration.or(l.duration).filter(|d| *d > 0.05) {
+            Some(d) => l.position().rem_euclid(d),
+            None => l.position(),
+        };
+        Some(times.partition_point(|&t0| t0 <= p).saturating_sub(1))
+    }
+
     /// True while animation/live playback should rest because the window
     /// lost focus (default on; `p` toggles, `pause_unfocused` configures).
     fn paused(&self) -> bool {
         !self.focused && self.tuning.pause_unfocused && self.focus_pause_on
+    }
+
+    /// May background prewarms (fullview's chapter probe, the on-demand
+    /// anim sheet) start right now? Only once the video the user is
+    /// watching is actually on screen — its cold spawn owns the CPU and
+    /// the media engine until then (the same principle that staggers
+    /// warm-pool spawns). Levels without live video don't wait, and a
+    /// stream that never delivers releases the gate after a short grace.
+    fn prewarm_ok(&self) -> bool {
+        if !self.level().live() || self.paused() || self.demo {
+            return true;
+        }
+        let ready = self.live_sel.as_ref().is_some_and(|l| {
+            l.first_frame.is_some()
+                && self
+                    .clips
+                    .get(self.selected)
+                    .is_some_and(|c| c.path == l.path)
+        });
+        ready || self.sel_changed_at.elapsed().as_secs_f32() > PREWARM_GRACE_S
+    }
+
+    /// A warm-pool decoder is mid cold-spawn (no frames buffered yet).
+    /// Sheet generation — nine ffmpeg decodes — additionally waits for
+    /// this to clear, so the worst case never stacks three decode chains
+    /// (selected stream + filling warm lane + storyboard) at once. The
+    /// 5s dead-decoder escape in update_live bounds the wait.
+    fn warm_filling(&self) -> bool {
+        self.warm
+            .iter()
+            .any(|w| w.player.buffered() == 0 && w.spawned.elapsed().as_secs_f32() < 5.0)
     }
 
     /// Effective animation level: CLI `--animation` beats the config.
@@ -1562,9 +1694,13 @@ impl Switchblade {
         // Camera chases its target (key moves use a gentler chase).
         self.scroll += (self.scroll_target - self.scroll) * a_of(self.chase);
 
-        // No hover under the chapter overlay: the cursor is picking a
-        // chip, and hover-play beneath the frost would waste a decoder.
-        let hover_now = if self.chapters.is_some() {
+        // No grid hover under ANY modal (quickview frost, fullview's
+        // black, the chapter bar): the pointer still sits "over" a
+        // hidden/frozen tile — without this gate every pointer rest
+        // cold-spawned a hover decoder for a clip nobody can see,
+        // stealing CPU and the media engine from the video being watched.
+        let modal = self.quickview || self.fullview;
+        let hover_now = if modal || self.chapters.is_some() {
             None
         } else {
             self.tile_at(&lay, self.cursor.0, self.cursor.1)
@@ -1573,7 +1709,9 @@ impl Switchblade {
             self.hovered = hover_now;
             self.hover_changed_at = Instant::now();
         }
-        let strip_hover_now = if self.quickview && self.chapters.is_none() {
+        // Same for the filmstrip when fullview covers quickview: its
+        // chips are behind the opaque backdrop, so no hover lane there.
+        let strip_hover_now = if self.quickview && !self.fullview && self.chapters.is_none() {
             self.strip_chip_at(self.cursor.0, self.cursor.1)
         } else {
             None
@@ -1591,25 +1729,36 @@ impl Switchblade {
 
         // Tile scale + emphasis springs (selected > hover > rest); both
         // keyboard moves and hover ride the same tween. Track whether any
-        // spring is still in flight for idle throttling.
-        let mut motion = (self.scroll_target - self.scroll).abs() > 0.3
-            || (self.zoom_target - self.zoom).abs() > 1e-3;
+        // spring is still in flight for idle throttling. Behind a modal
+        // NONE of this runs: the backdrop is a frozen snapshot, so grid
+        // springs and camera glides would be invisible work that only
+        // kept the loop hot — the camera snaps to its target instead
+        // (the state stays right for the eventual exit) and the per-clip
+        // spring sweep over the whole library is skipped outright.
+        let mut motion = !modal
+            && ((self.scroll_target - self.scroll).abs() > 0.3
+                || (self.zoom_target - self.zoom).abs() > 1e-3);
+        if modal {
+            self.scroll = self.scroll_target;
+        }
         let a = a_of(t.scale_smoothing);
-        for (i, clip) in self.clips.iter_mut().enumerate() {
-            let emphasized = i == self.selected || Some(i) == self.hovered;
-            let target = if i == self.selected {
-                sel_scale
-            } else if Some(i) == self.hovered {
-                t.hover_scale
-            } else {
-                1.0
-            };
-            let e_target = emphasized as u8 as f32;
-            if (target - clip.scale).abs() > 0.002 || (e_target - clip.emph).abs() > 0.005 {
-                motion = true;
+        if !modal {
+            for (i, clip) in self.clips.iter_mut().enumerate() {
+                let emphasized = i == self.selected || Some(i) == self.hovered;
+                let target = if i == self.selected {
+                    sel_scale
+                } else if Some(i) == self.hovered {
+                    t.hover_scale
+                } else {
+                    1.0
+                };
+                let e_target = emphasized as u8 as f32;
+                if (target - clip.scale).abs() > 0.002 || (e_target - clip.emph).abs() > 0.005 {
+                    motion = true;
+                }
+                clip.scale += (target - clip.scale) * a;
+                clip.emph += (e_target - clip.emph) * a;
             }
-            clip.scale += (target - clip.scale) * a;
-            clip.emph += (e_target - clip.emph) * a;
         }
         self.motion = motion;
 
@@ -1626,13 +1775,96 @@ impl Switchblade {
                 self.motion = true;
             }
         }
+
+        // Chapter bar: the slide-in rides the same spring family, and
+        // the strip pans toward its scroll target like the filmstrip.
+        // Once a closing bar's slide lands, the state drops.
+        if let Some(b) = &mut self.chapters {
+            let slide_target = if b.open { 1.0 } else { 0.0 };
+            b.slide += (slide_target - b.slide) * a_of(t.strip_snap_strength);
+            b.pos += (b.target - b.pos) * a_of(t.strip_snap_strength);
+            if (slide_target - b.slide).abs() > 0.002 || (b.target - b.pos).abs() > 0.001 {
+                self.motion = true;
+            }
+        }
+        if self
+            .chapters
+            .as_ref()
+            .is_some_and(|b| !b.open && b.slide < 0.005)
+        {
+            self.chapters = None;
+        }
     }
 
-    /// Filmstrip geometry: chip width/height and the strip's top y.
+    /// Filmstrip geometry: NOMINAL (16:9) chip width, fixed chip height,
+    /// and the strip's top y. Real chip widths are per-clip true aspect
+    /// (`chip_aspect`); the nominal width paces scroll sensitivity and
+    /// pos-bounds math.
     fn strip_geom(&self) -> (f32, f32, f32) {
         let ch = self.tuning.strip_height.max(24.0);
         let cw = ch * 16.0 / 9.0;
         (cw, ch, self.viewport.height - ch - 22.0)
+    }
+
+    /// Displayed aspect (w/h) of clip `i`'s strip chip: the thumbnail's
+    /// true aspect (fit-scaled, rotation already applied), clamped so a
+    /// pathological source stays browsable; 16:9 until the thumb lands.
+    /// Chips keep the strip's fixed HEIGHT and vary in width — portrait
+    /// clips are narrower, never taller.
+    fn chip_aspect(&self, i: usize) -> f32 {
+        let a = match self.clips.get(i).map(|c| &c.thumb) {
+            Some(&Thumb::Ready { tw, th, .. }) => tw as f32 / (th as f32).max(1.0),
+            _ => 16.0 / 9.0,
+        };
+        a.clamp(9.0 / 16.0, 2.4)
+    }
+
+    /// Visible filmstrip chips around fractional position `pos`:
+    /// `(clip index, center x, width)`. Widths are per-clip true aspect
+    /// at the strip's fixed height, so spacing is cumulative: chip
+    /// floor(pos) anchors at the window center (shifted by the
+    /// fractional part of one center-to-center step) and the walk
+    /// extends both ways until chips leave the screen.
+    fn strip_layout(&self, pos: f32) -> Vec<(usize, f32, f32)> {
+        let n = self.clips.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let (_, ch, _) = self.strip_geom();
+        let gap = self.tuning.strip_gap;
+        let vw = self.viewport.width;
+        let w_of = |i: usize| ch * self.chip_aspect(i);
+        let base = (pos.max(0.0) as usize).min(n - 1);
+        let frac = (pos - base as f32).clamp(0.0, 1.0);
+        let shift = if base + 1 < n {
+            frac * ((w_of(base) + w_of(base + 1)) * 0.5 + gap)
+        } else {
+            0.0
+        };
+        let cx0 = vw * 0.5 - shift;
+        let mut out = vec![(base, cx0, w_of(base))];
+        // Margin so chips scaled up by selection/hover still enter the
+        // walk before their unscaled box would.
+        let m = ch * 1.5;
+        let (mut cx, mut i) = (cx0, base);
+        while i + 1 < n {
+            cx += (w_of(i) + w_of(i + 1)) * 0.5 + gap;
+            i += 1;
+            if cx - w_of(i) * 0.5 > vw + m {
+                break;
+            }
+            out.push((i, cx, w_of(i)));
+        }
+        let (mut cx, mut i) = (cx0, base);
+        while i > 0 {
+            cx -= (w_of(i) + w_of(i - 1)) * 0.5 + gap;
+            i -= 1;
+            if cx + w_of(i) * 0.5 < -m {
+                break;
+            }
+            out.push((i, cx, w_of(i)));
+        }
+        out
     }
 
     /// Which filmstrip chip is under (x, y), if any.
@@ -1640,17 +1872,14 @@ impl Switchblade {
         if !self.quickview || self.clips.is_empty() {
             return None;
         }
-        let (cw, ch, sy) = self.strip_geom();
+        let (_, ch, sy) = self.strip_geom();
         if y < sy - 8.0 || y > sy + ch + 8.0 {
             return None;
         }
-        let step = cw + self.tuning.strip_gap;
-        let rel = (x - self.viewport.width * 0.5) / step + self.strip_pos;
-        let i = rel.round();
-        if i < 0.0 || i as usize >= self.clips.len() {
-            return None;
-        }
-        ((rel - i).abs() * step <= cw * 0.5).then_some(i as usize)
+        self.strip_layout(self.strip_pos)
+            .into_iter()
+            .find(|&(_, cx, w)| (x - cx).abs() <= w * 0.5)
+            .map(|(i, _, _)| i)
     }
 
     /// Rows currently on screen, extended by `margin` prefetch rows.
@@ -1740,7 +1969,17 @@ impl Switchblade {
     /// sweep, which can back up for hours after a recipe change — the
     /// user hovering the seekbar can't wait behind that.
     fn request_quickview_sheet(&mut self) {
-        if !self.quickview || self.tuning.seekbar_thumb_width < 8.0 {
+        // Fullview wants the sheet too — the chapter bar's chips sample
+        // it, and requesting on fullview ENTRY (not bar-open) means the
+        // storyboard is generating/cached before g is ever pressed. But
+        // never before the video being watched has its first frame
+        // (prewarm_ok): sheet generation is nine niced ffmpeg decodes,
+        // and racing them against the interactive cold spawn is exactly
+        // the jank the priority tiers exist to prevent.
+        let want = ((self.quickview && self.tuning.seekbar_thumb_width >= 8.0) || self.fullview)
+            && self.prewarm_ok()
+            && !self.warm_filling();
+        if !want {
             return;
         }
         let Some(clip) = self.clips.get_mut(self.selected) else {
@@ -1761,49 +2000,38 @@ impl Switchblade {
     fn drain_media(&mut self, lay: &Layout) -> Vec<ThumbUpload> {
         let mut uploads = Vec::new();
         let was_pending = self.jobs_total > self.jobs_done;
-        while uploads.len() < MEDIA_UPLOAD_BUDGET {
+        // While the selected stream is actively presenting, background
+        // thumb bursts trickle in under a much smaller per-frame budget:
+        // the full 64-upload batch staged ~80MB of texture writes
+        // between two video frames — a visible playback hitch.
+        let budget = if self
+            .live_sel
+            .as_ref()
+            .is_some_and(|l| l.first_frame.is_some())
+            && !self.sel_parked
+            && !self.paused()
+        {
+            MEDIA_UPLOAD_BUDGET_LIVE
+        } else {
+            MEDIA_UPLOAD_BUDGET
+        };
+        while uploads.len() < budget {
             let Some(result) = self.media.try_recv() else {
                 break;
             };
-            // Chapter-overlay results live outside the jobs ledger: one
-            // request fans out to many results (a plan + a frame per
-            // chip) and none of it is cached background work.
+            // The chapter probe's answer lives outside the jobs ledger
+            // (it isn't cached background work). Cache it per clip —
+            // fullview pre-warms probes ahead of the bar opening — and
+            // install it into the bar when one is waiting.
             let result = match result {
-                ThumbResult::ChapterTimes { path, times } => {
-                    if let Some(v) = &mut self.chapters
-                        && v.path == path
-                    {
-                        v.chips = vec![None; times.len()];
-                        v.times = times;
-                        self.wake(0.6);
-                    }
-                    continue;
-                }
-                ThumbResult::ChapterFrame {
+                ThumbResult::ChapterTimes {
                     path,
-                    index,
-                    w,
-                    h,
-                    rgba,
+                    times,
+                    duration,
                 } => {
-                    let live = self
-                        .chapters
-                        .as_ref()
-                        .is_some_and(|v| v.path == path && index < v.chips.len());
-                    if live && let Some(slot) = self.alloc_slot(lay, SlotKind::Chapter) {
-                        self.slots[slot] = Some((index, SlotKind::Chapter));
-                        self.chapters.as_mut().unwrap().chips[index] =
-                            Some((slot, w, h, Instant::now()));
-                        uploads.push(ThumbUpload { slot, w, h, rgba });
-                        self.wake(0.6);
-                    }
-                    continue;
-                }
-                ThumbResult::ChaptersFailed { path } => {
-                    if self.chapters.as_ref().is_some_and(|v| v.path == path) {
-                        log::info!("chapter overlay unavailable for {}", path.display());
-                        self.close_chapters();
-                    }
+                    self.chapter_probe
+                        .insert(path.clone(), Some((times.clone(), duration)));
+                    self.apply_chapter_plan(&path, &times, duration);
                     continue;
                 }
                 other => other,
@@ -1825,6 +2053,15 @@ impl Switchblade {
                     // Decoded pixels arrived, so the artifact is on disk —
                     // cached even if the atlas drops it below.
                     self.clips[i].cached = true;
+                    // Idempotent install (P1.2 follow-up): coalescing can
+                    // legitimately deliver the same artifact twice (a D
+                    // swap re-requests while the first job is still in
+                    // flight). Free the slot this clip already owns first
+                    // — otherwise it lingers with a stale owner, and its
+                    // eventual eviction clears the clip's CURRENT thumb.
+                    if let Thumb::Ready { slot, .. } = self.clips[i].thumb {
+                        self.slots[slot] = None;
+                    }
                     let Some(slot) = self.alloc_slot(lay, SlotKind::Static) else {
                         // Atlas momentarily full: drop the pixels but stay
                         // retryable — the disk cache makes the redo cheap.
@@ -1853,6 +2090,10 @@ impl Switchblade {
                     let Some(&i) = self.index.get(&path) else {
                         continue;
                     };
+                    // Same idempotent install as the static arm above.
+                    if let Thumb::Ready { slot, .. } = self.clips[i].anim {
+                        self.slots[slot] = None;
+                    }
                     let Some(slot) = self.alloc_slot(lay, SlotKind::Anim) else {
                         log::debug!("anim dropped, atlas full: {}", path.display());
                         self.clips[i].anim = Thumb::None;
@@ -1883,15 +2124,13 @@ impl Switchblade {
                         self.clips[i].cached = true;
                     }
                 }
-                // Chapter results were consumed before the ledger above.
-                ThumbResult::ChapterTimes { .. }
-                | ThumbResult::ChapterFrame { .. }
-                | ThumbResult::ChaptersFailed { .. } => {}
+                // Consumed before the ledger above.
+                ThumbResult::ChapterTimes { .. } => {}
             }
         }
         // Budget hit — more results are likely waiting; take them next
         // frame (P0.3).
-        if uploads.len() >= MEDIA_UPLOAD_BUDGET {
+        if uploads.len() >= budget {
             self.waker.wake();
         }
         // Batch just completed: the progress bar lingers, then fades over
@@ -1920,9 +2159,6 @@ impl Switchblade {
             let in_zone = row >= zone_first && row <= zone_last;
             let class: u8 = match (in_zone, kind) {
                 (_, SlotKind::Live) => 0, // never evicted
-                // Chapter chips free en masse when the overlay closes;
-                // while it's open they're what the user is looking at.
-                (_, SlotKind::Chapter) => 0,
                 (true, SlotKind::Static) => 0,
                 (true, SlotKind::Anim) => 1,
                 (false, SlotKind::Static) => 2,
@@ -1934,10 +2170,9 @@ impl Switchblade {
         }
         let (j, class, _) = best.expect("atlas has at least one slot");
         let min_class = match incoming {
-            // A static, the live frame or a chapter chip may displace
-            // in-zone anims; an anim sheet may not displace anything
-            // in-zone.
-            SlotKind::Static | SlotKind::Live | SlotKind::Chapter => 1,
+            // A static or the live frame may displace in-zone anims;
+            // an anim sheet may not displace anything in-zone.
+            SlotKind::Static | SlotKind::Live => 1,
             SlotKind::Anim => 2,
         };
         if class < min_class {
@@ -1948,7 +2183,7 @@ impl Switchblade {
             match kind {
                 SlotKind::Static => self.clips[victim].thumb = Thumb::None,
                 SlotKind::Anim => self.clips[victim].anim = Thumb::None,
-                SlotKind::Live | SlotKind::Chapter => {}
+                SlotKind::Live => {}
             }
         }
         self.slots[j] = None;
@@ -2317,290 +2552,325 @@ impl Switchblade {
         let mut hovered_group: Vec<Tile> = Vec::new();
         let mut selected_group: Vec<Tile> = Vec::new();
 
-        for row in first_row..=last_row {
-            for col in 0..lay.cols {
-                let i = row * lay.cols + col;
-                if i >= self.clips.len() {
-                    break;
-                }
-                let clip = &self.clips[i];
-
-                // Spawn fade/scale-in.
-                let fade = if !ui {
-                    1.0
-                } else {
-                    match now.checked_duration_since(clip.spawned) {
-                        Some(el) => (el.as_secs_f32() * 1000.0 / t.fade_in_ms.max(1.0)).min(1.0),
-                        None => 0.0,
+        // Modal views freeze the world behind them: the backdrop is a
+        // STATIC snapshot of the grid from the moment the modal opened
+        // (quickview blurs it; fullview covers it entirely, so it draws
+        // NOTHING), and none of the per-tile work below — dots, sheet
+        // frames, skip bars — runs while one is up. One of the bigger
+        // playback levers: cycling sheets behind the frost kept the loop
+        // at display rate for as long as quickview stayed open. A resize
+        // invalidates the snapshot (it stores window positions).
+        let modal = self.quickview || self.fullview;
+        if !modal
+            || self
+                .frozen_grid
+                .as_ref()
+                .is_some_and(|(w, h, _)| *w != self.viewport.width || *h != self.viewport.height)
+        {
+            self.frozen_grid = None;
+        }
+        if let Some((_, _, frozen)) = &self.frozen_grid {
+            tiles = frozen.clone();
+        } else if !self.fullview {
+            for row in first_row..=last_row {
+                for col in 0..lay.cols {
+                    let i = row * lay.cols + col;
+                    if i >= self.clips.len() {
+                        break;
                     }
-                };
-                if fade <= 0.0 {
-                    continue;
-                }
-                let ease = 1.0 - (1.0 - fade) * (1.0 - fade) * (1.0 - fade);
+                    let clip = &self.clips[i];
 
-                let selected = i == self.selected;
-                let hovered = Some(i) == self.hovered;
-                let emphasized = selected || hovered;
-
-                let (mut thumb, tex_mix) = match clip.thumb {
-                    Thumb::Ready { slot, at, tw, th } => {
-                        let m = if !ui {
-                            1.0
-                        } else {
-                            (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
-                                .min(1.0)
-                        };
-                        (
-                            Some((slot, tw as f32, th as f32)),
-                            1.0 - (1.0 - m) * (1.0 - m),
-                        )
-                    }
-                    _ => (None, 0.0),
-                };
-                // The selected tile shows the hires stream (GPU-downscaled
-                // via mips); hovered tiles show their tile-size atlas lane.
-                let mut live_hires: Option<(f32, f32)> = None;
-                if selected {
-                    if let Some(l) = &self.live_sel {
-                        // Path (not index) match: indices churn during the
-                        // D swap. A skip-respawned stream with no frame yet
-                        // keeps showing the texture's last frame — same
-                        // clip, so it reads as a freeze then jump.
-                        if l.path == clip.path
-                            && (l.first_frame.is_some()
-                                || self.hires_shown.as_ref() == Some(&l.path))
-                        {
-                            live_hires = Some((l.player.w as f32, l.player.h as f32));
-                        }
-                    }
-                } else if hovered
-                    && let Some(live) = &self.live_hover
-                    && live.clip == i
-                    && live.first_frame.is_some()
-                {
-                    thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
-                }
-
-                let s = clip.scale * (0.92 + 0.08 * ease);
-                let (wg, hg) = (lay.tile_w * s, lay.tile_h * s);
-                let mut w = wg;
-                let mut h = hg;
-
-                // Emphasized tiles morph (via the emph spring) toward the
-                // clip's own aspect ratio, capped at max_display_aspect
-                // (pan & scan), sized to *cover* the scaled cell box so no
-                // background peeks out behind portrait clips. The crop
-                // below derives from w/h, so it morphs along.
-                let e = clip.emph.clamp(0.0, 1.0);
-                if e > 0.001
-                    && let Some((_, tw, th)) = thumb
-                {
-                    let m = t.max_display_aspect.max(1.0);
-                    let a = (tw / th).clamp(1.0 / m, m);
-                    let (we, he) = if a > wg / hg {
-                        (hg * a, hg)
+                    // Spawn fade/scale-in.
+                    let fade = if !ui {
+                        1.0
                     } else {
-                        (wg, wg / a)
-                    };
-                    w = wg + (we - wg) * e;
-                    h = hg + (he - hg) * e;
-                }
-                let (ox, oy) = self.cell_origin(&lay, col, row);
-                let cx = ox + lay.tile_w * 0.5;
-                let cy = oy + lay.tile_h * 0.5;
-
-                // Texture source: in the grid, a cycling anim-sheet frame
-                // once available (M6); the static thumb otherwise.
-                // Emphasized tiles never use the sheet: its tiny 16:9
-                // crop-fill frames zoom horribly when the tile morphs to
-                // true aspect, and live video (seek-matched to the static
-                // thumb's frame) would land on different content. The
-                // emphasis morph itself keeps the tile alive until then.
-                let anim_allowed = self.sheets_on() && !emphasized && !self.paused();
-                let anim = if anim_allowed {
-                    match clip.anim {
-                        Thumb::Ready { slot, at, tw, th } => Some((slot, at, tw as f32, th as f32)),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                let mut mix = tex_mix;
-                let mut uv2 = [0.0; 4];
-                let mut frame_fade = 0.0;
-                let mut tile_hires = false;
-                let uv = if let Some((lw, lh)) = live_hires {
-                    // Crop the hires video frame to the tile's current
-                    // (morphing) shape, like the static path below.
-                    tile_hires = true;
-                    mix = 1.0;
-                    let target_a = w / h.max(1.0);
-                    let (mut cw, mut ch) = (lw, lh);
-                    if lw / lh > target_a {
-                        cw = lh * target_a;
-                    } else {
-                        ch = lw / target_a;
-                    }
-                    let (hw, hh) = (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
-                    [
-                        ((lw - cw) * 0.5 + 0.5) / hw,
-                        ((lh - ch) * 0.5 + 0.5) / hh,
-                        (cw - 1.0).max(0.0) / hw,
-                        (ch - 1.0).max(0.0) / hh,
-                    ]
-                } else if let Some((slot, at, sw, sh)) = anim {
-                    self.anim_rendered = true;
-                    let cols = self.anim_grid as usize;
-                    let frames = (cols * cols) as f32;
-                    let (fw, fh) = (sw / cols as f32, sh / cols as f32);
-                    // Per-clip phase offset so neighbors don't tick in
-                    // lockstep.
-                    let phase = (i % (cols * cols)) as f32 / frames;
-                    let pos = (anim_t / t.anim_cycle_s.max(0.2) + phase).fract() * frames;
-                    let k = (pos as usize).min(cols * cols - 1);
-
-                    let target_a = w / h.max(1.0);
-                    let (mut cw, mut ch) = (fw, fh);
-                    if fw / fh > target_a {
-                        cw = fh * target_a;
-                    } else {
-                        ch = fw / target_a;
-                    }
-                    let (ox, oy) = ((fw - cw) * 0.5, (fh - ch) * 0.5);
-                    let frame_uv = |kk: usize| {
-                        self.atlas_cfg.uv(
-                            slot,
-                            (kk % cols) as f32 * fw + ox,
-                            (kk / cols) as f32 * fh + oy,
-                            cw,
-                            ch,
-                        )
-                    };
-                    // Crossfade the tail of each frame interval into the
-                    // next frame (blended in the shader — two texture taps).
-                    let win = t.anim_crossfade.clamp(0.0, 1.0);
-                    if win > 0.0 {
-                        let ff = pos - k as f32;
-                        let f = ((ff - (1.0 - win)) / win).clamp(0.0, 1.0);
-                        frame_fade = f * f * (3.0 - 2.0 * f);
-                        uv2 = frame_uv((k + 1) % (cols * cols));
-                    }
-                    let anim_fade = {
-                        let m = (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
-                            .min(1.0);
-                        1.0 - (1.0 - m) * (1.0 - m)
-                    };
-                    // If the static thumb is already showing, swap without
-                    // re-fading (no dip to background).
-                    mix = if thumb.is_some() {
-                        mix.max(anim_fade)
-                    } else {
-                        anim_fade
-                    };
-                    frame_uv(k)
-                } else {
-                    // UV window into the static thumb, cropped to the tile's
-                    // current shape — the shape morphs with the emphasis
-                    // spring, so the crop morphs along with it.
-                    match thumb {
-                        Some((slot, tw, th)) => {
-                            let target_a = w / h.max(1.0);
-                            let (mut cw, mut ch) = (tw, th);
-                            if tw / th > target_a {
-                                cw = th * target_a;
-                            } else {
-                                ch = tw / target_a;
+                        match now.checked_duration_since(clip.spawned) {
+                            Some(el) => {
+                                (el.as_secs_f32() * 1000.0 / t.fade_in_ms.max(1.0)).min(1.0)
                             }
-                            self.atlas_cfg
-                                .uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
+                            None => 0.0,
                         }
-                        None => [0.0; 4],
+                    };
+                    if fade <= 0.0 {
+                        continue;
                     }
-                };
+                    let ease = 1.0 - (1.0 - fade) * (1.0 - fade) * (1.0 - fade);
 
-                // No random placeholder colors: empty tiles are transparent
-                // (thin grey outline below) and the thumbnail fades in from
-                // nothing. Cloud/unreadable keep their status tints.
-                let (fill_rgb, fill_a) = if clip.cloud {
-                    ([0.05, 0.08, 0.13], ease)
-                } else if !clip.readable {
-                    ([0.16, 0.05, 0.06], ease)
-                } else if selected {
-                    // The selected tile always has a body, even before
-                    // its thumbnail exists — but in the window's own
-                    // background color: a lighter grey read as a bright
-                    // flash whenever a tile waited on live video.
-                    (t.background, ease)
-                } else {
-                    ([0.0, 0.0, 0.0], ease * mix)
-                };
+                    let selected = i == self.selected;
+                    let hovered = Some(i) == self.hovered;
+                    let emphasized = selected || hovered;
 
-                let (sb, hb, eb) = (t.selection_border, t.hover_border, t.empty_border);
-                let (border_color, border_width, radius) = if selected {
-                    (
-                        [sb[0], sb[1], sb[2], ease],
-                        t.selection_border_width,
-                        t.selection_corner_radius,
-                    )
-                } else if hovered {
-                    (
-                        [hb[0], hb[1], hb[2], 0.35 * ease],
-                        t.hover_border_width,
-                        t.corner_radius,
-                    )
-                } else if thumb.is_none() && clip.readable && !clip.cloud {
-                    ([eb[0], eb[1], eb[2], ease], 1.0, t.corner_radius)
-                } else {
-                    ([0.0; 4], 0.0, t.corner_radius)
-                };
+                    let (mut thumb, tex_mix) = match clip.thumb {
+                        Thumb::Ready { slot, at, tw, th } => {
+                            let m = if !ui {
+                                1.0
+                            } else {
+                                (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
+                                    .min(1.0)
+                            };
+                            (
+                                Some((slot, tw as f32, th as f32)),
+                                1.0 - (1.0 - m) * (1.0 - m),
+                            )
+                        }
+                        _ => (None, 0.0),
+                    };
+                    // The selected tile shows the hires stream (GPU-downscaled
+                    // via mips); hovered tiles show their tile-size atlas lane.
+                    let mut live_hires: Option<(f32, f32)> = None;
+                    if selected {
+                        if let Some(l) = &self.live_sel {
+                            // Path (not index) match: indices churn during the
+                            // D swap. A skip-respawned stream with no frame yet
+                            // keeps showing the texture's last frame — same
+                            // clip, so it reads as a freeze then jump.
+                            if l.path == clip.path
+                                && (l.first_frame.is_some()
+                                    || self.hires_shown.as_ref() == Some(&l.path))
+                            {
+                                live_hires = Some((l.player.w as f32, l.player.h as f32));
+                            }
+                        }
+                    } else if hovered
+                        && let Some(live) = &self.live_hover
+                        && live.clip == i
+                        && live.first_frame.is_some()
+                    {
+                        thumb = Some((live.slot, live.player.w as f32, live.player.h as f32));
+                    }
 
-                let tile = Tile {
-                    x: cx - w * 0.5,
-                    y: cy - h * 0.5,
-                    w,
-                    h,
-                    color: [fill_rgb[0], fill_rgb[1], fill_rgb[2], fill_a],
-                    border_color,
-                    corner_radius: radius * s,
-                    border_width,
-                    uv,
-                    uv2,
-                    frame_fade,
-                    tex_mix: mix,
-                    hires: tile_hires,
-                };
-                let out = if selected {
-                    &mut selected_group
-                } else if hovered {
-                    &mut hovered_group
-                } else {
-                    &mut tiles
-                };
-                out.push(tile);
-                if clip.cloud && w > 70.0 {
-                    push_cloud_badge(out, &tile, ease);
-                }
-                if matches!(clip.thumb, Thumb::Pending) && w > 70.0 {
-                    // Selected tiles make the wait obvious: big, centered.
-                    push_loading_dots(out, &tile, ease, anim_t, selected);
-                }
-                // Post-skip position flash (in quickview the modal has it).
-                if selected
-                    && !self.quickview
-                    && let Some((pos, a)) = skip_bar
-                {
-                    push_skip_bar(out, &tile, pos, a * ease);
+                    let s = clip.scale * (0.92 + 0.08 * ease);
+                    let (wg, hg) = (lay.tile_w * s, lay.tile_h * s);
+                    let mut w = wg;
+                    let mut h = hg;
+
+                    // Emphasized tiles morph (via the emph spring) toward the
+                    // clip's own aspect ratio, capped at max_display_aspect
+                    // (pan & scan), sized to *cover* the scaled cell box so no
+                    // background peeks out behind portrait clips. The crop
+                    // below derives from w/h, so it morphs along.
+                    let e = clip.emph.clamp(0.0, 1.0);
+                    if e > 0.001
+                        && let Some((_, tw, th)) = thumb
+                    {
+                        let m = t.max_display_aspect.max(1.0);
+                        let a = (tw / th).clamp(1.0 / m, m);
+                        let (we, he) = if a > wg / hg {
+                            (hg * a, hg)
+                        } else {
+                            (wg, wg / a)
+                        };
+                        w = wg + (we - wg) * e;
+                        h = hg + (he - hg) * e;
+                    }
+                    let (ox, oy) = self.cell_origin(&lay, col, row);
+                    let cx = ox + lay.tile_w * 0.5;
+                    let cy = oy + lay.tile_h * 0.5;
+
+                    // Texture source: in the grid, a cycling anim-sheet frame
+                    // once available (M6); the static thumb otherwise.
+                    // Emphasized tiles never use the sheet: its tiny 16:9
+                    // crop-fill frames zoom horribly when the tile morphs to
+                    // true aspect, and live video (seek-matched to the static
+                    // thumb's frame) would land on different content. The
+                    // emphasis morph itself keeps the tile alive until then.
+                    let anim_allowed = self.sheets_on() && !emphasized && !self.paused();
+                    let anim = if anim_allowed {
+                        match clip.anim {
+                            Thumb::Ready { slot, at, tw, th } => {
+                                Some((slot, at, tw as f32, th as f32))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut mix = tex_mix;
+                    let mut uv2 = [0.0; 4];
+                    let mut frame_fade = 0.0;
+                    let mut tile_hires = false;
+                    let uv = if let Some((lw, lh)) = live_hires {
+                        // Crop the hires video frame to the tile's current
+                        // (morphing) shape, like the static path below.
+                        tile_hires = true;
+                        mix = 1.0;
+                        let target_a = w / h.max(1.0);
+                        let (mut cw, mut ch) = (lw, lh);
+                        if lw / lh > target_a {
+                            cw = lh * target_a;
+                        } else {
+                            ch = lw / target_a;
+                        }
+                        let (hw, hh) =
+                            (self.atlas_cfg.hires_w as f32, self.atlas_cfg.hires_h as f32);
+                        [
+                            ((lw - cw) * 0.5 + 0.5) / hw,
+                            ((lh - ch) * 0.5 + 0.5) / hh,
+                            (cw - 1.0).max(0.0) / hw,
+                            (ch - 1.0).max(0.0) / hh,
+                        ]
+                    } else if let Some((slot, at, sw, sh)) = anim {
+                        self.anim_rendered = true;
+                        let cols = self.anim_grid as usize;
+                        let frames = (cols * cols) as f32;
+                        let (fw, fh) = (sw / cols as f32, sh / cols as f32);
+                        // Per-clip phase offset so neighbors don't tick in
+                        // lockstep.
+                        let phase = (i % (cols * cols)) as f32 / frames;
+                        let pos = (anim_t / t.anim_cycle_s.max(0.2) + phase).fract() * frames;
+                        let k = (pos as usize).min(cols * cols - 1);
+
+                        let target_a = w / h.max(1.0);
+                        let (mut cw, mut ch) = (fw, fh);
+                        if fw / fh > target_a {
+                            cw = fh * target_a;
+                        } else {
+                            ch = fw / target_a;
+                        }
+                        let (ox, oy) = ((fw - cw) * 0.5, (fh - ch) * 0.5);
+                        let frame_uv = |kk: usize| {
+                            self.atlas_cfg.uv(
+                                slot,
+                                (kk % cols) as f32 * fw + ox,
+                                (kk / cols) as f32 * fh + oy,
+                                cw,
+                                ch,
+                            )
+                        };
+                        // Crossfade the tail of each frame interval into the
+                        // next frame (blended in the shader — two texture taps).
+                        let win = t.anim_crossfade.clamp(0.0, 1.0);
+                        if win > 0.0 {
+                            let ff = pos - k as f32;
+                            let f = ((ff - (1.0 - win)) / win).clamp(0.0, 1.0);
+                            frame_fade = f * f * (3.0 - 2.0 * f);
+                            uv2 = frame_uv((k + 1) % (cols * cols));
+                        }
+                        let anim_fade = {
+                            let m = (now.saturating_duration_since(at).as_secs_f32()
+                                / THUMB_FADE_S)
+                                .min(1.0);
+                            1.0 - (1.0 - m) * (1.0 - m)
+                        };
+                        // If the static thumb is already showing, swap without
+                        // re-fading (no dip to background).
+                        mix = if thumb.is_some() {
+                            mix.max(anim_fade)
+                        } else {
+                            anim_fade
+                        };
+                        frame_uv(k)
+                    } else {
+                        // UV window into the static thumb, cropped to the tile's
+                        // current shape — the shape morphs with the emphasis
+                        // spring, so the crop morphs along with it.
+                        match thumb {
+                            Some((slot, tw, th)) => {
+                                let target_a = w / h.max(1.0);
+                                let (mut cw, mut ch) = (tw, th);
+                                if tw / th > target_a {
+                                    cw = th * target_a;
+                                } else {
+                                    ch = tw / target_a;
+                                }
+                                self.atlas_cfg
+                                    .uv(slot, (tw - cw) * 0.5, (th - ch) * 0.5, cw, ch)
+                            }
+                            None => [0.0; 4],
+                        }
+                    };
+
+                    // No random placeholder colors: empty tiles are transparent
+                    // (thin grey outline below) and the thumbnail fades in from
+                    // nothing. Cloud/unreadable keep their status tints.
+                    let (fill_rgb, fill_a) = if clip.cloud {
+                        ([0.05, 0.08, 0.13], ease)
+                    } else if !clip.readable {
+                        ([0.16, 0.05, 0.06], ease)
+                    } else if selected {
+                        // The selected tile always has a body, even before
+                        // its thumbnail exists — but in the window's own
+                        // background color: a lighter grey read as a bright
+                        // flash whenever a tile waited on live video.
+                        (t.background, ease)
+                    } else {
+                        ([0.0, 0.0, 0.0], ease * mix)
+                    };
+
+                    let (sb, hb, eb) = (t.selection_border, t.hover_border, t.empty_border);
+                    let (border_color, border_width, radius) = if selected {
+                        (
+                            [sb[0], sb[1], sb[2], ease],
+                            t.selection_border_width,
+                            t.selection_corner_radius,
+                        )
+                    } else if hovered {
+                        (
+                            [hb[0], hb[1], hb[2], 0.35 * ease],
+                            t.hover_border_width,
+                            t.corner_radius,
+                        )
+                    } else if thumb.is_none() && clip.readable && !clip.cloud {
+                        ([eb[0], eb[1], eb[2], ease], 1.0, t.corner_radius)
+                    } else {
+                        ([0.0; 4], 0.0, t.corner_radius)
+                    };
+
+                    let tile = Tile {
+                        x: cx - w * 0.5,
+                        y: cy - h * 0.5,
+                        w,
+                        h,
+                        color: [fill_rgb[0], fill_rgb[1], fill_rgb[2], fill_a],
+                        border_color,
+                        corner_radius: radius * s,
+                        border_width,
+                        uv,
+                        uv2,
+                        frame_fade,
+                        tex_mix: mix,
+                        hires: tile_hires,
+                    };
+                    let out = if selected {
+                        &mut selected_group
+                    } else if hovered {
+                        &mut hovered_group
+                    } else {
+                        &mut tiles
+                    };
+                    out.push(tile);
+                    if clip.cloud && w > 70.0 {
+                        push_cloud_badge(out, &tile, ease);
+                    }
+                    if matches!(clip.thumb, Thumb::Pending) && w > 70.0 {
+                        // Selected tiles make the wait obvious: big, centered.
+                        push_loading_dots(out, &tile, ease, anim_t, selected);
+                    }
+                    // Post-skip position flash (in quickview the modal has it).
+                    if selected
+                        && !self.quickview
+                        && let Some((pos, a)) = skip_bar
+                    {
+                        push_skip_bar(out, &tile, pos, a * ease);
+                    }
                 }
             }
+            tiles.extend(hovered_group);
+            tiles.extend(selected_group);
+            if modal {
+                // First modal frame: this build becomes the frozen backdrop.
+                self.frozen_grid = Some((self.viewport.width, self.viewport.height, tiles.clone()));
+            }
         }
-        tiles.extend(hovered_group);
-        tiles.extend(selected_group);
 
         // Photos-style reflow: when the column count changes (zoom/resize),
-        // the previous layout fades out on top of the new one.
-        if ui && lay.cols != self.last_cols && !self.last_tiles.is_empty() {
+        // the previous layout fades out on top of the new one — never
+        // behind a modal, where the frozen backdrop can't reflow and a
+        // crossfade would just be invisible churn.
+        if modal {
+            self.transition = None;
+        } else if ui && lay.cols != self.last_cols && !self.last_tiles.is_empty() {
             self.transition = Some((std::mem::take(&mut self.last_tiles), now));
         }
         self.last_cols = lay.cols;
@@ -2630,7 +2900,10 @@ impl Switchblade {
         // and show the selected clip large, centered, playing via the live
         // slot. Arrows keep working — the modal follows the selection.
         let mut blur = None;
+        // Skipped entirely under fullview: everything here would sit
+        // behind its opaque black backdrop.
         if self.quickview
+            && !self.fullview
             && let Some(clip) = self.clips.get(self.selected)
         {
             let fade = if !ui {
@@ -2679,7 +2952,7 @@ impl Switchblade {
             let src = self.selected_video_src(clip);
             // The video sits above the filmstrip (geometry shared with
             // the pointer hit-tests via quickview_video_rect).
-            let (chip_w, chip_h, strip_y) = self.strip_geom();
+            let (_, chip_h, strip_y) = self.strip_geom();
             let avail_h = (strip_y - 18.0).max(60.0);
             if let (Some((uv, _, _, hires)), Some((rx, ry, rw, rh))) =
                 (src, self.quickview_video_rect())
@@ -2721,21 +2994,17 @@ impl Switchblade {
             }
 
             // Filmstrip: neighbors along the bottom, selected centered,
-            // sliding on the keyboard chase spring. Foreground layer —
-            // in quickview, actions live here; the grid is backdrop.
-            // Z-order like the grid: hovered chip above its neighbors,
-            // selected chip on top (both scale up and overlap).
-            let step = chip_w + t.strip_gap;
-            let half = (vw / step) as i64 / 2 + 1;
-            let center = self.strip_pos;
+            // sliding on the keyboard chase spring. Chips keep a FIXED
+            // height and take each clip's true aspect for width —
+            // portrait clips are narrower, never taller — so positions
+            // come from the cumulative strip_layout walk. Foreground
+            // layer — in quickview, actions live here; the grid is
+            // backdrop. Z-order like the grid: hovered chip above its
+            // neighbors, selected chip on top (both scale up and
+            // overlap).
             let mut sel_chip: Option<Tile> = None;
             let mut hover_chip: Option<Tile> = None;
-            for di in -half..=half {
-                let idx = center.round() as i64 + di;
-                if idx < 0 || idx as usize >= self.clips.len() {
-                    continue;
-                }
-                let i = idx as usize;
+            for (i, cx, cw_i) in self.strip_layout(self.strip_pos) {
                 let c = &self.clips[i];
                 let sel = i == self.selected;
                 let hov = !sel && self.strip_hover == Some(i);
@@ -2746,11 +3015,11 @@ impl Switchblade {
                 } else {
                     1.0
                 };
-                let (w, h) = (chip_w * s, chip_h * s);
-                let cx = vw * 0.5 + (i as f32 - center) * step;
+                let (w, h) = (cw_i * s, chip_h * s);
                 // The hovered chip plays its lane's video (tile-size,
                 // in the atlas Live slot); everything else shows its
-                // thumb, crop-filled to 16:9.
+                // thumb — cropped only as far as the aspect clamp asks
+                // (usually not at all: the chip IS the clip's shape).
                 let live = self
                     .live_hover
                     .as_ref()
@@ -2762,7 +3031,7 @@ impl Switchblade {
                 });
                 let (uv, has_tex) = match src {
                     Some((slot, tw, th)) => {
-                        let target_a = 16.0 / 9.0;
+                        let target_a = cw_i / chip_h.max(1.0);
                         let (mut cw, mut ch) = (tw, th);
                         if tw / th > target_a {
                             cw = th * target_a;
@@ -2863,9 +3132,13 @@ impl Switchblade {
                         tex_mix: 1.0,
                         hires,
                     });
+                    // The chapter bar owns the bottom edge while up: the
+                    // seekbar fades out as the bar slides in.
+                    let chapter_slide = self.chapters.as_ref().map(|b| b.slide).unwrap_or(0.0);
                     let bar_a = self
                         .seekbar_alpha()
-                        .max(skip_bar.map(|(_, a)| a).unwrap_or(0.0));
+                        .max(skip_bar.map(|(_, a)| a).unwrap_or(0.0))
+                        * (1.0 - chapter_slide);
                     self.push_seekbar(&mut tiles, rx, rw, clip, bar_a);
                 } else {
                     // Nothing decoded yet: loading dots on the black stage.
@@ -2881,126 +3154,157 @@ impl Switchblade {
             }
         }
 
-        // Chapter overlay (`chapter_mode`): floating chips over the same
-        // frosted/dimmed backdrop as quickview, drawn above quickview AND
-        // fullview so `g` works inside either. Chips fill in one by one
-        // as their frames extract; unloaded chips show the window
-        // background (never a lighter placeholder) plus loading dots.
-        if let Some(view) = self.chapters.clone() {
-            let fade = if !ui {
-                1.0
-            } else {
-                (view.opened.elapsed().as_secs_f32() * 1000.0 / t.quickview_fade_ms.max(1.0))
-                    .min(1.0)
-            };
-            let (vw, vh) = (self.viewport.width, self.viewport.height);
-            // Frost the scene below — unless quickview already did, or
-            // fullview's opaque black backdrop makes blurring pointless.
-            if blur.is_none() && !self.fullview && t.quickview_blur >= 0.5 {
-                blur = Some(Blur {
-                    split: tiles.len(),
-                    levels: t.quickview_blur.round() as u32,
-                    fade,
-                });
-            }
-            let full = |x, y, w, h, color| Tile {
-                x,
-                y,
-                w,
-                h,
-                color,
-                border_color: [0.0; 4],
-                corner_radius: 0.0,
-                border_width: 0.0,
-                uv: [0.0; 4],
-                uv2: [0.0; 4],
-                frame_fade: 0.0,
-                tex_mix: 0.0,
-                hires: false,
-            };
-            tiles.push(full(
-                0.0,
-                0.0,
-                vw,
-                vh,
-                [0.0, 0.0, 0.0, t.quickview_dim.clamp(0.0, 1.0) * fade],
-            ));
-
-            let n = view.times.len();
-            if n == 0 {
-                // Plan still probing: big dots center-screen.
-                let stage = full(
-                    (vw - 300.0) * 0.5,
-                    (vh - 100.0) * 0.5,
-                    300.0,
-                    100.0,
-                    [0.0; 4],
-                );
-                push_loading_dots(&mut tiles, &stage, fade, anim_t, true);
-                self.wake(0.3); // keep the dots breathing
-            }
-            let hover = self.chapter_chip_at(self.cursor.0, self.cursor.1);
-            // Highlight the chapter currently playing (selection border).
-            let current = self
-                .live_sel
-                .as_ref()
-                .filter(|l| l.path == view.path && n > 0)
-                .map(|l| {
-                    let p = match l.duration.filter(|d| *d > 0.05) {
-                        Some(d) => l.position().rem_euclid(d),
-                        None => l.position(),
+        // Fullview chapter bar (`chapter_mode`): filmstrip-style chips
+        // sliding up from the bottom edge — real chapter starts or
+        // synthesized checkpoints, imaged from the clip's cached anim
+        // sheet (the same frames the seekbar storyboard shows, so chips
+        // appear as fast as one disk-cached decode). Scrolls sideways
+        // like the quickview filmstrip; the playing chapter wears the
+        // selection border; clicking seeks and sends the bar back down.
+        if let Some(bar) = self.chapters.clone()
+            && bar.slide > 0.005
+            && let Some((anim_src, anim_failed)) = self.clips.get(self.selected).map(|c| {
+                (
+                    match c.anim {
+                        Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
+                        _ => None,
+                    },
+                    matches!(c.anim, Thumb::Failed),
+                )
+            })
+        {
+            let vw = self.viewport.width;
+            let a = bar.slide; // the slide doubles as the bar's alpha
+            let (_, chh, base_y) = self.strip_geom();
+            // Fixed height, the CLIP's true aspect for width: portrait
+            // clips get narrower chips, never taller ones.
+            let cw = self.chapter_chip_w();
+            let strip_y = base_y + (1.0 - bar.slide) * (chh + 44.0);
+            match bar.times.as_deref() {
+                // Probe still out: a few small dots low-center.
+                None => {
+                    let stage = Tile {
+                        x: (vw - 120.0) * 0.5,
+                        y: strip_y,
+                        w: 120.0,
+                        h: chh,
+                        color: [0.0; 4],
+                        border_color: [0.0; 4],
+                        corner_radius: 0.0,
+                        border_width: 0.0,
+                        uv: [0.0; 4],
+                        uv2: [0.0; 4],
+                        frame_fade: 0.0,
+                        tex_mix: 0.0,
+                        hires: false,
                     };
-                    view.times.partition_point(|&t0| t0 <= p).saturating_sub(1)
-                });
-            let (sb, hb, bg) = (t.selection_border, t.hover_border, t.background);
-            for i in 0..n {
-                let (x, y, w, h) = self.chapter_chip_rect(i, n);
-                let chip = view.chips.get(i).copied().flatten();
-                let (uv, mix) = match chip {
-                    Some((slot, tw, th, at)) => {
-                        let m = if !ui {
-                            1.0
-                        } else {
-                            (now.saturating_duration_since(at).as_secs_f32() / THUMB_FADE_S)
-                                .min(1.0)
-                        };
-                        (
-                            self.atlas_cfg.uv(slot, 0.0, 0.0, tw as f32, th as f32),
-                            (1.0 - (1.0 - m) * (1.0 - m)) * fade,
-                        )
-                    }
-                    None => ([0.0; 4], 0.0),
-                };
-                let (border_color, border_width) = if current == Some(i) {
-                    ([sb[0], sb[1], sb[2], fade], t.strip_border_width)
-                } else if hover == Some(i) {
-                    (
-                        [hb[0], hb[1], hb[2], fade],
-                        (t.strip_border_width * 0.5).max(1.0),
-                    )
-                } else {
-                    ([0.30, 0.30, 0.34, 0.55 * fade], 1.0)
-                };
-                let tile = Tile {
-                    x,
-                    y,
-                    w,
-                    h,
-                    color: [bg[0], bg[1], bg[2], fade],
-                    border_color,
-                    corner_radius: t.strip_corner_radius,
-                    border_width,
-                    uv,
-                    uv2: [0.0; 4],
-                    frame_fade: 0.0,
-                    tex_mix: mix,
-                    hires: false,
-                };
-                tiles.push(tile);
-                if chip.is_none() {
-                    push_loading_dots(&mut tiles, &tile, fade, anim_t, false);
+                    push_loading_dots(&mut tiles, &stage, a, anim_t, true);
                     self.wake(0.3);
                 }
+                Some(times) if !times.is_empty() => {
+                    let n = times.len();
+                    let step = cw + t.strip_gap;
+                    let center = bar.pos;
+                    let half = (vw / step) as i64 / 2 + 1;
+                    let hover = self.chapter_chip_at(self.cursor.0, self.cursor.1);
+                    let current = self.current_chapter(&bar);
+                    let d = bar.duration.filter(|d| *d > 0.05);
+                    let (sb, hb, bg) = (t.selection_border, t.hover_border, t.background);
+                    let mut cur_chip: Option<Tile> = None;
+                    let mut hov_chip: Option<Tile> = None;
+                    let mut dot_stages: Vec<Tile> = Vec::new();
+                    for di in -half..=half {
+                        let idx = center.round() as i64 + di;
+                        if idx < 0 || idx as usize >= n {
+                            continue;
+                        }
+                        let i = idx as usize;
+                        let cur = current == Some(i);
+                        let hov = !cur && hover == Some(i);
+                        let s = if cur {
+                            t.strip_selection_scale
+                        } else if hov {
+                            t.strip_hover_scale
+                        } else {
+                            1.0
+                        };
+                        let (w, h) = (cw * s, chh * s);
+                        let cx = vw * 0.5 + (i as f32 - center) * step;
+                        // The nearest anim-sheet cell to this chapter's
+                        // timestamp, center-cropped from the 16:9 cell to
+                        // the chip's (= clip's) aspect so nothing ever
+                        // stretches. Landscape clips crop ~nothing;
+                        // portrait chips show the cell's center band.
+                        let uv = match (anim_src, d) {
+                            (Some((slot, tw, th)), Some(d)) => {
+                                let g = self.anim_grid.max(1) as usize;
+                                let cells = (g * g) as f32;
+                                let f = (times[i] / d).clamp(0.0, 1.0) as f32;
+                                let k = ((f * cells) as usize).min(g * g - 1);
+                                let (fw, fh) = (tw / g as f32, th / g as f32);
+                                let target_a = cw / chh.max(1.0);
+                                let (mut cw2, mut ch2) = (fw, fh);
+                                if fw / fh > target_a {
+                                    cw2 = fh * target_a;
+                                } else {
+                                    ch2 = fw / target_a;
+                                }
+                                Some(self.atlas_cfg.uv(
+                                    slot,
+                                    (k % g) as f32 * fw + (fw - cw2) * 0.5,
+                                    (k / g) as f32 * fh + (fh - ch2) * 0.5,
+                                    cw2,
+                                    ch2,
+                                ))
+                            }
+                            _ => None,
+                        };
+                        let (border_color, border_width) = if cur {
+                            ([sb[0], sb[1], sb[2], a], t.strip_border_width)
+                        } else if hov {
+                            (
+                                [hb[0], hb[1], hb[2], a],
+                                (t.strip_border_width * 0.5).max(1.0),
+                            )
+                        } else {
+                            ([0.30, 0.30, 0.34, 0.55 * a], 1.0)
+                        };
+                        let tile = Tile {
+                            x: cx - w * 0.5,
+                            y: strip_y + (chh - h) * 0.5,
+                            w,
+                            h,
+                            color: [bg[0], bg[1], bg[2], a],
+                            border_color,
+                            corner_radius: t.strip_corner_radius,
+                            border_width,
+                            uv: uv.unwrap_or([0.0; 4]),
+                            uv2: [0.0; 4],
+                            frame_fade: 0.0,
+                            tex_mix: if uv.is_some() { a } else { 0.0 },
+                            hires: false,
+                        };
+                        if cur {
+                            cur_chip = Some(tile);
+                        } else if hov {
+                            hov_chip = Some(tile);
+                        } else {
+                            tiles.push(tile);
+                        }
+                        // Sheet still generating: dots on the chip
+                        // (after the elevated chips so they stay visible).
+                        if uv.is_none() && !anim_failed {
+                            dot_stages.push(tile);
+                            self.wake(0.3);
+                        }
+                    }
+                    tiles.extend(hov_chip);
+                    tiles.extend(cur_chip);
+                    for stage in &dot_stages {
+                        push_loading_dots(&mut tiles, stage, a, anim_t, false);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -3070,8 +3374,33 @@ impl App for Switchblade {
         match event {
             InputEvent::Key { key, .. } => self.key(key),
             InputEvent::Scroll { dx, dy } => {
+                // Chapter bar up: the wheel pans the chapter strip like
+                // the quickview filmstrip — but panning only (chapters
+                // seek on click, never on scroll), clamped so the row's
+                // ends stay reachable and nothing moves underneath.
+                if self.chapters.as_ref().is_some_and(|b| b.open) {
+                    let n = self
+                        .chapters
+                        .as_ref()
+                        .and_then(|b| b.times.as_ref())
+                        .map(|ts| ts.len())
+                        .unwrap_or(0);
+                    let step = self.chapter_chip_w() + self.tuning.strip_gap;
+                    if n > 0 && step > 1.0 {
+                        let d = if dx.abs() > dy.abs() { dx } else { dy };
+                        let (lo, hi) = self.chapter_pos_bounds(n);
+                        let sens = self.tuning.strip_scroll_sensitivity;
+                        if let Some(b) = &mut self.chapters {
+                            b.target = (b.target - d * sens / step).clamp(lo, hi);
+                        }
+                    }
+                    return;
+                }
                 if self.chapters.is_some() {
-                    return; // the overlay floats still; nothing scrolls under it
+                    return; // bar mid-slide: nothing scrolls under it
+                }
+                if self.fullview {
+                    return; // the grid is hidden — nothing to scroll
                 }
                 if self.quickview {
                     // Wheel/trackpad scrubs the filmstrip: the strip slides
@@ -3105,6 +3434,11 @@ impl App for Switchblade {
                 self.chase = self.tuning.snap_strength;
             }
             InputEvent::Pinch { delta } => {
+                // Zooming a frozen/hidden grid is invisible churn — the
+                // gesture belongs to the grid, not the modals.
+                if self.quickview || self.fullview {
+                    return;
+                }
                 let factor = 1.0 + delta * self.tuning.pinch_sensitivity;
                 self.set_zoom(self.zoom_target * factor.max(0.01));
             }
@@ -3132,19 +3466,20 @@ impl App for Switchblade {
                 self.focused = focused;
             }
             InputEvent::MouseDown { x, y } => {
-                // Chapter overlay first: a chip click jumps the playing
-                // clip there; any other click just closes the overlay.
-                if self.chapters.is_some() {
-                    if let Some(i) = self.chapter_chip_at(x, y) {
-                        self.chapter_seek(i);
-                    }
-                    self.close_chapters();
-                    return;
-                }
-                // In fullview the seekbar grabs first (click = seek, hold =
-                // scrub); any other click exits — the grid it would select
-                // is hidden behind the black backdrop.
+                // In fullview: an open chapter bar grabs first — a chip
+                // click seeks the video to that chapter and sends the
+                // bar back down; any other click just closes the bar
+                // (fullview stays). Then the seekbar (click = seek,
+                // hold = scrub); any other click exits — the grid it
+                // would select is hidden behind the black backdrop.
                 if self.fullview {
+                    if self.chapters.as_ref().is_some_and(|b| b.open) {
+                        if let Some(i) = self.chapter_chip_at(x, y) {
+                            self.chapter_seek(i);
+                        }
+                        self.close_chapter_bar();
+                        return;
+                    }
                     if let Some(f) = self.seekbar_hit(x, y) {
                         self.scrubbing = true;
                         self.seekbar_seen = Some(Instant::now());
@@ -3204,20 +3539,42 @@ impl App for Switchblade {
 
     fn frame(&mut self, dt: f32, viewport: Viewport) -> Frame {
         self.viewport = viewport;
-        if let Some(cfg) = self.tuning_file.poll() {
+        if let Some(f) = &mut self.tuning_file
+            && let Some(cfg) = f.poll()
+        {
             self.tuning = cfg.tuning;
             self.keymap = cfg.keymap;
         }
         self.drain_ingest();
-        // The chapter overlay describes one clip: if the selection left
-        // it (random jump, shuffle landing elsewhere, D swap churn),
-        // close rather than show stale moments over the wrong video.
-        if self.chapters.as_ref().is_some_and(|v| {
-            self.clips
-                .get(self.selected)
-                .is_none_or(|c| c.path != v.path)
+        // The chapter bar is a fullview add-on describing one clip: drop
+        // it the moment fullview exits or the selection leaves its clip
+        // (movement keys, random jump, D swap churn) — no slide-out, the
+        // whole context changed.
+        if self.chapters.as_ref().is_some_and(|b| {
+            !self.fullview
+                || self
+                    .clips
+                    .get(self.selected)
+                    .is_none_or(|c| c.path != b.path)
         }) {
-            self.close_chapters();
+            self.chapters = None;
+        }
+        // Fullview pre-warms the chapter probe for the clip on screen,
+        // so pressing g finds the plan already cached (the anim sheet
+        // pre-warms too, via request_quickview_sheet's fullview gate) —
+        // but only after the watched stream is up (prewarm_ok).
+        if self.fullview && !self.demo && self.prewarm_ok() {
+            let path = self
+                .clips
+                .get(self.selected)
+                .filter(|c| c.readable && !c.cloud)
+                .map(|c| c.path.clone());
+            if let Some(path) = path
+                && !self.chapter_probe.contains_key(&path)
+            {
+                self.chapter_probe.insert(path.clone(), None);
+                self.media.request_chapters(path);
+            }
         }
         self.tick_skip_timer();
         self.step(dt);
@@ -3384,6 +3741,22 @@ fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: b
     }
 }
 
+/// Synthesized chapter-checkpoint count for a clip with no real chapters:
+/// none under a minute (the bar just doesn't show), 4 over a minute
+/// (every 25%), 8 over three minutes, 10 over ten. Starts land at k/n of
+/// the duration, so chapter 1 is always the clip's opening.
+fn checkpoint_count(d: f64) -> usize {
+    if d > 600.0 {
+        10
+    } else if d > 180.0 {
+        8
+    } else if d >= 60.0 {
+        4
+    } else {
+        0
+    }
+}
+
 /// Cheap non-crypto randomness (jump_random / shuffle_library) with no new
 /// dependency: std's HashMap hasher is seeded from system entropy per
 /// instance, so one finish() makes a seed; xorshift stretches it.
@@ -3441,6 +3814,7 @@ mod tests {
             animation: Some(AnimLevel::None), // no live decoders in tests
             inputs: vec![dir.join("b.mp4")],
             demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         assert!(
@@ -3474,6 +3848,7 @@ mod tests {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         app.jobs_total = 500;
@@ -3499,6 +3874,7 @@ mod tests {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3571,6 +3947,7 @@ mod tests {
             animation: Some(AnimLevel::Normal),
             inputs: vec![clip],
             demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         assert!(
@@ -3621,6 +3998,7 @@ mod tests {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3672,6 +4050,7 @@ mod tests {
             animation: Some(AnimLevel::Normal), // live lanes enabled
             inputs: vec![bad.clone()],
             demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         assert!(pump_until(&mut app, |a| a.clips.len() == 1), "ingest");
@@ -3757,6 +4136,7 @@ mod tests {
             animation: Some(AnimLevel::Normal),
             inputs: vec![clip],
             demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         assert!(
@@ -3875,6 +4255,7 @@ mod tests {
             animation: Some(AnimLevel::Normal),
             inputs: vec![clip],
             demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         assert!(
@@ -3967,6 +4348,7 @@ mod tests {
             animation: Some(AnimLevel::None), // no live decoders in tests
             inputs: vec![dir.clone()],
             demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         assert!(pump_until(&mut app, |a| a.clips.len() == 3), "ingest");
@@ -3997,6 +4379,7 @@ mod tests {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         // Demo mode skips the index map (no media routing); build it the
@@ -4056,6 +4439,7 @@ mod tests {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None), // no live: counts from selection
             demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         let vp = Viewport {
@@ -4085,70 +4469,432 @@ mod tests {
         assert_eq!(app.selected, 0, "wraps to the first clip");
     }
 
-    /// Chapter overlay: hit-tests agree with the drawn geometry, Esc
-    /// closes it (freeing its atlas slots), and the overlay closes on
-    /// its own when the selection leaves its clip.
+    /// The fullview chapter bar: synthesized checkpoint counts follow
+    /// the duration ladder, chip hit-tests agree with the strip
+    /// geometry, Esc peels the bar before exiting fullview, and leaving
+    /// fullview or the bar's clip drops the state.
     #[test]
-    fn chapter_overlay_hit_tests_and_lifecycle() {
+    fn chapter_bar_checkpoints_and_lifecycle() {
+        // The checkpoint ladder for chapterless clips.
+        assert_eq!(checkpoint_count(30.0), 0, "under a minute: no bar");
+        assert_eq!(checkpoint_count(60.0), 4, "a minute up: every 25%");
+        assert_eq!(checkpoint_count(200.0), 8, "over three minutes: 8");
+        assert_eq!(checkpoint_count(700.0), 10, "over ten minutes: 10");
+
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
         let open = |app: &mut Switchblade, n: usize| {
-            app.chapters = Some(ChapterView {
+            app.fullview = true;
+            let last = n.saturating_sub(1) as f32;
+            app.chapters = Some(ChapterBar {
                 path: app.clips[app.selected].path.clone(),
-                opened: Instant::now(),
-                times: (0..n).map(|k| k as f64 * 10.0).collect(),
-                chips: vec![None; n],
+                duration: Some(400.0),
+                times: Some((0..n).map(|k| k as f64 * 50.0).collect()),
+                open: true,
+                slide: 1.0,
+                pos: last * 0.5,
+                target: last * 0.5,
             });
         };
-        // Every chip's center maps back to itself; the pad between two
-        // chips maps to nothing (12 chips = a partial-row-free grid;
-        // 14 exercises the centered partial last row).
-        for n in [12usize, 14] {
-            open(&mut app, n);
-            for i in 0..n {
-                let (x, y, w, h) = app.chapter_chip_rect(i, n);
-                assert_eq!(
-                    app.chapter_chip_at(x + w * 0.5, y + h * 0.5),
-                    Some(i),
-                    "chip {i} of {n} center hit"
-                );
-            }
-            let (x, y, _, h) = app.chapter_chip_rect(1, n);
+
+        // Chip centers map back to their index (8 chips all fit at
+        // 1280×800 with pos centered), the gap between chips is dead.
+        open(&mut app, 8);
+        let (cw, ch, sy) = app.strip_geom();
+        let step = cw + app.tuning.strip_gap;
+        let center = app.chapters.as_ref().unwrap().pos;
+        for i in 0..8 {
+            let cx = vp.width * 0.5 + (i as f32 - center) * step;
             assert_eq!(
-                app.chapter_chip_at(x - app.tuning.chapter_pad * 0.5, y + h * 0.5),
-                None,
-                "the gap between chips is dead space"
+                app.chapter_chip_at(cx, sy + ch * 0.5),
+                Some(i),
+                "chip {i} center hit"
             );
-            app.chapters = None;
+            assert_eq!(
+                app.chapter_chip_at(cx + step * 0.5, sy + ch * 0.5),
+                None,
+                "gap right of chip {i} is dead space"
+            );
         }
 
-        // Esc closes and frees the overlay's atlas slots.
-        open(&mut app, 12);
-        app.slots[0] = Some((3, SlotKind::Chapter));
+        // Esc slides the bar down but stays in fullview; the state
+        // drops once the (snap-mode) slide lands in step().
         app.event(InputEvent::Key {
             key: Key::Escape,
             repeat: false,
         });
-        assert!(app.chapters.is_none(), "Esc closes the overlay");
-        assert!(app.slots[0].is_none(), "chapter slots freed on close");
-
-        // Selection leaving the overlay's clip closes it next frame.
-        open(&mut app, 12);
-        app.selected += 1;
-        let _ = app.frame(
-            0.016,
-            Viewport {
-                width: 1280.0,
-                height: 800.0,
-            },
+        assert!(
+            app.chapters.as_ref().is_some_and(|b| !b.open),
+            "Esc closes the bar first"
         );
+        assert!(app.fullview, "fullview survives the first Esc");
+        for _ in 0..3 {
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(app.chapters.is_none(), "landed slide drops the state");
+        app.event(InputEvent::Key {
+            key: Key::Escape,
+            repeat: false,
+        });
+        assert!(!app.fullview, "second Esc exits fullview");
+
+        // Exiting fullview drops the bar outright…
+        open(&mut app, 8);
+        app.fullview = false;
+        let _ = app.frame(0.016, vp);
+        assert!(app.chapters.is_none(), "bar dies with fullview");
+
+        // …and so does the selection leaving the bar's clip.
+        open(&mut app, 8);
+        app.selected += 1;
+        let _ = app.frame(0.016, vp);
         assert!(
             app.chapters.is_none(),
-            "overlay closes when the selection moves off its clip"
+            "bar drops when the selection moves off its clip"
         );
+    }
+
+    /// `--no-config` runs on the internal defaults with no config file
+    /// watched at all — behavior can't be steered by a stray
+    /// ./switchblade.toml or ~/.config file (every test here passes it).
+    #[test]
+    fn no_config_runs_on_internal_defaults() {
+        let app = Switchblade::with_options(Options {
+            demo: true,
+            no_config: true,
+            ..Options::default()
+        });
+        assert!(app.tuning_file.is_none(), "no config file is watched");
+        assert_eq!(
+            app.tuning.selection_scale,
+            Tuning::default().selection_scale,
+            "internal defaults apply"
+        );
+    }
+
+    /// Modal views freeze the world behind them: the grid backdrop is a
+    /// static snapshot from the moment the modal opened — no per-clip
+    /// springs run, selection changes don't animate hidden tiles, and
+    /// the snapshot drops (simulation resumes) the moment the modal
+    /// closes.
+    #[test]
+    fn modal_backdrop_freezes_the_grid() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None), // springs snap in one frame
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        // Pin the scale the test observes — a user-level config on the
+        // machine running the tests could otherwise neutralize it.
+        app.tuning.selection_scale = 1.3;
+        app.tuning.selection_zoom_boost = 0.0;
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let _ = app.frame(0.016, vp);
+        assert!(
+            app.clips[0].scale > 1.05,
+            "selected tile scaled up in the open grid"
+        );
+
+        app.quickview = true;
+        let _ = app.frame(0.016, vp);
+        assert!(app.frozen_grid.is_some(), "backdrop snapshot captured");
+
+        // Selection moves while the modal is up: the hidden grid must
+        // not simulate — no spring catches up, the snapshot stands.
+        app.selected = 1;
+        for _ in 0..3 {
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(
+            app.clips[1].scale < 1.01,
+            "hidden tile never animated behind the modal"
+        );
+        assert!(
+            app.clips[0].scale > 1.05,
+            "old selection never shrank behind the modal"
+        );
+
+        // Exit: snapshot drops, simulation resumes (snap mode = 1 frame).
+        app.quickview = false;
+        let _ = app.frame(0.016, vp);
+        assert!(app.frozen_grid.is_none(), "snapshot dropped on exit");
+        assert!(
+            app.clips[1].scale > 1.05 && app.clips[0].scale < 1.01,
+            "springs resumed once the grid is visible again"
+        );
+    }
+
+    /// Fullview must never hover-play the hidden grid: the pointer still
+    /// sits "over" an invisible tile behind the black backdrop, and each
+    /// pointer rest used to cold-spawn a hover decoder for a clip nobody
+    /// can see — stealing CPU and the media engine from the video being
+    /// watched.
+    #[test]
+    fn fullview_suppresses_hidden_grid_hover() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let g = app.tuning.gap;
+        app.event(InputEvent::CursorMoved {
+            x: g + 10.0,
+            y: g + 10.0,
+        });
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.hovered, Some(0), "grid hover works normally");
+
+        app.fullview = true;
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.hovered, None, "fullview: no hidden-tile hover");
+
+        app.fullview = false;
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.hovered, Some(0), "hover returns with the grid");
+    }
+
+    /// Fullview's chapter-probe prewarm defers to the video being
+    /// watched: nothing fires while a live stream is expected but hasn't
+    /// delivered its first frame — until the dead-stream grace expires.
+    #[test]
+    fn fullview_prewarm_waits_for_the_playing_stream() {
+        let dir = std::env::temp_dir().join("sb_app_prewarm_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"").unwrap();
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal), // live video expected
+            inputs: vec![dir.join("a.mp4")],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(pump_until(&mut app, |a| a.clips.len() == 1), "ingest");
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+
+        // Stream expected (level normal) but not up: the prewarm holds.
+        app.sel_changed_at = Instant::now();
+        app.fullview = true;
+        for _ in 0..3 {
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(
+            app.chapter_probe.is_empty(),
+            "prewarm must wait for the watched stream's first frame"
+        );
+
+        // A stream that never delivers releases the gate after the grace
+        // — the storyboard must not starve behind a dead decoder.
+        app.sel_changed_at = Instant::now() - Duration::from_secs_f32(PREWARM_GRACE_S + 1.0);
+        let _ = app.frame(0.016, vp);
+        assert!(
+            app.chapter_probe.contains_key(&app.clips[0].path),
+            "grace expiry lets the probe prewarm through"
+        );
+    }
+
+    /// Strip chips keep a fixed height and take each clip's true aspect
+    /// for width: a portrait clip's chip is narrower (never taller),
+    /// neighbors space by the sum of half-widths, hit-tests follow the
+    /// variable layout, and the chapter bar adopts the selected clip's
+    /// shape for all its chips.
+    #[test]
+    fn strip_chips_keep_true_aspect_at_fixed_height() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let (_, ch, sy) = app.strip_geom();
+        let gap = app.tuning.strip_gap;
+        // Clip 5 is portrait (9:16); its neighbors have no thumbs and
+        // default to 16:9.
+        app.clips[5].thumb = Thumb::Ready {
+            slot: 0,
+            at: Instant::now(),
+            tw: 360,
+            th: 640,
+        };
+        let layout = app.strip_layout(5.0);
+        let find = |i: usize| {
+            layout
+                .iter()
+                .find(|&&(k, _, _)| k == i)
+                .copied()
+                .unwrap_or_else(|| panic!("chip {i} missing from layout"))
+        };
+        let (_, cx5, w5) = find(5);
+        let (_, cx6, w6) = find(6);
+        let (_, cx4, w4) = find(4);
+        assert!(
+            (w5 - ch * 9.0 / 16.0).abs() < 0.5,
+            "portrait chip is 9:16 at the fixed height, got {w5}"
+        );
+        assert!(
+            (w6 - ch * 16.0 / 9.0).abs() < 0.5,
+            "thumbless neighbor stays 16:9, got {w6}"
+        );
+        assert!(
+            (cx6 - cx5 - ((w5 + w6) * 0.5 + gap)).abs() < 0.5,
+            "neighbors space by half-widths plus the gap"
+        );
+        assert!(
+            ((cx5 - cx4) - ((w4 + w5) * 0.5 + gap)).abs() < 0.5,
+            "left neighbor spaces the same way"
+        );
+        // Hit-tests follow the variable widths.
+        app.quickview = true;
+        app.strip_pos = 5.0;
+        assert_eq!(app.strip_chip_at(cx5, sy + ch * 0.5), Some(5));
+        assert_eq!(app.strip_chip_at(cx6, sy + ch * 0.5), Some(6));
+        assert_eq!(
+            app.strip_chip_at(cx5 + w5 * 0.5 + gap * 0.5, sy + ch * 0.5),
+            None,
+            "the gap between chips stays dead space"
+        );
+        // The chapter bar adopts the selected clip's aspect.
+        app.selected = 5;
+        assert!(
+            (app.chapter_chip_w() - ch * 9.0 / 16.0).abs() < 0.5,
+            "chapter chips share the portrait clip's shape"
+        );
+        app.selected = 6;
+        assert!(
+            (app.chapter_chip_w() - ch * 16.0 / 9.0).abs() < 0.5,
+            "…and a 16:9 clip's shape"
+        );
+    }
+
+    /// End to end: `g` enters fullview and raises the bar, the probe
+    /// reports the file's real chapters, and clicking a chip seeks the
+    /// resident stream to that chapter and sends the bar down. Needs
+    /// ffmpeg; skipped quietly when missing.
+    #[test]
+    fn chapter_click_seeks_the_stream() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_chapter_click_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.mp4");
+        let clip = dir.join("chaptered.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=8:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&plain)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+            let metafile = dir.join("chapters.txt");
+            std::fs::write(
+                &metafile,
+                ";FFMETADATA1\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=3000\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=3000\nEND=6000\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=6000\nEND=8000\n",
+            )
+            .unwrap();
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error"])
+                .arg("-i")
+                .arg(&plain)
+                .arg("-i")
+                .arg(&metafile)
+                .args(["-map_metadata", "1", "-codec", "copy"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to mux chapters");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+
+        app.toggle_chapters();
+        assert!(app.fullview, "g enters fullview");
+        assert!(
+            app.chapters.as_ref().is_some_and(|b| b.open),
+            "the bar opens"
+        );
+        assert!(
+            pump_until(&mut app, |a| a
+                .chapters
+                .as_ref()
+                .is_some_and(|b| b.times.is_some() && b.slide > 0.9)),
+            "chapter probe never answered / bar never slid up"
+        );
+        let bar = app.chapters.as_ref().unwrap().clone();
+        let times = bar.times.as_ref().unwrap();
+        assert_eq!(times.len(), 3, "the file's real chapters, not checkpoints");
+        assert!((times[1] - 3.0).abs() < 0.05, "second chapter at 3s");
+
+        // Click the third chip: the SAME stream lands on ~6s and the
+        // bar slides back down.
+        let (cw, ch, sy) = app.strip_geom();
+        let step = cw + app.tuning.strip_gap;
+        let cx = 1280.0 * 0.5 + (2.0 - bar.pos) * step;
+        let cy = sy + (1.0 - bar.slide) * (ch + 44.0) + ch * 0.5;
+        app.event(InputEvent::MouseDown { x: cx, y: cy });
+        let l = app.live_sel.as_ref().expect("stream survives the click");
+        assert!(l.first_frame.is_some(), "no respawn");
+        let p = l.position();
+        assert!((5.5..=6.5).contains(&p), "seeked to chapter 3, got {p}");
+        assert!(
+            app.chapters.as_ref().is_none_or(|b| !b.open),
+            "the bar slides down after the click"
+        );
+        assert!(app.fullview, "fullview stays");
     }
 
     /// `jump_random` always lands somewhere else, and only ever on a clip
@@ -4158,6 +4904,7 @@ mod tests {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
         for _ in 0..50 {
