@@ -5,10 +5,12 @@ mod commands;
 mod ingest;
 mod tuning;
 
-pub use tuning::{AnimLevel, BackdropStyle, Tuning, config_path};
+pub use tuning::{AnimLevel, BackdropStyle, GridStyle, Tuning, config_path};
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -61,12 +63,58 @@ const SKIP_TIMER_SPAWN_GRACE_S: f32 = 3.0;
 const DEMO_TILES: usize = 480;
 
 /// Derived per-frame grid metrics; see [`Switchblade::layout`].
+/// `cols`/`tile_*`/`cell_*` are the fixed grid's uniform cells — in
+/// flexible mode they stay as the NOMINAL metrics (reflow-crossfade
+/// trigger, anim-size gate, budget estimates) and `flex` carries the
+/// real per-row geometry. All position/hit/row math goes through the
+/// mode-agnostic helpers (`tile_rect`, `row_of`, `row_range`,
+/// `row_at_y`), never through the uniform fields directly.
 struct Layout {
     cols: usize,
     tile_w: f32,
     tile_h: f32,
     cell_w: f32,
     cell_h: f32,
+    /// Justified rows (grid_layout = "flexible"); None = fixed grid.
+    flex: Option<Rc<FlexGrid>>,
+}
+
+/// The flexible ("justified"/mosaic) grid: rows of true-aspect tiles at
+/// a shared per-row height, each row's height flexed so it spans the
+/// viewport width. Rebuilt only when its inputs change (viewport width,
+/// zoom, clip count, an aspect landing, grid tuning) — see `flex_grid`.
+struct FlexGrid {
+    rows: Vec<FlexRow>,
+    /// Content height including the trailing gap.
+    height: f32,
+}
+
+struct FlexRow {
+    /// Clips `start..end` in library order.
+    start: usize,
+    end: usize,
+    /// Content-space top edge (scroll not applied) and row height.
+    y: f32,
+    h: f32,
+    /// Per-tile left edge and width, indexed by `i - start`.
+    x: Vec<f32>,
+    w: Vec<f32>,
+}
+
+/// Cache key for the flexible layout — every input that shapes it.
+/// f32 inputs are compared by bit pattern.
+#[derive(Clone, Copy, PartialEq)]
+struct FlexKey {
+    vw: u32,
+    zoom: u32,
+    len: usize,
+    /// Bumped on aspect arrivals, shuffles and library swaps.
+    rev: u64,
+    tile_w: u32,
+    tile_h: u32,
+    gap: u32,
+    rmin: u32,
+    rmax: u32,
 }
 
 enum Thumb {
@@ -186,6 +234,12 @@ struct Clip {
     /// Sprite-sheet animation (M6): frames cycle in the grid; the static
     /// thumb stays authoritative for the emphasized tile.
     anim: Thumb,
+    /// Displayed aspect (w/h), learned when the static thumb first
+    /// delivers (fit-scaled, rotation applied) and kept for the session —
+    /// atlas eviction must not reflow the flexible grid or reshape strip
+    /// chips, so this outlives `Thumb::Ready`. None until known (16:9
+    /// assumed).
+    aspect: Option<f32>,
 }
 
 /// Startup options from the CLI (config handles everything else).
@@ -323,6 +377,13 @@ pub struct Switchblade {
     /// the first modal frame and reused until every modal closes (or the
     /// window resizes). While it stands, no grid simulation runs at all.
     frozen_grid: Option<(f32, f32, Vec<Tile>)>,
+    /// Memoized flexible-grid geometry: rebuilding is O(library), so it
+    /// only happens when an input in `FlexKey` actually changed.
+    /// RefCell because `layout()` is called from `&self` contexts.
+    flex_cache: RefCell<Option<(FlexKey, Rc<FlexGrid>)>>,
+    /// Bumped whenever flexible-layout inputs outside `FlexKey`'s plain
+    /// fields change: an aspect arrival, a shuffle, a library swap.
+    grid_rev: u64,
     /// Previous frame's tiles + column count, for the reflow crossfade.
     last_cols: usize,
     last_tiles: Vec<Tile>,
@@ -588,6 +649,8 @@ impl Switchblade {
             zoom_target: 1.0,
             chase: 0.22,
             frozen_grid: None,
+            flex_cache: RefCell::new(None),
+            grid_rev: 0,
             last_cols: 0,
             last_tiles: Vec::new(),
             transition: None,
@@ -627,6 +690,12 @@ impl Switchblade {
                     emph: 0.0,
                     thumb: Thumb::Failed, // demo paths aren't real; never request
                     anim: Thumb::Failed,
+                    // A varied spread so --demo shows off the flexible
+                    // layout: mostly landscape, some portrait/square.
+                    aspect: Some(
+                        [16.0 / 9.0, 9.0 / 16.0, 16.0 / 9.0, 1.0, 4.0 / 3.0, 2.35, 16.0 / 9.0]
+                            [i % 7],
+                    ),
                 });
             }
         }
@@ -649,29 +718,206 @@ impl Switchblade {
         let cols = (((self.viewport.width - t.gap) / (ideal + t.gap)).floor() as usize).max(1);
         let tile_w = ((self.viewport.width - t.gap * (cols as f32 + 1.0)) / cols as f32).max(1.0);
         let tile_h = tile_w * t.tile_height / t.tile_width.max(1.0);
+        let flex = (t.grid_layout == GridStyle::Flexible).then(|| self.flex_grid(zoom));
         Layout {
             cols,
             tile_w,
             tile_h,
             cell_w: tile_w + t.gap,
             cell_h: tile_h + t.gap,
+            flex,
         }
     }
 
-    fn rows(&self, lay: &Layout) -> usize {
-        self.clips.len().div_ceil(lay.cols)
+    /// The flexible grid for this zoom, memoized until an input changes
+    /// (`FlexKey`): a zoom glide or thumb-burst rebuilds per change, but
+    /// a settled grid costs one key comparison per `layout()` call.
+    fn flex_grid(&self, zoom: f32) -> Rc<FlexGrid> {
+        let t = &self.tuning;
+        let key = FlexKey {
+            vw: self.viewport.width.to_bits(),
+            zoom: zoom.to_bits(),
+            len: self.clips.len(),
+            rev: self.grid_rev,
+            tile_w: t.tile_width.to_bits(),
+            tile_h: t.tile_height.to_bits(),
+            gap: t.gap.to_bits(),
+            rmin: t.row_height_min.to_bits(),
+            rmax: t.row_height_max.to_bits(),
+        };
+        let mut cache = self.flex_cache.borrow_mut();
+        if let Some((k, grid)) = cache.as_ref()
+            && *k == key
+        {
+            return grid.clone();
+        }
+        let grid = Rc::new(self.build_flex(zoom));
+        *cache = Some((key, grid.clone()));
+        grid
     }
 
-    fn cell_origin(&self, lay: &Layout, col: usize, row: usize) -> (f32, f32) {
-        let g = self.tuning.gap;
-        (
-            g + col as f32 * lay.cell_w,
-            g + row as f32 * lay.cell_h - self.scroll,
-        )
+    /// Justified layout: rows fill greedily with true-aspect tiles at
+    /// the nominal height, then each row scales so it exactly spans the
+    /// viewport width — capped to `row_height_min/max` × nominal, so a
+    /// capped row leaves a little slack instead of ballooning. The last
+    /// (underfull) row never grows past nominal height.
+    fn build_flex(&self, zoom: f32) -> FlexGrid {
+        let t = &self.tuning;
+        let g = t.gap;
+        let vw = self.viewport.width;
+        let ideal_w = (t.tile_width * zoom).max(40.0);
+        let nominal_h = (ideal_w * t.tile_height / t.tile_width.max(1.0)).max(24.0);
+        let rmin = t.row_height_min.clamp(0.1, 1.0);
+        let rmax = t.row_height_max.clamp(1.0, 4.0);
+        // Width available to `cnt` tiles (side margins + inner gaps).
+        let usable = |cnt: f32| (vw - g * (cnt + 1.0)).max(1.0);
+        let aspect = |i: usize| self.chip_aspect(i);
+
+        let n = self.clips.len();
+        let mut rows = Vec::new();
+        let mut y = g;
+        let mut i = 0;
+        while i < n {
+            let start = i;
+            let mut sum = nominal_h * aspect(i);
+            i += 1;
+            // Fill while the row still fits at nominal height.
+            while i < n {
+                let w = nominal_h * aspect(i);
+                let cnt = (i - start) as f32;
+                if sum + w > usable(cnt + 1.0) {
+                    break;
+                }
+                sum += w;
+                i += 1;
+            }
+            // The overflowing clip still joins when shrinking with it
+            // lands nearer nominal than growing without it — and never
+            // below the min cap (that would overflow the right edge).
+            if i < n {
+                let cnt = (i - start) as f32;
+                let w = nominal_h * aspect(i);
+                let s_with = usable(cnt + 1.0) / (sum + w);
+                let s_without = usable(cnt) / sum;
+                if s_with >= rmin && s_with.ln().abs() < s_without.ln().abs() {
+                    sum += w;
+                    i += 1;
+                }
+            }
+            let cnt = (i - start) as f32;
+            let raw = usable(cnt) / sum;
+            let scale = if i == n {
+                raw.clamp(rmin, 1.0)
+            } else {
+                raw.clamp(rmin, rmax)
+            };
+            let h = nominal_h * scale;
+            let mut x = Vec::with_capacity(i - start);
+            let mut w = Vec::with_capacity(i - start);
+            let mut cx = g;
+            for j in start..i {
+                x.push(cx);
+                let tw = nominal_h * aspect(j) * scale;
+                w.push(tw);
+                cx += tw + g;
+            }
+            rows.push(FlexRow {
+                start,
+                end: i,
+                y,
+                h,
+                x,
+                w,
+            });
+            y += h + g;
+        }
+        FlexGrid { rows, height: y }
+    }
+
+    fn rows(&self, lay: &Layout) -> usize {
+        match &lay.flex {
+            Some(f) => f.rows.len(),
+            None => self.clips.len().div_ceil(lay.cols),
+        }
+    }
+
+    /// Row containing clip `i` (both modes).
+    fn row_of(&self, lay: &Layout, i: usize) -> usize {
+        match &lay.flex {
+            Some(f) => f.rows.partition_point(|r| r.start <= i).saturating_sub(1),
+            None => i / lay.cols.max(1),
+        }
+    }
+
+    /// Clip indices in `row` (clamped to the library; empty when out of
+    /// range).
+    fn row_range(&self, lay: &Layout, row: usize) -> std::ops::Range<usize> {
+        match &lay.flex {
+            Some(f) => f.rows.get(row).map(|r| r.start..r.end).unwrap_or(0..0),
+            None => {
+                let s = (row * lay.cols).min(self.clips.len());
+                s..(s + lay.cols).min(self.clips.len())
+            }
+        }
+    }
+
+    /// Content-space rect `(x, y, w, h)` of tile `i` (scroll NOT applied).
+    fn tile_rect(&self, lay: &Layout, i: usize) -> (f32, f32, f32, f32) {
+        match &lay.flex {
+            Some(f) => {
+                let g = self.tuning.gap;
+                let Some(r) = f.rows.get(self.row_of(lay, i)) else {
+                    return (g, g, lay.tile_w, lay.tile_h); // empty grid
+                };
+                let j = i - r.start;
+                if j >= r.x.len() {
+                    return (g, r.y, lay.tile_w, r.h); // defensive: index past the row
+                }
+                (r.x[j], r.y, r.w[j], r.h)
+            }
+            None => {
+                let g = self.tuning.gap;
+                let cols = lay.cols.max(1);
+                (
+                    g + (i % cols) as f32 * lay.cell_w,
+                    g + (i / cols) as f32 * lay.cell_h,
+                    lay.tile_w,
+                    lay.tile_h,
+                )
+            }
+        }
+    }
+
+    /// Row whose band contains content-space `y` (clamped to the ends).
+    fn row_at_y(&self, lay: &Layout, y: f32) -> usize {
+        match &lay.flex {
+            Some(f) => f.rows.partition_point(|r| r.y <= y).saturating_sub(1),
+            None => (((y - self.tuning.gap) / lay.cell_h).floor().max(0.0)) as usize,
+        }
+    }
+
+    /// The clip in `row` whose center is horizontally nearest `cx` —
+    /// vertical selection moves land on the visually adjacent tile even
+    /// when flexible rows don't share column edges.
+    fn nearest_in_row(&self, lay: &Layout, row: usize, cx: f32) -> Option<usize> {
+        self.row_range(lay, row).min_by(|&a, &b| {
+            let da = {
+                let (x, _, w, _) = self.tile_rect(lay, a);
+                (x + w * 0.5 - cx).abs()
+            };
+            let db = {
+                let (x, _, w, _) = self.tile_rect(lay, b);
+                (x + w * 0.5 - cx).abs()
+            };
+            da.total_cmp(&db)
+        })
     }
 
     fn content_height(&self, lay: &Layout) -> f32 {
-        self.tuning.gap + self.rows(lay) as f32 * lay.cell_h
+        match &lay.flex {
+            Some(f) => f.height,
+            None => self.tuning.gap + self.rows(lay) as f32 * lay.cell_h,
+        }
     }
 
     fn max_scroll(&self, lay: &Layout) -> f32 {
@@ -679,19 +925,15 @@ impl Switchblade {
     }
 
     fn tile_at(&self, lay: &Layout, x: f32, y: f32) -> Option<usize> {
-        let g = self.tuning.gap;
-        let xx = x - g;
-        let yy = y + self.scroll - g;
-        if xx < 0.0 || yy < 0.0 {
+        let yy = y + self.scroll;
+        if yy < 0.0 {
             return None;
         }
-        let col = (xx / lay.cell_w) as usize;
-        let row = (yy / lay.cell_h) as usize;
-        if col >= lay.cols || xx % lay.cell_w > lay.tile_w || yy % lay.cell_h > lay.tile_h {
-            return None;
-        }
-        let i = row * lay.cols + col;
-        (i < self.clips.len()).then_some(i)
+        let row = self.row_at_y(lay, yy);
+        self.row_range(lay, row).find(|&i| {
+            let (tx, ty, tw, th) = self.tile_rect(lay, i);
+            x >= tx && x <= tx + tw && yy >= ty && yy <= ty + th
+        })
     }
 
     // --- selection ---
@@ -708,11 +950,14 @@ impl Switchblade {
             // the next row's first chip (the "next" clip in stdin order).
             (sel + dx).clamp(0, last) as usize
         } else {
-            let cols = lay.cols as i32;
+            // Vertical moves land on the horizontally nearest tile in the
+            // adjacent row — the same-column tile in the fixed grid, the
+            // visually adjacent one under flexible rows.
             let rows = self.rows(&lay) as i32;
-            let col = (sel % cols).clamp(0, cols - 1);
-            let row = (sel / cols + dy).clamp(0, rows - 1);
-            (row * cols + col).min(last) as usize
+            let row = ((self.row_of(&lay, self.selected) as i32) + dy).clamp(0, rows - 1) as usize;
+            let (x, _, w, _) = self.tile_rect(&lay, self.selected);
+            self.nearest_in_row(&lay, row, x + w * 0.5)
+                .unwrap_or(self.selected)
         };
         if idx != self.selected {
             self.selected = idx;
@@ -727,8 +972,8 @@ impl Switchblade {
     /// gentler key-move chase curve so whole-screen jumps glide, not jolt.
     fn scroll_to_selected(&mut self) {
         let lay = self.layout();
-        let row = self.selected / lay.cols;
-        let row_center = self.tuning.gap + row as f32 * lay.cell_h + lay.tile_h * 0.5;
+        let (_, ty, _, th) = self.tile_rect(&lay, self.selected.min(self.clips.len().saturating_sub(1)));
+        let row_center = ty + th * 0.5;
         self.scroll_target =
             (row_center - self.viewport.height * 0.5).clamp(0.0, self.max_scroll(&lay));
         self.scroll_vel = 0.0;
@@ -811,6 +1056,8 @@ impl Switchblade {
         }
         let mut old: Vec<Option<Clip>> = self.clips.drain(..).map(Some).collect();
         self.clips = order.iter().map(|&o| old[o].take().unwrap()).collect();
+        // Same length, new order: the flexible layout must rebuild.
+        self.grid_rev = self.grid_rev.wrapping_add(1);
         let remap = |i: &mut usize| {
             if let Some(&ni) = new_of_old.get(*i) {
                 *i = ni;
@@ -1314,6 +1561,7 @@ impl Switchblade {
         // listing stream in (thumbs re-serve from the disk cache).
         self.chapters = None; // the bar's clip context is gone
         self.clips.clear();
+        self.grid_rev = self.grid_rev.wrapping_add(1);
         self.index.clear();
         self.slots.fill(None);
         self.live_hover = None;
@@ -1623,6 +1871,7 @@ impl Switchblade {
                         } else {
                             Thumb::None
                         },
+                        aspect: None,
                     });
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1643,7 +1892,7 @@ impl Switchblade {
         if first_new < self.clips.len() {
             let lay = self.layout();
             let (_, last_vis) = self.visible_rows(&lay, PREFETCH_ROWS);
-            if first_new / lay.cols.max(1) <= last_vis {
+            if self.row_of(&lay, first_new) <= last_vis {
                 self.wake(0.6);
             }
         }
@@ -1828,15 +2077,18 @@ impl Switchblade {
         (cw, ch, self.viewport.height - ch - 22.0)
     }
 
-    /// Displayed aspect (w/h) of clip `i`'s strip chip: the thumbnail's
-    /// true aspect (fit-scaled, rotation already applied), clamped so a
-    /// pathological source stays browsable; 16:9 until the thumb lands.
-    /// Chips keep the strip's fixed HEIGHT and vary in width — portrait
-    /// clips are narrower, never taller.
+    /// Displayed aspect (w/h) of clip `i`: the thumbnail's true aspect
+    /// (fit-scaled, rotation already applied), clamped so a pathological
+    /// source stays browsable; 16:9 until the thumb lands. Sizes both
+    /// strip chips and the flexible grid's tiles — fixed height, width
+    /// varies, portrait clips are narrower, never taller. Reads the
+    /// session-persistent `Clip.aspect` (with the resident thumb as a
+    /// fallback) so atlas eviction never reshapes anything.
     fn chip_aspect(&self, i: usize) -> f32 {
-        let a = match self.clips.get(i).map(|c| &c.thumb) {
+        let c = self.clips.get(i);
+        let a = match c.map(|c| &c.thumb) {
             Some(&Thumb::Ready { tw, th, .. }) => tw as f32 / (th as f32).max(1.0),
-            _ => 16.0 / 9.0,
+            _ => c.and_then(|c| c.aspect).unwrap_or(16.0 / 9.0),
         };
         a.clamp(9.0 / 16.0, 2.4)
     }
@@ -1906,16 +2158,22 @@ impl Switchblade {
 
     /// Rows currently on screen, extended by `margin` prefetch rows.
     fn visible_rows(&self, lay: &Layout, margin: usize) -> (usize, usize) {
-        let g = self.tuning.gap;
-        let first = (((self.scroll - g) / lay.cell_h).floor().max(0.0)) as usize;
-        let last = (((self.scroll + self.viewport.height) / lay.cell_h).ceil()) as usize;
-        (first.saturating_sub(margin), last + margin)
+        let nrows = self.rows(lay);
+        if nrows == 0 {
+            return (0, 0);
+        }
+        let first = self.row_at_y(lay, self.scroll);
+        let last = self.row_at_y(lay, self.scroll + self.viewport.height);
+        (
+            first.saturating_sub(margin),
+            (last + margin + 1).min(nrows - 1),
+        )
     }
 
     /// Zone rows ordered center-outward, for prioritized requests.
     fn zone_rows(&self, lay: &Layout) -> Vec<usize> {
         let (first_row, last_row) = self.visible_rows(lay, PREFETCH_ROWS);
-        let center = ((self.scroll + self.viewport.height * 0.5) / lay.cell_h).max(0.0) as i64;
+        let center = self.row_at_y(lay, self.scroll + self.viewport.height * 0.5) as i64;
         let mut rows: Vec<usize> = (first_row..=last_row).collect();
         rows.sort_by_key(|r| (*r as i64 - center).abs());
         rows
@@ -1933,8 +2191,7 @@ impl Switchblade {
         let mut budget = self.atlas_cfg.slots() as i64 - 8; // headroom incl. live slot
 
         'statics: for &row in &rows {
-            for col in 0..lay.cols {
-                let i = row * lay.cols + col;
+            for i in self.row_range(lay, row) {
                 let Some(clip) = self.clips.get_mut(i) else {
                     break;
                 };
@@ -1957,8 +2214,7 @@ impl Switchblade {
             return;
         }
         'anims: for &row in &rows {
-            for col in 0..lay.cols {
-                let i = row * lay.cols + col;
+            for i in self.row_range(lay, row) {
                 let Some(clip) = self.clips.get_mut(i) else {
                     break;
                 };
@@ -2100,6 +2356,13 @@ impl Switchblade {
                         tw: w,
                         th: h,
                     };
+                    // The clip's true aspect just became known — remember
+                    // it past eviction and reflow the flexible grid.
+                    let a = w as f32 / (h as f32).max(1.0);
+                    if self.clips[i].aspect != Some(a) {
+                        self.clips[i].aspect = Some(a);
+                        self.grid_rev = self.grid_rev.wrapping_add(1);
+                    }
                     uploads.push(ThumbUpload { slot, w, h, rgba });
                 }
                 ThumbResult::Failed { path } => {
@@ -2169,14 +2432,14 @@ impl Switchblade {
     /// static or the live slot. Returns None (caller drops the pixels) when
     /// nothing evictable remains; the request budget makes that rare.
     fn alloc_slot(&mut self, lay: &Layout, incoming: SlotKind) -> Option<usize> {
-        let center_row = ((self.scroll + self.viewport.height * 0.5) / lay.cell_h).max(0.0) as i64;
+        let center_row = self.row_at_y(lay, self.scroll + self.viewport.height * 0.5) as i64;
         let (zone_first, zone_last) = self.visible_rows(lay, PREFETCH_ROWS);
         let mut best: Option<(usize, u8, i64)> = None;
         for (j, owner) in self.slots.iter().enumerate() {
             let Some((owner, kind)) = owner else {
                 return Some(j);
             };
-            let row = owner / lay.cols;
+            let row = self.row_of(lay, *owner);
             let dist = (row as i64 - center_row).abs();
             let in_zone = row >= zone_first && row <= zone_last;
             let class: u8 = match (in_zone, kind) {
@@ -2276,8 +2539,17 @@ impl Switchblade {
         let mut warm_targets: Vec<usize> = Vec::new();
         if live_on && !pending {
             let s = self.selected;
-            let cols = lay.cols.max(1);
             let n = self.clips.len();
+            // The "down" destination: the horizontally nearest tile in
+            // the next row — same-column in the fixed grid, the visually
+            // adjacent tile under flexible rows (mirrors move_selection).
+            let down = {
+                let row = self.row_of(lay, s);
+                let (x, _, w, _) = self.tile_rect(lay, s);
+                (row + 1 < self.rows(lay))
+                    .then(|| self.nearest_in_row(lay, row + 1, x + w * 0.5))
+                    .flatten()
+            };
             let mut push = |i: usize| {
                 if i < n && i != s && !warm_targets.contains(&i) {
                     warm_targets.push(i);
@@ -2290,7 +2562,9 @@ impl Switchblade {
             // right-tap is instant too.
             push(s + 1);
             push(s + 2);
-            push(s + cols);
+            if let Some(d) = down {
+                push(d);
+            }
             if s > 0 {
                 push(s - 1);
             }
@@ -2403,7 +2677,7 @@ impl Switchblade {
         // gets here.)
         self.sel_parked = self.live_sel.is_some() && !self.quickview && !self.fullview && {
             let (first, last) = self.visible_rows(lay, 0);
-            let row = self.selected / lay.cols.max(1);
+            let row = self.row_of(lay, self.selected);
             !(first..=last).contains(&row)
         };
         if !self.sel_parked
@@ -2605,11 +2879,8 @@ impl Switchblade {
             tiles = frozen.clone();
         } else if backdrop_grid {
             for row in first_row..=last_row {
-                for col in 0..lay.cols {
-                    let i = row * lay.cols + col;
-                    if i >= self.clips.len() {
-                        break;
-                    }
+                for i in self.row_range(&lay, row) {
+                    let (tx, ty, tw_g, th_g) = self.tile_rect(&lay, i);
                     let clip = &self.clips[i];
 
                     // Spawn fade/scale-in.
@@ -2678,7 +2949,7 @@ impl Switchblade {
                     }
 
                     let s = clip.scale * (0.92 + 0.08 * ease);
-                    let (wg, hg) = (lay.tile_w * s, lay.tile_h * s);
+                    let (wg, hg) = (tw_g * s, th_g * s);
                     let mut w = wg;
                     let mut h = hg;
 
@@ -2701,9 +2972,8 @@ impl Switchblade {
                         w = wg + (we - wg) * e;
                         h = hg + (he - hg) * e;
                     }
-                    let (ox, oy) = self.cell_origin(&lay, col, row);
-                    let cx = ox + lay.tile_w * 0.5;
-                    let cy = oy + lay.tile_h * 0.5;
+                    let cx = tx + tw_g * 0.5;
+                    let cy = ty - self.scroll + th_g * 0.5;
 
                     // Texture source: in the grid, a cycling anim-sheet frame
                     // once available (M6); the static thumb otherwise.
@@ -4363,6 +4633,7 @@ mod tests {
                 emph: 0.0,
                 thumb: Thumb::Failed,
                 anim: Thumb::Failed,
+                aspect: None,
             });
         }
         app.scroll = 1e6;
@@ -5092,6 +5363,131 @@ mod tests {
         );
     }
 
+    /// The flexible (default) grid: rows fill with true-aspect tiles at
+    /// a shared per-row height, then justify — each row's height flexes
+    /// (within the row_height caps) so it spans the viewport width; the
+    /// last row stays at nominal height. Hit-tests follow the variable
+    /// rects, and "fixed" restores the uniform grid.
+    #[test]
+    fn flexible_rows_justify_true_aspect_tiles() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert_eq!(
+            app.tuning.grid_layout,
+            GridStyle::Flexible,
+            "flexible is the default layout"
+        );
+        let lay = app.layout();
+        let flex = lay.flex.clone().expect("flexible mode builds rows");
+        assert!(flex.rows.len() > 1, "the demo library spans several rows");
+        let g = app.tuning.gap;
+        let vw = app.viewport.width;
+        // Demo runs at zoom 1.0: nominal row height = the tuning tile.
+        let nominal_h = app.tuning.tile_height;
+        let hmin = nominal_h * app.tuning.row_height_min;
+        let hmax = nominal_h * app.tuning.row_height_max;
+        for (k, row) in flex.rows.iter().enumerate() {
+            let last = k + 1 == flex.rows.len();
+            for i in row.start..row.end {
+                let (_, y, w, h) = app.tile_rect(&lay, i);
+                assert!((y - row.y).abs() < 0.01 && (h - row.h).abs() < 0.01);
+                assert!(
+                    (w - app.chip_aspect(i) * row.h).abs() < 0.5,
+                    "tile {i} keeps its clip's aspect at the row height"
+                );
+            }
+            let right = row.x.last().unwrap() + row.w.last().unwrap();
+            assert!(right <= vw - g + 0.5, "row {k} never overflows the width");
+            if last {
+                assert!(row.h <= nominal_h + 0.5, "the last row never grows");
+                continue;
+            }
+            assert!(
+                row.h >= hmin - 0.5 && row.h <= hmax + 0.5,
+                "row {k} height {} stays within the caps",
+                row.h
+            );
+            // Justified: unless a cap kicked in, the row spans the width.
+            let capped = row.h <= hmin + 0.5 || row.h >= hmax - 0.5;
+            if !capped {
+                assert!(
+                    (right - (vw - g)).abs() < 0.5,
+                    "row {k} right edge {right} spans the viewport"
+                );
+            }
+        }
+        // Portrait clips get narrower tiles, never taller: demo clip 1 is
+        // 9:16 in the same row as 16:9 clip 0.
+        let (_, y0, w0, h0) = app.tile_rect(&lay, 0);
+        let (_, y1, w1, h1) = app.tile_rect(&lay, 1);
+        assert!((y0 - y1).abs() < 0.01 && (h0 - h1).abs() < 0.01);
+        assert!(w1 < w0 * 0.5, "the portrait tile is narrower");
+        // Hit-tests agree with the rects.
+        for i in [0usize, 1, 7, 20, 33] {
+            let (x, y, w, h) = app.tile_rect(&lay, i);
+            assert_eq!(
+                app.tile_at(&lay, x + w * 0.5, y + h * 0.5 - app.scroll),
+                Some(i),
+                "tile_at finds tile {i} at its center"
+            );
+        }
+        // An aspect arrival reflows: the memoized grid rebuilds.
+        app.clips[0].aspect = Some(1.0);
+        app.grid_rev = app.grid_rev.wrapping_add(1);
+        let lay2 = app.layout();
+        let (_, _, w0b, h0b) = app.tile_rect(&lay2, 0);
+        assert!(
+            (w0b - h0b).abs() < 0.5,
+            "the square clip's tile follows its new aspect"
+        );
+        // "fixed" restores the uniform grid.
+        app.tuning.grid_layout = GridStyle::Fixed;
+        let lay3 = app.layout();
+        assert!(lay3.flex.is_none(), "fixed mode has no flex rows");
+        let (_, _, wf, hf) = app.tile_rect(&lay3, 1);
+        assert!(
+            (wf - lay3.tile_w).abs() < 0.01 && (hf - lay3.tile_h).abs() < 0.01,
+            "fixed tiles are uniform regardless of aspect"
+        );
+    }
+
+    /// Vertical selection moves in the flexible grid land on the
+    /// horizontally nearest tile of the adjacent row — flexible rows
+    /// don't share column edges, so "down" is visual, not index math.
+    #[test]
+    fn flexible_vertical_moves_land_on_the_nearest_tile() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let lay = app.layout();
+        app.selected = 2;
+        let (x, _, w, _) = app.tile_rect(&lay, 2);
+        let cx = x + w * 0.5;
+        app.move_selection(0, 1);
+        let lay = app.layout();
+        assert_eq!(app.row_of(&lay, app.selected), 1, "moved one row down");
+        assert_eq!(
+            Some(app.selected),
+            app.nearest_in_row(&lay, 1, cx),
+            "landed on the horizontally nearest tile below"
+        );
+        // …and back up: the landing tile again tracks the pointer x, so
+        // a down-up round trip stays in the same neighborhood.
+        let (x, _, w, _) = app.tile_rect(&lay, app.selected);
+        let cx = x + w * 0.5;
+        app.move_selection(0, -1);
+        let lay = app.layout();
+        assert_eq!(app.row_of(&lay, app.selected), 0, "moved back to row 0");
+        assert_eq!(Some(app.selected), app.nearest_in_row(&lay, 0, cx));
+    }
+
     /// End to end: `g` enters fullview and raises the bar, the probe
     /// reports the file's real chapters, and clicking a chip seeks the
     /// resident stream to that chapter and sends the bar down. Needs
@@ -5241,3 +5637,4 @@ mod tests {
         assert_eq!(app.selected, before, "nothing cached: selection holds");
     }
 }
+

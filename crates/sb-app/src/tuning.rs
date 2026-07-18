@@ -44,6 +44,21 @@ impl AnimLevel {
     }
 }
 
+/// How the grid lays tiles out: `flexible` (default) = justified rows —
+/// every tile keeps its clip's true aspect ratio at the row's shared
+/// height, and each row's height flexes (within `row_height_min/max` ×
+/// the nominal tile height) so every row spans the full window width;
+/// `fixed` = the classic uniform grid, every tile the tuning's
+/// tile_width:tile_height shape, thumbs crop-filled into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GridStyle {
+    #[serde(alias = "square")]
+    Fixed,
+    #[serde(alias = "variable", alias = "mosaic")]
+    Flexible,
+}
+
 /// What a modal draws behind its video: `blur` = the frosted, dimmed
 /// gallery (quickview's classic backdrop); `flat` = an opaque
 /// `backdrop_color` stage that hides the grid entirely (fullview's
@@ -63,8 +78,18 @@ pub struct Tuning {
     /// Animation level: "none" | "minimal" | "normal" | "full".
     /// CLI `--animation` overrides this.
     pub animation: AnimLevel,
+    /// Grid layout: "flexible" (justified true-aspect rows, the default)
+    /// or "fixed" (uniform tiles). "square"/"variable"/"mosaic" are
+    /// accepted aliases.
+    pub grid_layout: GridStyle,
     pub tile_width: f32,
     pub tile_height: f32,
+    /// Flexible rows justify by scaling their height; these caps (as
+    /// fractions of the nominal tile height) keep one pathological row
+    /// from towering or vanishing. A row that would need to leave the
+    /// band stops justifying and leaves a little slack at the end.
+    pub row_height_min: f32,
+    pub row_height_max: f32,
     pub gap: f32,
     /// Scroll delta multiplier. Negative flips direction.
     pub pan_sensitivity: f32,
@@ -223,8 +248,11 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             animation: AnimLevel::Normal,
+            grid_layout: GridStyle::Flexible,
             tile_width: 240.0,
             tile_height: 135.0,
+            row_height_min: 0.62,
+            row_height_max: 1.6,
             gap: 2.0,
             pan_sensitivity: 1.0,
             pan_inertia: 0.0,
@@ -385,4 +413,26 @@ impl TuningFile {
 /// at 60fps; the result is the equivalent fraction for an arbitrary `dt`.
 pub fn alpha(k: f32, dt: f32) -> f32 {
     1.0 - (1.0 - k.clamp(0.0, 0.999)).powf(dt * 60.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `grid_layout` parses both canonical names and the common aliases,
+    /// and flexible is the default.
+    #[test]
+    fn grid_layout_parses_with_aliases() {
+        assert_eq!(Tuning::default().grid_layout, GridStyle::Flexible);
+        for (s, want) in [
+            ("fixed", GridStyle::Fixed),
+            ("square", GridStyle::Fixed),
+            ("flexible", GridStyle::Flexible),
+            ("variable", GridStyle::Flexible),
+            ("mosaic", GridStyle::Flexible),
+        ] {
+            let t: Tuning = toml::from_str(&format!("grid_layout = \"{s}\"")).unwrap();
+            assert_eq!(t.grid_layout, want, "{s}");
+        }
+    }
 }
