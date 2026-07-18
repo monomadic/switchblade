@@ -33,6 +33,15 @@ pub enum Key {
     Char(char),
 }
 
+/// Keyboard modifiers held during a pointer event, normalized so apps
+/// never see winit's modifier types. `cmd` is the platform primary
+/// modifier (⌘ on macOS, Ctrl elsewhere).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mods {
+    pub shift: bool,
+    pub cmd: bool,
+}
+
 /// Normalized input events. Coordinates and deltas are in logical pixels.
 #[derive(Debug, Clone, Copy)]
 pub enum InputEvent {
@@ -56,6 +65,8 @@ pub enum InputEvent {
     MouseDown {
         x: f32,
         y: f32,
+        /// Modifiers held at press time (cmd/shift-click multi-select).
+        mods: Mods,
     },
     /// Left button released (ends a seekbar drag-scrub).
     MouseUp {
@@ -349,6 +360,7 @@ pub fn run(app: impl App) -> anyhow::Result<()> {
         gpu: None,
         last_frame: Instant::now(),
         cursor: (0.0, 0.0),
+        mods: Mods::default(),
         animating: true,
         redraw_at: None,
         occluded: false,
@@ -378,6 +390,9 @@ struct Runner<A: App> {
     gpu: Option<render::Gpu>,
     last_frame: Instant,
     cursor: (f32, f32),
+    /// Current keyboard modifiers, tracked from `ModifiersChanged` and
+    /// stamped onto MouseDown (cmd/shift-click).
+    mods: Mods,
     animating: bool,
     /// The last frame's one-shot deadline (next live-frame due time);
     /// caps the idle wait so video presents on schedule (P1.4).
@@ -554,6 +569,19 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 // while the OS's current event is still this mouse-drag.
                 self.apply_commands(event_loop);
             }
+            WindowEvent::ModifiersChanged(m) => {
+                let s = m.state();
+                self.mods = Mods {
+                    shift: s.shift_key(),
+                    // ⌘ on macOS, Ctrl elsewhere — the platform's primary
+                    // click modifier.
+                    cmd: if cfg!(target_os = "macos") {
+                        s.super_key()
+                    } else {
+                        s.control_key()
+                    },
+                };
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -561,7 +589,11 @@ impl<A: App> ApplicationHandler for Runner<A> {
             } => {
                 let (x, y) = self.cursor;
                 self.app.event(match state {
-                    ElementState::Pressed => InputEvent::MouseDown { x, y },
+                    ElementState::Pressed => InputEvent::MouseDown {
+                        x,
+                        y,
+                        mods: self.mods,
+                    },
                     ElementState::Released => InputEvent::MouseUp { x, y },
                 });
                 self.apply_commands(event_loop);

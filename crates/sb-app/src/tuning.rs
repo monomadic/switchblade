@@ -59,6 +59,20 @@ pub enum GridStyle {
     Flexible,
 }
 
+/// The grid's core gesture model (PLAN.md §15 spike). `classic` = the
+/// shipped behavior: the selection plays hires, hover gets a tile-size
+/// lane, click selects, click-on-selection quickviews. `attention` = one
+/// hires lane follows attention (the hovered tile while mousing, the
+/// selection while keyboard-navigating; the tile-size hover lane is
+/// gone), a single click on any tile opens quickview by promoting that
+/// stream, and cmd/shift-click multi-selects (border-only, never plays).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Interaction {
+    Classic,
+    Attention,
+}
+
 /// What a modal draws behind its video: `blur` = the frosted, dimmed
 /// gallery (quickview's classic backdrop); `flat` = an opaque
 /// `backdrop_color` stage that hides the grid entirely (fullview's
@@ -136,6 +150,16 @@ pub struct Tuning {
     pub recurse: bool,
     /// How long the selection must settle before live playback starts.
     pub live_delay_ms: f32,
+    /// Interaction model: "classic" (default) or "attention" — the
+    /// PLAN.md §15 spike where one hires lane follows attention and a
+    /// single click quickviews. Hot-reloadable, so the two models can be
+    /// compared in place.
+    pub interaction: Interaction,
+    /// Attention mode only: how long a HOVER must settle before the
+    /// attention lane spawns for it. Hover is more volatile than the
+    /// selection and every settle costs a quickview-res cold spawn, so
+    /// this guard defaults longer than `live_delay_ms`.
+    pub attention_delay_ms: f32,
     /// Fraction of the clip's duration that `[`/`]` jump (0..1). A binding
     /// can override it per key via `amount` on an internal command.
     pub skip_fraction: f32,
@@ -284,6 +308,8 @@ impl Default for Tuning {
             pause_unfocused: true,
             recurse: true,
             live_delay_ms: 100.0,
+            interaction: Interaction::Classic,
+            attention_delay_ms: 250.0,
             skip_fraction: 0.10,
             drag_threshold: 6.0,
             auto_skip_s: 5.0,

@@ -97,6 +97,21 @@ animation = "normal"
 # so flying across the grid doesn't spawn a decoder per keypress.
 live_delay_ms = 100.0
 
+# Interaction model (PLAN.md §15 spike — hot-reloadable, compare in place):
+#   "classic" (default) — the selection plays hires, hover gets a
+#   tile-size lane, click selects, click on the selection quickviews.
+#   "attention" — ONE hires lane follows attention (the hovered tile
+#   while mousing, the selection while keyboard-navigating; the tile-size
+#   hover lane is gone), a single click on any tile opens quickview by
+#   promoting that stream, and cmd/shift-click multi-selects
+#   (border-only marks that never play).
+interaction = "classic"
+# Attention mode: how long a hover must settle before the attention lane
+# spawns for it. Hover is more volatile than the selection and every
+# settle costs a quickview-resolution cold spawn, so this guard runs
+# longer than live_delay_ms.
+attention_delay_ms = 250.0
+
 # [ / ] jump the playing clip by this fraction of its duration (wraps at
 # the ends). A binding can override the amount per key — see [keys] below.
 skip_fraction = 0.10

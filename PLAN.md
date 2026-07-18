@@ -388,7 +388,7 @@ Sequence:
 
 ## 14. Milestones
 
-> **Progress:** M0–M6 and M8 are shipped. Next up is the **attention-lane interaction spike** (§15 — hover/selection-following hires lane, click-to-quickview, cmd/shift-click multi-select; do it early, its verdict shapes the select model everything else builds on), then M9, then M7 (which brings the text stack), then the planned M10 (hashtags) and M11 (drawers). A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
+> **Progress:** M0–M6 and M8 are shipped. The **attention-lane interaction spike** (§15 — hover/selection-following hires lane, click-to-quickview, cmd/shift-click multi-select) is built behind the `interaction` flag; its feel evaluation and verdict are next (the verdict shapes the select model everything else builds on), then M9, then M7 (which brings the text stack), then the planned M10 (hashtags) and M11 (drawers). A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
 
 ### M0 — Skeleton ✅
 - CLI accepts stdin paths (newline and NUL-delimited), **streaming** — don't wait for EOF.
@@ -533,7 +533,9 @@ Dock-style edge reveal: push the pointer to a screen edge and a drawer slides ou
 
 ## 15. Open technical spikes
 
-### Attention-lane interaction spike *(next up — do early, before M9)*
+### Attention-lane interaction spike *(BUILT — evaluation pending, before M9)*
+
+> **Progress (2026-07):** the model below is implemented behind the hot-reloadable `interaction = "classic" | "attention"` flag (plus `attention_delay_ms`, the hover-settle guard — default 250ms, deliberately longer than `live_delay_ms`). Attention retargets the existing selected-stream lane (`attention_target()`: hover while mousing via a `mouse_attention` modality bit, selection while keyboard-navigating; strict — a gap hover plays nothing); the grid's tile-size hover lane is gated off; click-anywhere quickviews on mouse-up by promoting the lane; cmd/shift-click marks `marked` (border-only, shuffle-remapped, D-swap-cleared, Esc-dropped). Modifiers arrive as `Mods` on `MouseDown` (sb-window tracks `ModifiersChanged`). Classic is unchanged. What remains is the **evaluation + verdict** per the risks below.
 
 Rework the grid's core gesture around a single **attention lane** and see how it feels and performs before committing. Flag-gated (`interaction = "classic" | "attention"`, hot-reloadable if cheap) so the two models can be compared in place.
 
