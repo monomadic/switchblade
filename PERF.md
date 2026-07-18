@@ -80,9 +80,9 @@ new `tiles.wgsl` sampling), and leaves the atlas hover lane RGBA
 regardless (two paths forever).
 
 Entry criteria (any): profiling shows convert/upload ≥1 core or gaps on
-target hardware; **the edge-peek milestone lands** (do both
-hires-texture-format disruptions in one renderer change); or multiple
-simultaneous hires streams become a requirement.
+target hardware, or multiple simultaneous hires streams become a
+requirement (if so, do both hires-texture-format disruptions in one
+renderer change).
 
 Sketch: output `nv12` (5.5MB/frame at 1440p, 2.67× less than RGBA); upload
 R8 luma + RG8 chroma; convert in `tiles.wgsl` with matrix+range from meta

@@ -388,7 +388,9 @@ Sequence:
 
 ## 14. Milestones
 
-### M0 — Skeleton
+> **Progress:** M0–M6 and M8 are shipped; M9 is the next buildable milestone, then M7 (which brings the text stack), then the planned M10 (hashtags) and M11 (drawers). A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
+
+### M0 — Skeleton ✅
 - CLI accepts stdin paths (newline and NUL-delimited), **streaming** — don't wait for EOF.
 - Window opens.
 - Fullscreen toggle.
@@ -396,7 +398,7 @@ Sequence:
 
 **Exit criteria:** `fd -e mp4 . ~/Clips | switchblade` opens a window and receives paths as they arrive.
 
-### M1 — Fake grid
+### M1 — Fake grid ✅
 - Render placeholder tiles.
 - Keyboard navigation.
 - Pointer pan with inertia.
@@ -406,14 +408,14 @@ Sequence:
 
 **Exit criteria:** the grid feels good even with fake tiles.
 
-### M2 — Real file tiles
+### M2 — Real file tiles ✅
 - Tiles appear as paths stream in; preserve stdin order; stable placement.
 - Debug-quality labels only (bitmap font or window-title filename — no text stack, see §9).
 - Handle missing/unreadable files gracefully.
 
 **Exit criteria:** a real piped file list becomes a navigable visual grid, still without thumbnails.
 
-### M3 — Static thumbnail cache
+### M3 — Static thumbnail cache ✅
 - Generate static thumbnails in background, prioritized by visibility/proximity.
 - Store in filesystem cache.
 - Load cached thumbnails on restart.
@@ -421,7 +423,7 @@ Sequence:
 
 **Exit criteria:** second launch over the same files feels instant.
 
-### M4 — External open/actions
+### M4 — External open/actions ✅
 - Open selected clip in mpv.
 - Basic configurable commands.
 - Copy path.
@@ -429,7 +431,7 @@ Sequence:
 
 **Exit criteria:** Switchblade is already useful as a visual picker.
 
-### M5 — Selected preview
+### M5 — Selected preview ✅
 - `Space` previews the selected clip.
 - MVP may spawn mpv (with a distinct preview profile — loop, borderless).
 - Later: internal overlay preview.
@@ -442,7 +444,7 @@ Sequence:
 
 ---
 
-### M6 — Animated thumbnails *(MVP v2)*
+### M6 — Animated thumbnails *(MVP v2)* ✅
 - First recipe: 5–10 stills per clip cycled over a few seconds (reuses static-thumb machinery, packed as a sprite sheet).
 - Then: tiny animated previews (~1s, 10–20fps) generated in background.
 - Prioritize selected / nearby / visible clips (and direction of pan).
@@ -497,7 +499,25 @@ Filters (each press cycles a mode, wrapping back to `all`):
 
 **Exit criteria:** a keybind flips the grid between all/1080p+/4K+ and all/30/60/120fps+, and sorts by date/rating/size, with the selected clip preserved and stdin order restorable — all without a text stack.
 
+### M10 — Hashtags *(planned)*
+View a clip's hashtags and filter the grid by them.
+- **Source (confirm before building):** filename tokens (`clip #loop #glitch.mp4`) parsed at ingest, the same trick as M9's trailing-star rating — cheap, no probe, survives the cache. Alternatives: xattrs or a sidecar file.
+- **Filtering** rides M9's view-indirection layer verbatim — a hashtag predicate is just another filter over the sacred ingest vector, selection tracked by path, empty result valid.
+- **Viewing** tags on a clip needs real text, so the display half lands with/after M7's text stack; its natural home is the side drawer panels (M11). A keybound tag-cycle filter could ship text-free before that — scoping call.
+
+**Exit criteria:** a clip's hashtags are visible somewhere, and the grid can be narrowed to one or more tags and restored, with selection preserved.
+
+### M11 — Drawers *(planned)*
+Dock-style edge reveal: push the pointer to a screen edge and a drawer slides out; pull away and it retracts.
+- **Bottom edge** → the chapter bar (today `g`-only; edge-hover becomes a second way in, in fullview/quickview first).
+- **Left/right edges** → an info panel (name, resolution, fps, duration, size, date, rating) and a hashtag panel (view + toggle tag filters — M10's display surface).
+- Reuses the filmstrip/chapter-bar slide machinery (strip springs, slide-damped overlaps); reveal threshold and dwell/hide delays are `Tuning` fields — must not fire during ordinary pans or scrubs.
+- The info/hashtag panels need the text stack (M7); the bottom drawer (chapter bar) doesn't, so it can land first as the proving ground for the edge-hover gesture.
+
+**Exit criteria:** resting the pointer at an edge slides the drawer out smoothly (and never by accident mid-gesture); leaving retracts it; the bottom drawer is the existing chapter bar.
+
 ### Later
+- Still images as one-frame movies: an image file ingests like a clip whose thumb IS the image (no live lane, no sheet, duration 0/undefined). To be scoped and considered before committing — extension whitelist, what `Meta` looks like without a probe, and what quickview/seekbar/auto-skip mean for a still.
 - `--wrap` infinite grid mode.
 - Internal hardware-decoded preview.
 - Better thumbnail frame selection.
@@ -545,7 +565,7 @@ The M8 prerequisite. **Problem:** the ffmpeg-CLI `LivePlayer` had no seek channe
 
 Exact seeks are GOP-decode-bound (~7ms/frame under VT), so long-GOP 4K can't hit <100ms exact — which **settles the interaction design, mpv-style: scrub = keyframe seeks (instant), release/settle = one exact seek** (hidden behind the keyframe frame already on screen). VT stays load-bearing; VP9/AV1 keep sw decode (keyframe-snappy, exact-slow — acceptable).
 
-**Shipped as `SeekablePlayer`** (`crates/sb-media/src/seekable.rs`): the same paced-queue contract `LivePlayer` presents (`spawn`/`take_frame`/`buffered`) plus `seek(f64, exact)`; demuxer + decoder owned by the reader thread, `seek()` = flush + `avformat_seek_file` backward (+ decode-forward when exact), position is a real pts property. The decode/scale chain reuses `hw_scale_vf` verbatim as a libavfilter graph (parity by construction), the sw fallback rotates explicitly (libavfilter doesn't autorotate), pacing stamps by pts-delta with late re-anchor. All live lanes — selected, warm pool, hover — run on it; `[`/`]` is a plain `seek()` and the old `warm_skip`/checkpoint machinery is deleted. `LivePlayer` stays in sb-media (tests + pacebench keep it compiling) as an instant-revert fallback until a release soaks, then goes. Tests: the `SeekablePlayer` pacing/stall/drop trio + `seek_jumps_in_place_without_respawn` + `skip_seeks_the_selected_stream_in_place`. Resident sessions are already the feed edge-peek needs.
+**Shipped as `SeekablePlayer`** (`crates/sb-media/src/seekable.rs`): the same paced-queue contract `LivePlayer` presents (`spawn`/`take_frame`/`buffered`) plus `seek(f64, exact)`; demuxer + decoder owned by the reader thread, `seek()` = flush + `avformat_seek_file` backward (+ decode-forward when exact), position is a real pts property. The decode/scale chain reuses `hw_scale_vf` verbatim as a libavfilter graph (parity by construction), the sw fallback rotates explicitly (libavfilter doesn't autorotate), pacing stamps by pts-delta with late re-anchor. All live lanes — selected, warm pool, hover — run on it; `[`/`]` is a plain `seek()` and the old `warm_skip`/checkpoint machinery is deleted. `LivePlayer` stays in sb-media (tests + pacebench keep it compiling) as an instant-revert fallback until a release soaks, then goes. Tests: the `SeekablePlayer` pacing/stall/drop trio + `seek_jumps_in_place_without_respawn` + `skip_seeks_the_selected_stream_in_place`.
 
 ### Cache lookup performance
 Start with the filesystem cache. Only add SQLite if profiling proves:

@@ -640,7 +640,7 @@ roughly 56 MiB per lane before libav/filter buffers.
 
 - Carry reference-counted frame storage or GPU-upload staging buffers across the
   app boundary.
-- This is more invasive and should wait for measurements or the NV12/edge-peek
+- This is more invasive and should wait for measurements or the NV12
   renderer work.
 
 **Acceptance criteria**
@@ -835,9 +835,9 @@ churn on target usage.
 Do not pull this forward merely because RGBA copies are visible in the code.
 The existing entry criteria still apply:
 
-- profiling shows conversion/upload costs at least one core or causes gaps;
-- edge-peek lands and both texture-format disruptions should be combined; or
-- multiple simultaneous hires streams become required.
+- profiling shows conversion/upload costs at least one core or causes gaps; or
+- multiple simultaneous hires streams become required (combine both
+  texture-format disruptions in one renderer change).
 
 When an entry criterion is met, follow the color-space/range metadata and PSNR
 verification plan in [PERF.md](PERF.md). This is not a substitute for the

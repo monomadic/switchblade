@@ -21,6 +21,10 @@ Built for VJs picking clips mid-set, creators sorting AI-generated footage, and 
 - **Animated thumbnails** — a sprite sheet of frames sampled across each clip; tiles cycle with per-clip phase offsets and shader crossfade. Toggle with `a`.
 - **Live playback in-tile** — the selected and hovered clips play real (silent, looping) video inside their tiles, seek-matched to the thumbnail's frame so nothing jumps. An in-process (libav) decoder keeps the demuxer resident, so seeking is a jump-in-place, not a reload.
 - **Quickview** — `Space` (or click the selection): the grid dims and frosts and the clip plays large and centered at natural resolution (up to 1080p, configurable). Move the pointer over the video for a **seekbar** — click to seek, hold-drag to scrub, hover for storyboard thumbnails; scroll to fly the **filmstrip** of neighbors along the bottom, or `h`/`l` to step. `[`/`]` skip through the clip anywhere.
+- **Chapter bar** — `g` opens the clip fullscreen-in-app with a strip of chapter chips (real container chapters when present, synthesized checkpoints otherwise); click a chip to jump the video there.
+- **Shuffle, random, auto-skip** — `s` shuffles the library, `x` jumps to a random clip, `t` auto-advances after a few seconds of playback with a timer ring on the video (lean-back skimming).
+- **Flexible grid layout** — justified rows where every tile keeps its clip's true aspect ratio (the classic uniform grid is one config line away).
+- **Drag out** — drag a tile or filmstrip chip straight into Finder or any other app, exactly like dragging a file out of Finder.
 - **Pinch zoom** — tile size scales, columns reflow with a crossfade. `-`/`=`/`0` on the keyboard.
 - **Keymap** — bind any non-movement key to internal actions or launched programs with `{path}`/`{dir}`/`{name}` templates: open in mpv, reveal in Finder, run your renamer script, push to a VJ tool.
 - **Hot-tunable feel** — every motion constant (springs, gaps, scales, fades) lives in `switchblade.toml` and reloads within 250ms while the app runs.
@@ -39,8 +43,8 @@ Built for VJs picking clips mid-set, creators sorting AI-generated footage, and 
 cargo build --release
 fd -e mp4 -e mov . ~/Clips | ./target/release/switchblade
 
-cargo run          # demo mode: fake tiles (when stdin is a TTY)
-switchblade --help # options, including --no-anim
+cargo run -- --demo   # demo mode: fake tiles, no media needed
+switchblade --help    # options, including --animation and --fullscreen
 ```
 
 ## Keys (defaults)
@@ -49,7 +53,11 @@ switchblade --help # options, including --no-anim
 |---|---|
 | `hjkl` / arrows | move selection (row-end wraps to the next row) |
 | `Enter` / `o` | open in mpv |
-| `Space` | quickview (internal preview; `Esc`/`Space`/click closes, arrows browse) |
+| `Space` | quickview (internal preview; `Esc`/`Space`/click closes, `h`/`l` browse) |
+| `g` | chapter bar (fullscreen view + chapter/checkpoint chips; click jumps there) |
+| `x` | jump to a random clip |
+| `s` | shuffle the library |
+| `t` | toggle auto-skip (auto-advance while previewing, with a timer ring) |
 | `c` | copy path |
 | `r` | reveal in Finder |
 | `[` / `]` | skip back / forward through the playing clip (wraps) |
@@ -81,9 +89,10 @@ See the [example config](switchblade.toml) — it documents every field.
 ## Cache
 
 Thumbnails, sprite sheets, and probed metadata live under
-`~/Library/Caches/switchblade.noindex/v1/objects/` keyed by file fingerprint (`.noindex` keeps Spotlight away)
-(path + size + mtime). It's plain files — inspect it, or delete it any
-time and it regenerates.
+`~/Library/Caches/switchblade.noindex/v1/objects/` keyed by file fingerprint
+(size + mtime by default, so renamed or moved files keep their cache; `cache_key = "path"`
+adds the absolute path to the key). `.noindex` keeps Spotlight away. It's plain files —
+inspect it, or delete it any time (`--cleanup-cache` prunes dead entries) and it regenerates.
 
 ## License
 
