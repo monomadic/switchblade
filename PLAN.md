@@ -388,7 +388,7 @@ Sequence:
 
 ## 14. Milestones
 
-> **Progress:** M0–M6 and M8 are shipped; M9 is the next buildable milestone, then M7 (which brings the text stack), then the planned M10 (hashtags) and M11 (drawers). A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
+> **Progress:** M0–M6 and M8 are shipped. Next up is the **attention-lane interaction spike** (§15 — hover/selection-following hires lane, click-to-quickview, cmd/shift-click multi-select; do it early, its verdict shapes the select model everything else builds on), then M9, then M7 (which brings the text stack), then the planned M10 (hashtags) and M11 (drawers). A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
 
 ### M0 — Skeleton ✅
 - CLI accepts stdin paths (newline and NUL-delimited), **streaming** — don't wait for EOF.
@@ -532,6 +532,27 @@ Dock-style edge reveal: push the pointer to a screen edge and a drawer slides ou
 ---
 
 ## 15. Open technical spikes
+
+### Attention-lane interaction spike *(next up — do early, before M9)*
+
+Rework the grid's core gesture around a single **attention lane** and see how it feels and performs before committing. Flag-gated (`interaction = "classic" | "attention"`, hot-reloadable if cheap) so the two models can be compared in place.
+
+**The model:**
+- **One hires lane follows attention**: the hovered tile while mousing, the selected tile while keyboard-navigating. It decodes at quickview resolution exactly like today's selected lane (the tile samples it downscaled) — so it costs what the selected lane costs now, and today's tile-size hover lane is deleted.
+- **Click opens quickview immediately** by promoting the attention lane's already-running stream — the same zero-handoff trick quickview uses today, minus one click. Composes with drag-out unchanged (open already fires on mouse-up; a matured drag suppresses it).
+- **Cmd-click / shift-click select** (toggle / range): selected clips get the border + selected state only — they never play. Multiple selection allowed; this is the multi-select foundation the Later list wants, and actions/batch actions target it.
+- **Strict playback rule:** the attention lane is the only thing that ever plays in the grid. (A "last-selected keeps playing over empty space" rule can be added later if strict feels dead.)
+- Comparing two clips = quickview's filmstrip, or cmd-click the first and seek out the second.
+
+**Why it might win:** click-to-preview is more direct than select-then-Space; one decoder instead of two (small CPU/VT saving during hover); the interaction and the playback architecture collapse into one concept.
+
+**Spike risks / what to actually evaluate:**
+- Hover is more volatile than selection — every settle now spawns a 1080p decoder, not a tile-size one. The settle delay is the guard; it may need to be longer in this mode. Watch cold-spawn churn while sweeping the grid.
+- The warm pool pre-warms keyboard destinations and can't predict the mouse — hover-to-first-frame stays a cold spawn. Is that acceptable in feel?
+- Misclick cost: every stray click is now a modal. Does Esc-out feel cheap enough?
+- Measure with the `RUST_LOG=sb_app=debug` redraw-reason line + core usage vs classic on the same library.
+
+**Exit criteria:** a verdict — adopt (attention becomes the default, classic possibly deleted), keep both behind the flag, or reject with notes. Multi-select's border-only state likely survives regardless of the verdict.
 
 ### Thumbnail format
 Compare:
