@@ -166,6 +166,13 @@ fn handle_path(tx: &Tx, path: PathBuf, recurse: bool) -> Result<(), SendError<In
         return Ok(());
     }
     let cloud = is_cloud_placeholder(&path, meta.as_ref().ok());
+    // A valid extension is not enough: a path that doesn't exist (never
+    // existed, or moved away) would otherwise claim a chip and pose as a
+    // playable clip. Skip it unless it's a cloud placeholder (whose real
+    // file is legitimately absent until downloaded).
+    if meta.is_err() && !cloud {
+        return Ok(());
+    }
     tx.send(Ingested {
         path,
         readable: meta.is_ok(),
@@ -282,5 +289,30 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a.mp4", "b.mov"]);
+    }
+
+    /// A stdin path with a valid video extension but no file behind it
+    /// (never existed, or moved away) must NOT become a clip — a valid
+    /// extension alone can't claim a chip. An existing video still passes.
+    #[test]
+    fn missing_paths_never_reach_the_grid() {
+        let dir = std::env::temp_dir().join("sb_ingest_missing_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.mp4");
+        std::fs::write(&real, b"").unwrap();
+        let ghost = dir.join("ghost.mp4"); // valid extension, no file
+
+        let (raw, rx) = mpsc::sync_channel(8);
+        let tx = Tx {
+            tx: raw,
+            notify: std::sync::Arc::new(|| {}),
+        };
+        send_path(&tx, real.to_string_lossy().as_bytes(), false).unwrap();
+        send_path(&tx, ghost.to_string_lossy().as_bytes(), false).unwrap();
+        drop(tx);
+
+        let paths: Vec<PathBuf> = rx.iter().map(|i| i.path).collect();
+        assert_eq!(paths, [real]);
     }
 }
