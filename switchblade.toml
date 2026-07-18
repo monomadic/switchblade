@@ -13,11 +13,24 @@
 
 [tuning]
 # ── Layout ──────────────────────────────────────────────────────────────
-# Ideal tile size: width picks the column count, then tiles stretch so the
-# columns exactly fill the window (the background should barely show).
-# width:height sets the aspect ratio (240:135 = 16:9).
+# Grid layout:
+#   "flexible" (default) — justified rows: every tile keeps its clip's
+#   true aspect ratio at the row's shared height, and each row's height
+#   flexes a little (see row_height_min/max) so rows span the window,
+#   like the quickview filmstrip. "variable"/"mosaic" are aliases.
+#   "fixed" — the classic uniform grid: every tile is
+#   tile_width:tile_height, thumbs crop-filled into it. Alias "square".
+grid_layout = "flexible"
+# Ideal tile size: width picks the column count (and, in flexible mode,
+# the nominal row height). In fixed mode tiles stretch so the columns
+# exactly fill the window; width:height sets the aspect (240:135 = 16:9).
 tile_width = 240.0
 tile_height = 135.0
+# Flexible rows justify by scaling their height; these caps (fractions of
+# the nominal tile height) keep one odd row from towering or vanishing —
+# a row that would need to leave the band leaves a little slack instead.
+row_height_min = 0.62
+row_height_max = 1.6
 gap = 1.0  # space between tiles
 
 # ── Colors ──────────────────────────────────────────────────────────────
