@@ -313,6 +313,7 @@ pub enum ThumbResult {
 pub struct MediaService {
     queue: SharedQueue,
     rx: Receiver<ThumbResult>,
+    recipe: Recipe,
 }
 
 impl MediaService {
@@ -336,7 +337,21 @@ impl MediaService {
             let notify = notify.clone();
             thread::spawn(move || worker(q, tx, notify, root, have_ffmpeg, recipe));
         }
-        Self { queue, rx: rx_done }
+        Self {
+            queue,
+            rx: rx_done,
+            recipe,
+        }
+    }
+
+    /// Disk path of the clip's cached static thumbnail under the current
+    /// recipe, if it exists — used as the drag-out ghost image. Cheap
+    /// (one stat + one exists check); never generates or queues anything.
+    pub fn cached_thumb_path(&self, path: &Path) -> Option<PathBuf> {
+        let st = std::fs::metadata(path).ok()?;
+        let file = entry_dir(&cache_root(), path, st.len(), mtime_secs(&st))
+            .join(self.recipe.thumb_file());
+        file.exists().then_some(file)
     }
 
     pub fn request(&self, path: PathBuf) {

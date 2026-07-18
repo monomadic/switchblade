@@ -114,6 +114,11 @@ pub struct Tuning {
     /// Fraction of the clip's duration that `[`/`]` jump (0..1). A binding
     /// can override it per key via `amount` on an internal command.
     pub skip_fraction: f32,
+    /// Pointer travel (logical px) that turns a press on a tile or
+    /// filmstrip chip into a drag-out: the clip's file leaves the app as
+    /// a native macOS drag (drop into Finder or onto another app).
+    /// Below this the press stays a click.
+    pub drag_threshold: f32,
     /// Auto-advance ("skip timer", `toggle_skip_timer`): once the selected
     /// clip has played this many seconds, selection moves to the next clip
     /// (wraps at the end of the library).
@@ -244,6 +249,7 @@ impl Default for Tuning {
             recurse: true,
             live_delay_ms: 100.0,
             skip_fraction: 0.10,
+            drag_threshold: 6.0,
             skip_timer_s: 5.0,
             thumb_width: 640,
             thumb_height: 360,

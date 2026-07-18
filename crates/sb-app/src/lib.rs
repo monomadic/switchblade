@@ -348,6 +348,23 @@ pub struct Switchblade {
     viewport: Viewport,
     cmds: Vec<WindowCommand>,
     title: String,
+    /// A mouse press on a grid tile or filmstrip chip that may still
+    /// become a drag-out: pointer travel past `drag_threshold` matures
+    /// it into a `WindowCommand::BeginDrag` (and the press stops being a
+    /// click); otherwise MouseUp resolves it — including the quickview
+    /// open for a press on the selection, which waits for release
+    /// exactly so a drag never opens the modal.
+    press: Option<Press>,
+}
+
+/// See [`Switchblade::press`].
+struct Press {
+    x: f32,
+    y: f32,
+    clip: usize,
+    /// The press was on the already-selected grid tile: releasing
+    /// without dragging opens quickview.
+    open_quickview: bool,
 }
 
 /// Once-a-second debug log of how many frames ran and which condition
@@ -588,6 +605,7 @@ impl Switchblade {
             },
             cmds: Vec::new(),
             title: String::new(),
+            press: None,
         };
         // Queued now, drained by the window layer right after the window
         // exists — so --fullscreen never flashes a windowed frame.
@@ -3502,6 +3520,31 @@ impl App for Switchblade {
             }
             InputEvent::CursorMoved { x, y } => {
                 self.cursor = (x, y);
+                // A pressed tile/chip pulled past the threshold stops
+                // being a click and leaves the app as a native drag-out.
+                // The window layer needs the command NOW (inside this
+                // pointer callback — the OS event seeds the session), so
+                // it drains commands after CursorMoved too.
+                if let Some(p) = &self.press {
+                    let (dx, dy) = (x - p.x, y - p.y);
+                    let t = self.tuning.drag_threshold.max(1.0);
+                    if dx * dx + dy * dy >= t * t {
+                        if let Some(c) = self.clips.get(p.clip) {
+                            let image = if c.cloud {
+                                None
+                            } else {
+                                self.media.cached_thumb_path(&c.path)
+                            };
+                            self.cmds.push(WindowCommand::BeginDrag {
+                                path: c.path.clone(),
+                                image,
+                            });
+                        }
+                        // The OS owns the gesture from here: no MouseUp
+                        // may ever arrive, so the press ends now.
+                        self.press = None;
+                    }
+                }
                 if self.scrubbing {
                     // Drag-scrub: coarse keyframe hops track the pointer
                     // (the decoder coalesces to the newest target); the
@@ -3565,6 +3608,14 @@ impl App for Switchblade {
                             self.pending_reselect = None; // click outranks the D reselect
                             self.scroll_to_selected();
                         }
+                        // Chips are drag sources too (select on press,
+                        // as before — selecting what you drag is right).
+                        self.press = Some(Press {
+                            x,
+                            y,
+                            clip: i,
+                            open_quickview: false,
+                        });
                     } else {
                         self.quickview = false;
                     }
@@ -3573,18 +3624,39 @@ impl App for Switchblade {
                 let lay = self.layout();
                 if let Some(i) = self.tile_at(&lay, x, y) {
                     if i == self.selected {
-                        self.quickview = true;
-                        self.quickview_at = Instant::now();
-                        self.strip_pos = self.selected as f32;
-                        self.strip_target = self.strip_pos;
+                        // Quickview waits for release: this press may be
+                        // the start of a drag-out, not a click.
+                        self.press = Some(Press {
+                            x,
+                            y,
+                            clip: i,
+                            open_quickview: true,
+                        });
                     } else {
                         self.selected = i;
                         self.sel_changed_at = Instant::now();
                         self.pending_reselect = None; // click outranks the D reselect
+                        self.press = Some(Press {
+                            x,
+                            y,
+                            clip: i,
+                            open_quickview: false,
+                        });
                     }
                 }
             }
             InputEvent::MouseUp { x, .. } => {
+                if let Some(p) = self.press.take()
+                    && p.open_quickview
+                    && p.clip == self.selected
+                {
+                    // The press never became a drag: it was a click on
+                    // the selection, which opens quickview on release.
+                    self.quickview = true;
+                    self.quickview_at = Instant::now();
+                    self.strip_pos = self.selected as f32;
+                    self.strip_target = self.strip_pos;
+                }
                 if self.scrubbing {
                     self.scrubbing = false;
                     if let Some(f) = self.seekbar_frac(x) {
@@ -3894,6 +3966,76 @@ mod tests {
             app.clips[app.selected].path,
             dir.join("b.mp4"),
             "the clip re-finds itself among its siblings"
+        );
+    }
+
+    /// A press on a tile pulled past `drag_threshold` becomes a native
+    /// drag-out (`WindowCommand::BeginDrag` with the clip's path) and
+    /// stops being a click — quickview must NOT open on the release.
+    /// A press that stays put is still a click: quickview opens on
+    /// MouseUp (moved off MouseDown exactly so drags can't open it).
+    #[test]
+    fn tile_drag_out_matures_and_click_still_opens_quickview() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let lay = app.layout();
+        let g = app.tuning.gap;
+        let (cx, cy) = (g + lay.tile_w * 0.5, g + lay.tile_h * 0.5);
+        assert_eq!(
+            app.tile_at(&lay, cx, cy),
+            Some(0),
+            "test point misses tile 0"
+        );
+
+        // Drag: down on the selected tile, pull well past the threshold.
+        app.event(InputEvent::MouseDown { x: cx, y: cy });
+        assert!(
+            !app.cmds
+                .iter()
+                .any(|c| matches!(c, WindowCommand::BeginDrag { .. })),
+            "the press alone must not start a drag"
+        );
+        let far = app.tuning.drag_threshold + 10.0;
+        app.event(InputEvent::CursorMoved { x: cx + far, y: cy });
+        let dragged = app.cmds.iter().find_map(|c| match c {
+            WindowCommand::BeginDrag { path, .. } => Some(path.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            dragged.as_deref(),
+            Some(app.clips[0].path.as_path()),
+            "pointer travel past drag_threshold emits BeginDrag for the pressed clip"
+        );
+        app.event(InputEvent::MouseUp { x: cx + far, y: cy });
+        assert!(!app.quickview, "a matured drag must not open quickview");
+        assert_eq!(
+            app.cmds
+                .iter()
+                .filter(|c| matches!(c, WindowCommand::BeginDrag { .. }))
+                .count(),
+            1,
+            "one gesture, one drag session"
+        );
+
+        // Click: down + up with sub-threshold wiggle opens quickview.
+        app.cmds.clear();
+        app.event(InputEvent::MouseDown { x: cx, y: cy });
+        app.event(InputEvent::CursorMoved { x: cx + 2.0, y: cy });
+        assert!(!app.quickview, "quickview waits for the release");
+        app.event(InputEvent::MouseUp { x: cx + 2.0, y: cy });
+        assert!(
+            app.quickview,
+            "an un-dragged click on the selection quickviews"
+        );
+        assert!(
+            !app.cmds
+                .iter()
+                .any(|c| matches!(c, WindowCommand::BeginDrag { .. })),
+            "sub-threshold wiggle stays a click"
         );
     }
 

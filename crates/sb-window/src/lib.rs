@@ -4,8 +4,10 @@
 //! [`App`] trait. No winit or wgpu types cross the boundary — the app sees
 //! normalized input events and hands back a plain frame description.
 
+mod drag;
 mod render;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -78,6 +80,18 @@ pub enum WindowCommand {
         fast: bool,
     },
     SetTitle(String),
+    /// Start a native drag-out of `path` (macOS: an `NSDraggingSession`
+    /// whose pasteboard carries the file URL, so dropping into Finder or
+    /// onto another app behaves exactly like a drag out of Finder).
+    /// Only honored from inside a pointer-event callback — the platform
+    /// layer seeds the session from the OS's current mouse event, so the
+    /// app must emit it in direct response to a MouseDown/CursorMoved.
+    /// `image` is the drag ghost (the clip's cached thumb jpeg); absent,
+    /// the OS file icon stands in.
+    BeginDrag {
+        path: PathBuf,
+        image: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -386,6 +400,11 @@ impl<A: App> Runner<A> {
                         w.set_title(&title);
                     }
                 }
+                WindowCommand::BeginDrag { path, image } => {
+                    if let Some(w) = &self.window {
+                        drag::begin(w, &path, image.as_deref());
+                    }
+                }
             }
         }
     }
@@ -523,6 +542,10 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 let p = position.to_logical::<f32>(self.scale());
                 self.cursor = (p.x, p.y);
                 self.app.event(InputEvent::CursorMoved { x: p.x, y: p.y });
+                // Drain right here, inside the callback: a drag-out
+                // matures on pointer travel, and BeginDrag must run
+                // while the OS's current event is still this mouse-drag.
+                self.apply_commands(event_loop);
             }
             WindowEvent::MouseInput {
                 state,

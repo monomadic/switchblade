@@ -88,6 +88,11 @@ live_delay_ms = 100.0
 # the ends). A binding can override the amount per key — see [keys] below.
 skip_fraction = 0.10
 
+# Dragging a grid tile or filmstrip chip this many logical pixels turns
+# the press into a native drag-out: drop the clip's file into Finder or
+# onto another app. Below this the press stays a click.
+drag_threshold = 6.0
+
 # Skip timer ('t' toggles): once the selected clip has PLAYED this many
 # seconds, selection auto-advances to the next clip (wraps at the end) —
 # a hands-free slideshow. The countdown starts when video actually

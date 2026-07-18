@@ -11,13 +11,31 @@ bytemuck = { version = "1", features = ["derive"] }
 anyhow = { workspace = true }
 log = { workspace = true }
 
-# Dock icon for the bare (unbundled) binary — same versions winit
-# already pulls in transitively, so this adds no new compilation.
+# Dock icon + drag-out sessions for the bare (unbundled) binary — same
+# versions winit already pulls in transitively, so this adds no new
+# compilation units, only generated bindings.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSData"] }
+# "exception": AppKit throws NSExceptions (e.g. a drag session refused
+# its seed event); uncaught they abort the process from inside the event
+# callback. objc2::exception::catch turns them into loggable Results.
+objc2 = { version = "0.5", features = ["exception"] }
+objc2-foundation = { version = "0.2", features = [
+    "NSData",
+    "NSString",
+    "NSURL",
+    "NSArray",
+    "NSGeometry",
+] }
 objc2-app-kit = { version = "0.2", features = [
     "NSApplication",
     "NSImage",
     "NSResponder",
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSEvent",
+    "NSView",
+    "NSWorkspace",
 ] }
