@@ -1,8 +1,10 @@
 //! Key → command dispatch (PLAN.md §11): one keymap resolves keys to
 //! internal actions or external programs run on the selected clip.
 //!
-//! Movement keys (hjkl/arrows) are reserved and never reach the keymap.
-//! User `[keys]`/`[commands]` entries overlay the built-in defaults.
+//! Vertical movement keys (jk / up / down arrows) are reserved and never
+//! reach the keymap; forward/back are the remappable `next`/`prev`
+//! actions (h/l and the horizontal arrows by default). User
+//! `[keys]`/`[commands]` entries overlay the built-in defaults.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -67,15 +69,22 @@ pub enum Action {
         forward: bool,
         amount: Option<f32>,
     },
+    /// Advance the selection to the next clip (linear order — the same
+    /// move `l`/`Right` make; row-end wraps to the next row). Auto-skip
+    /// fires this when its countdown expires.
+    SelectNext,
+    /// Selection back one clip (linear order, like `h`/`Left`).
+    SelectPrev,
     /// Re-ingest from the selected clip's parent directory (siblings view).
     OpenParent,
     /// Select a uniformly random other clip in the library.
     JumpRandom,
     /// Shuffle the whole grid in place (Fisher–Yates over the clip order).
     ShuffleLibrary,
-    /// Auto-advance: once the selected clip has played `skip_timer_s`,
-    /// selection moves to the next clip (wraps at the end).
-    ToggleSkipTimer,
+    /// Auto-skip: while quickview or fullview is up, once the selected
+    /// clip has played `auto_skip_s`, selection moves to the next clip
+    /// (wraps at the end). Back in the grid the countdown suspends.
+    ToggleAutoSkip,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +117,11 @@ impl Default for KeyMap {
             ("D", "open_parent"),
             ("x", "jump_random"),
             ("s", "shuffle_library"),
-            ("t", "toggle_skip_timer"),
+            ("t", "toggle_auto_skip"),
+            ("h", "prev"),
+            ("l", "next"),
+            ("left", "prev"),
+            ("right", "next"),
         ] {
             keys.insert(k.to_string(), v.to_string());
         }
@@ -185,7 +198,10 @@ fn key_name(key: &Key) -> Option<String> {
         Key::Escape => "esc".to_string(),
         Key::Tab => "tab".to_string(),
         Key::Char(c) => c.to_string(),
-        // Arrows are reserved movement keys; they never reach the keymap.
+        // Horizontal arrows resolve like any key (bound to prev/next by
+        // default); vertical arrows stay reserved movement keys.
+        Key::Left => "left".to_string(),
+        Key::Right => "right".to_string(),
         _ => return None,
     })
 }
@@ -212,10 +228,15 @@ fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
             forward: false,
             amount,
         },
+        "next" | "select_next" => Action::SelectNext,
+        "prev" | "previous" | "select_prev" => Action::SelectPrev,
         "open_parent" | "browse_parent" => Action::OpenParent,
         "jump_random" | "jump_to_random" => Action::JumpRandom,
         "shuffle_library" | "shuffle" => Action::ShuffleLibrary,
-        "toggle_skip_timer" | "skip_timer" => Action::ToggleSkipTimer,
+        // The old "skip timer" spellings stay as config aliases.
+        "toggle_auto_skip" | "auto_skip" | "toggle_skip_timer" | "skip_timer" => {
+            Action::ToggleAutoSkip
+        }
         other => {
             log::warn!(
                 "unknown command '{other}': no [commands.{other}] entry and not a built-in action"
@@ -330,7 +351,27 @@ mod tests {
             Some(Action::Spawn { ref program, .. }) if program == "mpv"
         ));
         assert!(map.action_for(&Key::Char('y')).is_none());
-        assert!(map.action_for(&Key::Left).is_none());
+    }
+
+    #[test]
+    fn movement_defaults_resolve_and_stay_remappable() {
+        let map = KeyMap::default();
+        for key in [Key::Char('l'), Key::Right] {
+            assert!(matches!(map.action_for(&key), Some(Action::SelectNext)));
+        }
+        for key in [Key::Char('h'), Key::Left] {
+            assert!(matches!(map.action_for(&key), Some(Action::SelectPrev)));
+        }
+        // Vertical movement stays reserved — arrows never reach the keymap.
+        assert!(map.action_for(&Key::Up).is_none());
+        assert!(map.action_for(&Key::Down).is_none());
+        // next/prev are ordinary commands: a user config can rebind them.
+        let keys = HashMap::from([("n".to_string(), "next".to_string())]);
+        let map = KeyMap::merged(keys, HashMap::new());
+        assert!(matches!(
+            map.action_for(&Key::Char('n')),
+            Some(Action::SelectNext)
+        ));
     }
 
     #[test]
@@ -357,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn random_shuffle_and_skip_timer_defaults_resolve() {
+    fn random_shuffle_and_auto_skip_defaults_resolve() {
         let map = KeyMap::default();
         assert!(matches!(
             map.action_for(&Key::Char('x')),
@@ -369,7 +410,7 @@ mod tests {
         ));
         assert!(matches!(
             map.action_for(&Key::Char('t')),
-            Some(Action::ToggleSkipTimer)
+            Some(Action::ToggleAutoSkip)
         ));
         // The alias spellings resolve too.
         assert!(matches!(
@@ -380,6 +421,13 @@ mod tests {
             internal_action("shuffle", None),
             Some(Action::ShuffleLibrary)
         ));
+        // Configs written before the auto-skip rename keep working.
+        for legacy in ["toggle_skip_timer", "skip_timer", "auto_skip"] {
+            assert!(matches!(
+                internal_action(legacy, None),
+                Some(Action::ToggleAutoSkip)
+            ));
+        }
     }
 
     #[test]

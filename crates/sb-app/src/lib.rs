@@ -54,11 +54,17 @@ const THUMB_FADE_S: f32 = 0.3;
 /// Skip flash bar: hold after a `[`/`]` skip, then a quick fade-out.
 const SKIP_BAR_HOLD_S: f32 = 1.0;
 const SKIP_BAR_FADE_S: f32 = 0.25;
-/// Skip-timer stall guard: when a live stream is expected but hasn't
+/// Auto-skip stall guard: when a live stream is expected but hasn't
 /// delivered a first frame (cold spawn, failed decode, cloud placeholder),
-/// the timer still advances after `skip_timer_s` plus this grace — a
+/// the timer still advances after `auto_skip_s` plus this grace — a
 /// slideshow must never freeze on one bad clip.
-const SKIP_TIMER_SPAWN_GRACE_S: f32 = 3.0;
+const AUTO_SKIP_SPAWN_GRACE_S: f32 = 3.0;
+/// Inset of the auto-skip timer from the video's (or window's) top-right
+/// corner; its radius is the `auto_skip_ring_radius` tuning.
+const AUTO_SKIP_RING_MARGIN: f32 = 18.0;
+/// How far the soft dark scrim extends past the ring's edge — keeps the
+/// white-on-white case legible without reading as a drawn border.
+const AUTO_SKIP_RING_SCRIM: f32 = 3.0;
 
 const DEMO_TILES: usize = 480;
 
@@ -300,10 +306,11 @@ pub struct Switchblade {
     sel_parked: bool,
     /// Set on `[`/`]` — the skip flash bar shows for a moment after.
     skip_flash_at: Option<Instant>,
-    /// Skip timer (`toggle_skip_timer`): when armed, holds the arming
-    /// instant so a clip already mid-play gets a full countdown from the
-    /// toggle, not an instant advance. None = off.
-    skip_timer_since: Option<Instant>,
+    /// Auto-skip (`toggle_auto_skip`): when armed, holds the countdown's
+    /// re-anchor instant — refreshed while the countdown is suspended
+    /// (grid view, pauses, scrubs), so a clip only ever counts down from
+    /// the moment it's actually being watched. None = off.
+    auto_skip_since: Option<Instant>,
     /// Clips already queued for meta.json healing this session (old
     /// cache entries lack pix_fmt, so live spawns fall back to the
     /// software chain until a background reprobe rewrites them — see
@@ -612,7 +619,7 @@ impl Switchblade {
             live_retry: HashMap::new(),
             sel_parked: false,
             skip_flash_at: None,
-            skip_timer_since: None,
+            auto_skip_since: None,
             reprobed: std::collections::HashSet::new(),
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
@@ -980,7 +987,7 @@ impl Switchblade {
         self.chase = self.tuning.key_snap_strength;
     }
 
-    /// Move the selection to an arbitrary index (random jump, skip-timer
+    /// Move the selection to an arbitrary index (random jump, auto-skip
     /// advance) — the same bookkeeping as `move_selection`, plus a
     /// filmstrip snap on far jumps: sliding the strip across half the
     /// library reads as a smear, single steps still glide.
@@ -998,7 +1005,7 @@ impl Switchblade {
             self.strip_pos = idx as f32;
             self.strip_target = self.strip_pos;
         }
-        // Not always an input event (the skip timer calls this): keep the
+        // Not always an input event (auto-skip calls this): keep the
         // loop awake through the settle timers, like event() does.
         self.wake(0.6);
     }
@@ -1091,43 +1098,33 @@ impl Switchblade {
         self.wake(1.0);
     }
 
-    /// Skip timer: with the timer armed, advance to the next clip
-    /// (wrapping) once the current one has played `skip_timer_s`. "Played"
-    /// means live frames on screen — the countdown starts at first frame,
-    /// not at selection, so cold-spawn latency doesn't eat watch time. At
-    /// levels without live video it counts from the selection change; a
-    /// stream that never delivers gets `SKIP_TIMER_SPAWN_GRACE_S` before
-    /// the slideshow moves on anyway.
-    fn tick_skip_timer(&mut self) {
-        let Some(since) = self.skip_timer_since else {
+    /// Auto-skip: with the timer armed AND a modal view (quickview or
+    /// fullview) up, advance to the next clip (wrapping) once the current
+    /// one has played `auto_skip_s`. "Played" means live frames on screen
+    /// — the countdown starts at first frame, not at selection, so
+    /// cold-spawn latency doesn't eat watch time. At levels without live
+    /// video it counts from the selection change; a stream that never
+    /// delivers gets `AUTO_SKIP_SPAWN_GRACE_S` before the slideshow moves
+    /// on anyway. Whenever the countdown is suspended — back in the grid,
+    /// paused, parked, scrubbing, mid-swap, chapter bar up — the anchor
+    /// refreshes, so clearing the suspension restarts a fresh countdown
+    /// (reopening a modal never inherits stale watch time).
+    fn tick_auto_skip(&mut self) {
+        if self.auto_skip_since.is_none() {
             return;
-        };
-        // Paused, parked (user scrolled away), scrubbing, or mid-swap:
-        // hold the countdown rather than yank the view around.
-        if self.clips.is_empty()
+        }
+        let suspended = !(self.quickview || self.fullview)
+            || self.clips.is_empty()
             || self.paused()
             || self.sel_parked
             || self.scrubbing
             || self.pending_reselect.is_some()
-            || self.chapters.is_some()
-        {
+            || self.chapters.is_some();
+        if suspended {
+            self.auto_skip_since = Some(Instant::now());
             return;
         }
-        let limit = Duration::from_secs_f32(self.tuning.skip_timer_s.max(0.05));
-        let first_frame = self
-            .live_sel
-            .as_ref()
-            .filter(|l| l.clip == self.selected)
-            .and_then(|l| l.first_frame);
-        let due = match first_frame {
-            Some(ff) => ff.max(since).elapsed() >= limit,
-            None if !self.level().live() => self.sel_changed_at.max(since).elapsed() >= limit,
-            None => {
-                self.sel_changed_at.max(since).elapsed()
-                    >= limit + Duration::from_secs_f32(SKIP_TIMER_SPAWN_GRACE_S)
-            }
-        };
-        if due {
+        if self.auto_skip_progress() >= Some(1.0) {
             let next = (self.selected + 1) % self.clips.len();
             if next != self.selected {
                 self.select_index(next);
@@ -1135,10 +1132,40 @@ impl Switchblade {
         }
     }
 
+    /// Elapsed fraction (0..1) of the auto-skip countdown — `Some` only
+    /// while the timer is armed and a modal view is up, which doubles as
+    /// the timer ring's visibility gate. 1.0 = time to advance.
+    fn auto_skip_progress(&self) -> Option<f32> {
+        let since = self.auto_skip_since?;
+        if !(self.quickview || self.fullview) || self.clips.is_empty() {
+            return None;
+        }
+        let limit = self.tuning.auto_skip_s.max(0.05);
+        let first_frame = self
+            .live_sel
+            .as_ref()
+            .filter(|l| l.clip == self.selected)
+            .and_then(|l| l.first_frame);
+        let start = match first_frame {
+            Some(ff) => ff.max(since),
+            None if !self.level().live() => self.sel_changed_at.max(since),
+            // Live expected but nothing delivered yet: bill the stall
+            // grace up front so the ring honestly shows "not started".
+            None => {
+                self.sel_changed_at.max(since)
+                    + Duration::from_secs_f32(AUTO_SKIP_SPAWN_GRACE_S)
+            }
+        };
+        let elapsed = Instant::now().saturating_duration_since(start);
+        Some((elapsed.as_secs_f32() / limit).min(1.0))
+    }
+
     // --- input ---
 
     fn key(&mut self, key: Key) {
-        // Movement keys are reserved; everything else goes through the keymap.
+        // Vertical movement keys are reserved; everything else (including
+        // horizontal movement, the `next`/`prev` actions) goes through
+        // the keymap.
         match key {
             // Esc peels layers: the chapter bar slides down first, then
             // fullview exits, then quickview.
@@ -1153,8 +1180,6 @@ impl Switchblade {
                 self.quickview = false;
                 return;
             }
-            Key::Char('h') | Key::Left => return self.move_selection(-1, 0),
-            Key::Char('l') | Key::Right => return self.move_selection(1, 0),
             Key::Char('k') | Key::Up => return self.move_selection(0, -1),
             Key::Char('j') | Key::Down => return self.move_selection(0, 1),
             _ => {}
@@ -1195,22 +1220,24 @@ impl Switchblade {
             Action::Fullview => self.fullview = !self.fullview,
             Action::ChapterMode => self.toggle_chapters(),
             Action::Skip { forward, amount } => self.skip(forward, amount),
+            Action::SelectNext => self.move_selection(1, 0),
+            Action::SelectPrev => self.move_selection(-1, 0),
             Action::OpenParent => self.open_parent(),
             Action::JumpRandom => self.jump_random(),
             Action::ShuffleLibrary => self.shuffle_library(),
-            Action::ToggleSkipTimer => {
-                self.skip_timer_since = match self.skip_timer_since {
+            Action::ToggleAutoSkip => {
+                self.auto_skip_since = match self.auto_skip_since {
                     Some(_) => None,
                     None => Some(Instant::now()),
                 };
                 log::info!(
-                    "skip timer {} ({}s per clip)",
-                    if self.skip_timer_since.is_some() {
+                    "auto-skip {} ({}s per clip, runs in quickview/fullview)",
+                    if self.auto_skip_since.is_some() {
                         "on"
                     } else {
                         "off"
                     },
-                    self.tuning.skip_timer_s
+                    self.tuning.auto_skip_s
                 );
             }
             Action::CopyPath => {
@@ -1470,6 +1497,7 @@ impl Switchblade {
             frame_fade: 0.0,
             tex_mix: 0.0,
             hires: false,
+            pie: 0.0,
         };
         // Track: a translucent-white tint (reads as a bright frosted line
         // over the video, not a grey slab); the fill is solid white.
@@ -1510,6 +1538,7 @@ impl Switchblade {
                     frame_fade: 0.0,
                     tex_mix: bar_a,
                     hires: false,
+                    pie: 0.0,
                 });
             }
         }
@@ -3139,6 +3168,7 @@ impl Switchblade {
                         frame_fade,
                         tex_mix: mix,
                         hires: tile_hires,
+                        pie: 0.0,
                     };
                     let out = if selected {
                         &mut selected_group
@@ -3243,6 +3273,7 @@ impl Switchblade {
                 frame_fade: 0.0,
                 tex_mix: 0.0,
                 hires: false,
+                pie: 0.0,
             };
             // Flat backdrop: an opaque stage instead of the tinted dim —
             // the grid behind it was never built, so nothing shows
@@ -3289,6 +3320,7 @@ impl Switchblade {
                     frame_fade: 0.0,
                     tex_mix: fade,
                     hires,
+                    pie: 0.0,
                 };
                 tiles.push(video);
                 // Seekbar along the video's bottom: revealed by pointer
@@ -3393,6 +3425,7 @@ impl Switchblade {
                     frame_fade: 0.0,
                     tex_mix: if has_tex { fade } else { 0.0 },
                     hires: false,
+                    pie: 0.0,
                 };
                 if sel {
                     sel_chip = Some(tile);
@@ -3428,6 +3461,7 @@ impl Switchblade {
                 frame_fade: 0.0,
                 tex_mix: 0.0,
                 hires: false,
+                pie: 0.0,
             };
             // Flat (default): an opaque backdrop_color stage covers the
             // grid (and any quickview) behind it. Blur: the frozen grid
@@ -3471,6 +3505,7 @@ impl Switchblade {
                         frame_fade: 0.0,
                         tex_mix: 1.0,
                         hires,
+                        pie: 0.0,
                     });
                     // The chapter bar owns the bottom edge while up: the
                     // seekbar fades out as the bar slides in.
@@ -3537,6 +3572,7 @@ impl Switchblade {
                         frame_fade: 0.0,
                         tex_mix: 0.0,
                         hires: false,
+                        pie: 0.0,
                     };
                     push_loading_dots(&mut tiles, &stage, a, anim_t, true);
                     self.wake(0.3);
@@ -3623,6 +3659,7 @@ impl Switchblade {
                             frame_fade: 0.0,
                             tex_mix: if uv.is_some() { a } else { 0.0 },
                             hires: false,
+                            pie: 0.0,
                         };
                         if cur {
                             cur_chip = Some(tile);
@@ -3646,6 +3683,39 @@ impl Switchblade {
                 }
                 _ => {}
             }
+        }
+
+        // Auto-skip timer: an arc ring in the VIDEO's top-right corner
+        // (the window's while nothing is decoded yet) — by default it
+        // fills clockwise toward the next clip; `auto_skip_countdown`
+        // flips it to a draining countdown. Only exists while the
+        // countdown does — armed AND a modal view up — so turning
+        // auto-skip off (or dropping back to the grid) removes it.
+        // Drawn above the modal layers, below the jobs bar.
+        if let Some(frac) = self.auto_skip_progress() {
+            let r = self.tuning.auto_skip_ring_radius.max(4.0);
+            let (cx, cy) = match self.active_video_rect() {
+                Some((x, y, w, _)) => (
+                    x + w - r - AUTO_SKIP_RING_MARGIN,
+                    y + r + AUTO_SKIP_RING_MARGIN,
+                ),
+                None => (
+                    self.viewport.width - r - AUTO_SKIP_RING_MARGIN,
+                    r + AUTO_SKIP_RING_MARGIN,
+                ),
+            };
+            push_countdown_ring(
+                &mut tiles,
+                cx,
+                cy,
+                r,
+                frac,
+                self.tuning.auto_skip_countdown,
+            );
+            // The ring is a clock: keep frames coming while it's on
+            // screen (live-video pacing usually covers this; levels
+            // without live video need the nudge).
+            self.wake(0.3);
         }
 
         // Background-jobs indicator: a hairline progress bar, bottom-right.
@@ -3684,6 +3754,7 @@ impl Switchblade {
                     frame_fade: 0.0,
                     tex_mix: 0.0,
                     hires: false,
+                    pie: 0.0,
                 };
                 tiles.push(bar(bx, bw, 0.03)); // track
                 tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
@@ -3976,7 +4047,7 @@ impl App for Switchblade {
                 self.media.request_chapters(path);
             }
         }
-        self.tick_skip_timer();
+        self.tick_auto_skip();
         self.step(dt);
         let lay = self.layout();
         self.request_visible_thumbs(&lay);
@@ -4068,10 +4139,93 @@ fn push_cloud_badge(out: &mut Vec<Tile>, tile: &Tile, ease: f32) {
         frame_fade: 0.0,
         tex_mix: 0.0,
         hires: false,
+        pie: 0.0,
     };
     out.push(part(bx + 2.0, by + 4.0, 13.0, 13.0)); // small bump
     out.push(part(bx + 9.0, by, 16.0, 16.0)); // big bump
     out.push(part(bx, by + 7.0, 28.0, 10.0)); // base bar
+}
+
+/// The auto-skip timer: a stroked arc ring, macOS-style — pure white,
+/// opacity does all the work. A soft dark scrim disc sits behind (a
+/// shadow, not a drawn border, so white-on-white stays legible), a
+/// ghosted full ring is the track, and a brighter arc shows progress:
+/// count-up (default) grows clockwise from 12 as `frac` (elapsed, 0..1)
+/// rises; `countdown` flips it to a draining arc ending at 12. The arcs
+/// are border-only circle tiles clipped by the shader's `Tile.pie`.
+fn push_countdown_ring(out: &mut Vec<Tile>, cx: f32, cy: f32, r: f32, frac: f32, countdown: bool) {
+    let stroke = (r * 0.375).max(2.0);
+    let ring = |alpha: f32, pie: f32| Tile {
+        x: cx - r,
+        y: cy - r,
+        w: r * 2.0,
+        h: r * 2.0,
+        color: [0.0; 4],
+        border_color: [1.0, 1.0, 1.0, alpha],
+        corner_radius: r,
+        border_width: stroke,
+        uv: [0.0; 4],
+        uv2: [0.0; 4],
+        frame_fade: 0.0,
+        tex_mix: 0.0,
+        hires: false,
+        pie,
+    };
+    let scrim = AUTO_SKIP_RING_SCRIM;
+    out.push(Tile {
+        x: cx - r - scrim,
+        y: cy - r - scrim,
+        w: (r + scrim) * 2.0,
+        h: (r + scrim) * 2.0,
+        color: [0.0, 0.0, 0.0, 0.25],
+        border_color: [0.0; 4],
+        corner_radius: r + scrim,
+        border_width: 0.0,
+        uv: [0.0; 4],
+        uv2: [0.0; 4],
+        frame_fade: 0.0,
+        tex_mix: 0.0,
+        hires: false,
+        pie: 0.0,
+    });
+    out.push(ring(0.14, 0.0));
+    let sweep = if countdown {
+        (1.0 - frac).clamp(0.0, 1.0)
+    } else {
+        frac.clamp(0.0, 1.0)
+    };
+    if sweep > 0.004 {
+        // Positive pie drains toward 12; negative grows from 12.
+        let pie = if countdown { sweep } else { -sweep };
+        out.push(ring(0.85, pie));
+        // Round caps: little discs on the arc's centerline at both ends —
+        // one fixed at 12, one riding the moving edge (the shader's
+        // angular cut is square; these round it off).
+        let rc = r - stroke * 0.5;
+        let cap = |turns: f32| {
+            let a = turns * std::f32::consts::TAU;
+            Tile {
+                x: cx + a.sin() * rc - stroke * 0.5,
+                y: cy - a.cos() * rc - stroke * 0.5,
+                w: stroke,
+                h: stroke,
+                color: [1.0, 1.0, 1.0, 0.85],
+                border_color: [0.0; 4],
+                corner_radius: stroke * 0.5,
+                border_width: 0.0,
+                uv: [0.0; 4],
+                uv2: [0.0; 4],
+                frame_fade: 0.0,
+                tex_mix: 0.0,
+                hires: false,
+                pie: 0.0,
+            }
+        };
+        out.push(cap(0.0));
+        if sweep < 0.996 {
+            out.push(cap(if countdown { 1.0 - sweep } else { sweep }));
+        }
+    }
 }
 
 /// A slim playback-position bar along a tile's bottom edge — the short
@@ -4096,6 +4250,7 @@ fn push_skip_bar(out: &mut Vec<Tile>, tile: &Tile, pos: f32, alpha: f32) {
         frame_fade: 0.0,
         tex_mix: 0.0,
         hires: false,
+        pie: 0.0,
     };
     let bx = tile.x + pad;
     out.push(bar(bx, bw, [0.08, 0.08, 0.10, 0.55 * alpha]));
@@ -4137,6 +4292,7 @@ fn push_loading_dots(out: &mut Vec<Tile>, tile: &Tile, ease: f32, t: f32, big: b
             frame_fade: 0.0,
             tex_mix: 0.0,
             hires: false,
+            pie: 0.0,
         });
     }
 }
@@ -5009,10 +5165,12 @@ mod tests {
         );
     }
 
-    /// The skip timer advances the selection once the current clip's time
-    /// is up, wraps at the end of the library, and holds while off.
+    /// Auto-skip advances the selection once the current clip's time is
+    /// up, wraps at the end of the library, only runs while a modal view
+    /// (quickview/fullview) is up, and shows a timer ring exactly
+    /// while the countdown exists.
     #[test]
-    fn skip_timer_advances_and_wraps() {
+    fn auto_skip_advances_and_wraps() {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None), // no live: counts from selection
             demo: true,
@@ -5024,23 +5182,52 @@ mod tests {
             height: 800.0,
         };
         let expired = Instant::now() - Duration::from_secs(60);
-        app.tuning.skip_timer_s = 5.0;
+        app.tuning.auto_skip_s = 5.0;
 
-        // Off: an expired countdown does nothing.
+        // Off: an expired countdown does nothing, no ring.
+        app.quickview = true;
         app.sel_changed_at = expired;
         let _ = app.frame(0.016, vp);
-        assert_eq!(app.selected, 0, "timer off: selection holds");
+        assert_eq!(app.selected, 0, "auto-skip off: selection holds");
+        assert_eq!(app.auto_skip_progress(), None, "off: no timer ring");
 
-        // On: it advances…
-        app.skip_timer_since = Some(expired);
+        // Armed but back in the grid: the countdown suspends (and keeps
+        // re-anchoring, so it can't fire the moment a modal reopens).
+        app.quickview = false;
+        app.auto_skip_since = Some(expired);
+        app.sel_changed_at = expired;
         let _ = app.frame(0.016, vp);
-        assert_eq!(app.selected, 1, "timer on: selection advances");
-        // …and re-arms (the new clip gets its own countdown).
+        assert_eq!(app.selected, 0, "grid view: countdown suspended");
+        assert_eq!(app.auto_skip_progress(), None, "grid view: ring hidden");
+        assert!(
+            app.auto_skip_since.unwrap() > expired,
+            "suspension re-anchors the countdown"
+        );
+
+        // In quickview it advances…
+        app.quickview = true;
+        app.auto_skip_since = Some(expired);
+        app.sel_changed_at = expired;
+        assert_eq!(
+            app.auto_skip_progress(),
+            Some(1.0),
+            "modal + armed: ring shows a spent countdown"
+        );
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.selected, 1, "auto-skip on: selection advances");
+        // …and re-arms (the new clip gets its own countdown, ring reset).
         let _ = app.frame(0.016, vp);
         assert_eq!(app.selected, 1, "fresh selection: countdown restarts");
+        assert!(
+            app.auto_skip_progress().unwrap() < 1.0,
+            "fresh selection: the ring starts over"
+        );
 
-        // Wraps from the last clip back to the first.
+        // Wraps from the last clip back to the first (fullview counts too).
+        app.quickview = false;
+        app.fullview = true;
         app.selected = app.clips.len() - 1;
+        app.auto_skip_since = Some(expired);
         app.sel_changed_at = expired;
         let _ = app.frame(0.016, vp);
         assert_eq!(app.selected, 0, "wraps to the first clip");

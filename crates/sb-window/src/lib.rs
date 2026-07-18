@@ -190,6 +190,13 @@ pub struct Tile {
     /// Sample the high-res texture instead of the atlas (`uv` is then
     /// normalized against the hires dims).
     pub hires: bool,
+    /// Pie-clip (the auto-skip timer): 0 = off (normal tile); otherwise
+    /// the tile — fill and border alike, so a border-only circle becomes
+    /// an arc — is clipped to a wedge spanning |pie| (0..=1) of the
+    /// circle. Positive: the wedge ends at 12 o'clock and drains
+    /// clockwise as it shrinks (countdown). Negative: it starts at 12
+    /// and grows clockwise (count-up).
+    pub pie: f32,
 }
 
 /// Frosted-glass backdrop: `tiles[..split]` also render offscreen, get

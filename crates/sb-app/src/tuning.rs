@@ -144,10 +144,18 @@ pub struct Tuning {
     /// a native macOS drag (drop into Finder or onto another app).
     /// Below this the press stays a click.
     pub drag_threshold: f32,
-    /// Auto-advance ("skip timer", `toggle_skip_timer`): once the selected
-    /// clip has played this many seconds, selection moves to the next clip
-    /// (wraps at the end of the library).
-    pub skip_timer_s: f32,
+    /// Auto-skip (`toggle_auto_skip`): with the timer armed and quickview
+    /// or fullview up, once the selected clip has played this many
+    /// seconds the selection auto-advances to the next clip (wraps at
+    /// the end of the library). `skip_timer_s` is the legacy spelling.
+    #[serde(alias = "skip_timer_s")]
+    pub auto_skip_s: f32,
+    /// Radius (px) of the auto-skip timer — the arc ring in the video's
+    /// top-right corner while the countdown runs.
+    pub auto_skip_ring_radius: f32,
+    /// false (default): the arc fills up toward the next clip (count-up).
+    /// true: it drains like a classic countdown.
+    pub auto_skip_countdown: bool,
     /// Media quality — read once at startup (restart to apply).
     /// Thumbnails generate at exactly this size; any resolution works.
     /// The GPU atlas is carved into fixed slots of this same size, so
@@ -278,7 +286,9 @@ impl Default for Tuning {
             live_delay_ms: 100.0,
             skip_fraction: 0.10,
             drag_threshold: 6.0,
-            skip_timer_s: 5.0,
+            auto_skip_s: 5.0,
+            auto_skip_ring_radius: 16.0,
+            auto_skip_countdown: false,
             thumb_width: 640,
             thumb_height: 360,
             thumb_quality: 7,

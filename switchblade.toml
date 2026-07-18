@@ -106,11 +106,19 @@ skip_fraction = 0.10
 # onto another app. Below this the press stays a click.
 drag_threshold = 6.0
 
-# Skip timer ('t' toggles): once the selected clip has PLAYED this many
-# seconds, selection auto-advances to the next clip (wraps at the end) —
-# a hands-free slideshow. The countdown starts when video actually
-# appears, so decoder spin-up doesn't eat watch time.
-skip_timer_s = 5.0
+# Auto-skip ('t' toggles): while quickview or fullview is up, once the
+# selected clip has PLAYED this many seconds the selection auto-advances
+# to the next clip (wraps at the end) — a hands-free slideshow. The
+# countdown starts when video actually appears (decoder spin-up doesn't
+# eat watch time), resets whenever you skip to another clip, and
+# suspends while you're back in the grid. skip_timer_s is the legacy
+# spelling.
+auto_skip_s = 5.0
+# The timer: an arc ring in the video's top-right corner that fills up
+# clockwise toward the next clip. Set auto_skip_countdown = true to make
+# it drain like a classic countdown instead.
+auto_skip_ring_radius = 16.0
+auto_skip_countdown = false
 
 # Pause live playback + sheet animation while the window is unfocused
 # (the grid stays visible, just still — big CPU saver). Toggle at
@@ -257,7 +265,9 @@ quickview_max_width = 2560
 quickview_max_height = 1440
 
 # ── Keys & commands (PLAN.md §11) ────────────────────────────────────────
-# hjkl / arrows are reserved for movement; every other key is remappable.
+# j/k and the vertical arrows are reserved for movement; every other key
+# is remappable — including forward/back, which are the ordinary `next`
+# and `prev` actions (h/l and the horizontal arrows by default).
 # Built-in defaults: enter/o = open · space = quickview · tab = fullview ·
 # c = copy_path · q = quit · f = fullscreen · a = toggle_anim ·
 # p = toggle_focus_pause · r = reveal · -/=/0 = zoom · [ / ] = skip
@@ -266,9 +276,9 @@ quickview_max_height = 1440
 #
 # A key can name an internal action (quit, fullscreen, fast_fullscreen,
 # copy_path, quickview, fullview, chapter_mode, toggle_anim,
-# toggle_focus_pause, zoom_in, zoom_out, zoom_reset, skip_forward,
-# skip_back, open_parent, jump_random, shuffle_library,
-# toggle_skip_timer) or any
+# toggle_focus_pause, zoom_in, zoom_out, zoom_reset, next, prev,
+# skip_forward, skip_back, open_parent, jump_random, shuffle_library,
+# toggle_auto_skip) or any
 # [commands.*] entry below. In command args, {path}, {dir} and {name}
 # expand against the selected clip.
 #
@@ -290,12 +300,14 @@ D = "open_parent"  # re-ingest from the selected clip's parent dir
 a = "toggle_anim"  # animated thumbnails on/off
 c = "copy_path"
 g = "chapter_mode"  # chapter bar in fullview ("chapters" also works)
-j = "jump_random"  # random clip with a cached thumbnail ("jump_to_random" too)
+h = "prev"  # selection back one clip (the default vim binding)
+l = "next"  # selection forward one clip — what auto-skip fires
 o = "open"
 p = "toggle_focus_pause"  # pause-when-unfocused on/off
 r = "reveal"  # reveal in Finder (open -R)
 s = "shuffle_library"  # shuffle cached clips to the front ("shuffle" also works)
-t = "toggle_skip_timer"  # auto-advance every skip_timer_s of playback
+t = "toggle_auto_skip"  # auto-advance after auto_skip_s of modal playback
+x = "jump_random"  # random clip with a cached thumbnail ("jump_to_random" too)
 # n = "rename_script"    # any key -> any launched program; example below
 
 # "open" is just a command like any other — swap mpv for whatever you

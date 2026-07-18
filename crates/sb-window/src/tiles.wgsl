@@ -24,6 +24,7 @@ struct Inst {
     @location(8) uv: vec4<f32>,
     @location(9) uv2: vec4<f32>,
     @location(10) tex_source: f32,
+    @location(11) pie: f32,
 };
 
 struct VsOut {
@@ -39,6 +40,7 @@ struct VsOut {
     @location(8) uv: vec4<f32>,
     @location(9) uv2: vec4<f32>,
     @location(10) tex_source: f32,
+    @location(11) pie: f32,
 };
 
 @vertex
@@ -67,6 +69,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     out.uv = inst.uv;
     out.uv2 = inst.uv2;
     out.tex_source = inst.tex_source;
+    out.pie = inst.pie;
     return out;
 }
 
@@ -91,7 +94,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let r = min(in.radius, min(in.size.x, in.size.y) * 0.5);
     let d = sd_round_rect(p, in.size * 0.5, r);
     let aa = 1.0;
-    let fill = 1.0 - smoothstep(-aa, aa, d);
+    var fill = 1.0 - smoothstep(-aa, aa, d);
+
+    // Pie-clip (the auto-skip timer): clip the tile (fill AND border, so
+    // a border-only tile becomes an arc) to a wedge |pie| of the circle.
+    // pie > 0: the wedge ENDS at 12 o'clock — it drains clockwise as pie
+    // shrinks (countdown). pie < 0: the wedge STARTS at 12 — it grows
+    // clockwise as |pie| grows (count-up). 0 = off.
+    let pw = abs(in.pie);
+    if (pw > 0.0 && pw < 0.999) {
+        // Angle as a clockwise 0..1 fraction from 12 o'clock (y is down).
+        let a = atan2(p.x, -p.y);
+        let tau = 6.28318530718;
+        let f = fract(a / tau + 1.0);
+        // ~1px of angular smoothing at this tile's rim.
+        let e = 1.0 / (3.1416 * max(min(in.size.x, in.size.y), 4.0));
+        if (in.pie > 0.0) {
+            fill = fill * smoothstep(1.0 - pw - e, 1.0 - pw + e, f);
+        } else {
+            fill = fill * (1.0 - smoothstep(pw - e, pw + e, f));
+        }
+    }
 
     var ring = 0.0;
     if (in.border_width > 0.0) {

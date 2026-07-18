@@ -54,7 +54,8 @@ struct Instance {
     uv: [f32; 4],
     uv2: [f32; 4],
     tex_source: f32,
-    _pad: [f32; 3],
+    pie: f32,
+    _pad: [f32; 2],
 }
 
 pub struct Gpu {
@@ -351,6 +352,7 @@ impl Gpu {
                 8 => Float32x4,
                 9 => Float32x4,
                 10 => Float32,
+                11 => Float32,
             ],
         };
 
@@ -736,7 +738,8 @@ impl Gpu {
                 uv: t.uv,
                 uv2: t.uv2,
                 tex_source: t.hires as u8 as f32,
-                _pad: [0.0; 3],
+                pie: t.pie,
+                _pad: [0.0; 2],
             })
             .collect();
 
