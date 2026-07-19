@@ -33,13 +33,36 @@ pub struct Recipe {
     /// evenly across the clip (PLAN.md §6 level 2), packed into one slot.
     /// Frame resolution = thumb / anim_grid: 3 = more motion, 2 = crisper.
     pub anim_grid: u32,
+    /// Fraction of the clip's duration the STATIC thumb is extracted at
+    /// (0..1). Live playback seeks to the same fraction so it continues
+    /// from the frame the tile already shows — so this value governs both,
+    /// and it's part of the artifact name below so a change regenerates
+    /// the thumb (a stale-fraction thumb would jolt when live starts).
+    pub seek_fraction: f32,
 }
 
 impl Recipe {
+    /// Filename suffix for a non-default seek fraction (e.g. `_s25` = 25%).
+    /// The historical default (`SEEK_FRACTION`) keeps the original
+    /// suffix-less name so existing caches aren't invalidated on upgrade;
+    /// only opting into a different fraction regenerates.
+    fn seek_suffix(&self) -> String {
+        if (self.seek_fraction as f64 - SEEK_FRACTION).abs() < 0.0005 {
+            String::new()
+        } else {
+            format!(
+                "_s{}",
+                (self.seek_fraction.clamp(0.0, 1.0) * 100.0).round() as u32
+            )
+        }
+    }
     fn thumb_file(&self) -> String {
         format!(
-            "thumb_fit_{}x{}_q{}.jpg",
-            self.thumb_w, self.thumb_h, self.quality
+            "thumb_fit_{}x{}_q{}{}.jpg",
+            self.thumb_w,
+            self.thumb_h,
+            self.quality,
+            self.seek_suffix()
         )
     }
     fn anim_file(&self) -> String {
@@ -61,8 +84,10 @@ const WORKERS: usize = 3;
 /// wake for it instead of polling (PERFORMANCE-TASKS.md P0.2). The app
 /// passes its window-layer wake handle wrapped in a closure.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
-/// Extract the frame this far into the clip (PLAN.md §6 initial policy).
-/// Public so live playback can start from the same frame the thumb shows.
+/// Default fraction into the clip the thumb is extracted at (PLAN.md §6
+/// initial policy) — the `thumb_seek_fraction` tuning overrides it via
+/// `Recipe::seek_fraction`. Kept public as the default and so callers
+/// without a recipe (maintenance) share one constant.
 pub const SEEK_FRACTION: f64 = 0.10;
 
 enum Request {
@@ -867,7 +892,7 @@ fn ensure_thumb_file(
         let seek = probed
             .as_ref()
             .and_then(|m| m.duration)
-            .map(|d| (d * SEEK_FRACTION).max(0.0))
+            .map(|d| (d * recipe.seek_fraction as f64).max(0.0))
             .unwrap_or(0.0);
         let codec = probed.as_ref().and_then(|m| m.codec.clone());
         extract_frame(src, &jpg, seek, recipe, codec.as_deref())?;
@@ -1699,6 +1724,39 @@ mod tests {
         assert!(q.pop().is_none(), "bulk entry must not run again");
     }
 
+    /// The thumb seek fraction is part of the artifact name so a changed
+    /// start point regenerates — but the historical default keeps the
+    /// original suffix-less name so existing caches survive an upgrade.
+    #[test]
+    fn seek_fraction_names_the_thumb_artifact() {
+        let base = Recipe {
+            thumb_w: 640,
+            thumb_h: 360,
+            quality: 5,
+            anim_grid: 3,
+            seek_fraction: 0.10,
+        };
+        assert_eq!(
+            base.thumb_file(),
+            "thumb_fit_640x360_q5.jpg",
+            "the default fraction keeps the legacy name"
+        );
+        let start = Recipe {
+            seek_fraction: 0.0,
+            ..base
+        };
+        assert_eq!(
+            start.thumb_file(),
+            "thumb_fit_640x360_q5_s0.jpg",
+            "a 0% start gets its own artifact"
+        );
+        let quarter = Recipe {
+            seek_fraction: 0.25,
+            ..base
+        };
+        assert_eq!(quarter.thumb_file(), "thumb_fit_640x360_q5_s25.jpg");
+    }
+
     /// Two generations of the same artifact must never share a staging
     /// file — a shared name let concurrent ffmpeg outputs interleave and
     /// renamed a truncated JPEG into the cache (P0.6).
@@ -1752,6 +1810,7 @@ mod tests {
             thumb_h: 180,
             quality: 5,
             anim_grid: 2,
+            seek_fraction: 0.10,
         };
         let root = dir.join("race-cache");
         for _ in 0..3 {
@@ -1810,6 +1869,7 @@ mod tests {
             thumb_h: 180,
             quality: 5,
             anim_grid: 3,
+            seek_fraction: 0.10,
         };
         let t0 = std::time::Instant::now();
         let sheet = make_anim(&clip, &root, true, &recipe);

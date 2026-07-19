@@ -163,6 +163,13 @@ pub struct Tuning {
     /// Fraction of the clip's duration that `[`/`]` jump (0..1). A binding
     /// can override it per key via `amount` on an internal command.
     pub skip_fraction: f32,
+    /// Where playback (and the matching static thumbnail) starts, as a
+    /// fraction of the clip's duration (0..1) — 0.0 opens at the very
+    /// beginning. Startup-only (part of the media recipe): changing it
+    /// regenerates thumbs so the thumb and the first live frame agree,
+    /// keeping the no-jolt handoff. The historical default 0.10 reuses
+    /// the existing cache; any other value regenerates.
+    pub thumb_seek_fraction: f32,
     /// Pointer travel (logical px) that turns a press on a tile or
     /// filmstrip chip into a drag-out: the clip's file leaves the app as
     /// a native macOS drag (drop into Finder or onto another app).
@@ -180,6 +187,12 @@ pub struct Tuning {
     /// false (default): the arc fills up toward the next clip (count-up).
     /// true: it drains like a classic countdown.
     pub auto_skip_countdown: bool,
+    /// Background-jobs progress bar (bottom-right hairline while thumbs
+    /// generate): drawn size in logical px and a master opacity (0..1)
+    /// scaling both the faint track and the fill.
+    pub jobs_bar_width: f32,
+    pub jobs_bar_height: f32,
+    pub jobs_bar_opacity: f32,
     /// Media quality — read once at startup (restart to apply).
     /// Thumbnails generate at exactly this size; any resolution works.
     /// The GPU atlas is carved into fixed slots of this same size, so
@@ -230,6 +243,10 @@ pub struct Tuning {
     /// stays generous either way — the hit band is taller than the bar).
     pub seekbar_height: f32,
     pub seekbar_hover_height: f32,
+    /// Opacity (0..1) of the seekbar's background track — the unfilled
+    /// part behind the played fill. The fill stays solid white; this only
+    /// tints the track. Scaled by the bar's reveal/fade alpha.
+    pub seekbar_track_opacity: f32,
     /// Width of the storyboard preview shown while hovering the bar (the
     /// nearest anim-sheet frame to the hovered timestamp). 0 disables.
     pub seekbar_thumb_width: f32,
@@ -311,10 +328,14 @@ impl Default for Tuning {
             interaction: Interaction::Classic,
             attention_delay_ms: 250.0,
             skip_fraction: 0.10,
+            thumb_seek_fraction: 0.10,
             drag_threshold: 6.0,
             auto_skip_s: 5.0,
             auto_skip_ring_radius: 16.0,
             auto_skip_countdown: false,
+            jobs_bar_width: 84.0,
+            jobs_bar_height: 4.0,
+            jobs_bar_opacity: 0.8,
             thumb_width: 640,
             thumb_height: 360,
             thumb_quality: 7,
@@ -335,6 +356,7 @@ impl Default for Tuning {
             seekbar_fade_ms: 250.0,
             seekbar_height: 6.0,
             seekbar_hover_height: 12.0,
+            seekbar_track_opacity: 0.28,
             seekbar_thumb_width: 190.0,
             strip_scroll_sensitivity: 1.0,
             strip_scroll_selects: true,

@@ -328,6 +328,10 @@ pub struct Switchblade {
     focused: bool,
     focus_pause_on: bool,
     anim_grid: u32,
+    /// Where live playback seeks to on spawn (fraction of duration),
+    /// captured from the media recipe at startup so it stays locked to the
+    /// fraction the cached thumbnail was extracted at — the no-jolt handoff.
+    seek_fraction: f64,
     atlas_cfg: AtlasCfg,
     /// Internal fullscreen-ish preview of the selected clip.
     quickview: bool,
@@ -551,6 +555,7 @@ pub fn recipe_from(tuning: &Tuning) -> Recipe {
         // avoids the hideous end of the scale.
         quality: 12 - tuning.thumb_quality.clamp(1, 10),
         anim_grid: tuning.anim_grid.clamp(1, 4),
+        seek_fraction: tuning.thumb_seek_fraction.clamp(0.0, 0.99),
     }
 }
 
@@ -637,6 +642,7 @@ impl Switchblade {
             focused: true,
             focus_pause_on: true,
             anim_grid: recipe.anim_grid,
+            seek_fraction: recipe.seek_fraction as f64,
             atlas_cfg,
             quickview: false,
             quickview_at: Instant::now(),
@@ -1554,7 +1560,8 @@ impl Switchblade {
         };
         // Track: a translucent-white tint (reads as a bright frosted line
         // over the video, not a grey slab); the fill is solid white.
-        tiles.push(bar(bx, bw, [1.0, 1.0, 1.0, 0.28 * bar_a]));
+        let track_a = t.seekbar_track_opacity.clamp(0.0, 1.0);
+        tiles.push(bar(bx, bw, [1.0, 1.0, 1.0, track_a * bar_a]));
         tiles.push(bar(bx, (bw * pos).max(bh), [1.0, 1.0, 1.0, 0.95 * bar_a]));
         // Storyboard preview (PLAN.md §14 M8 phase 1): the anim sheet is
         // already g² frames spread across the duration — hovering the bar
@@ -2878,7 +2885,7 @@ impl Switchblade {
         // frame the tile already shows instead of jolting to 0:00.
         let duration = meta.as_ref().and_then(|m| m.duration);
         let seek = duration
-            .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
+            .map(|d| (d * self.seek_fraction).max(0.0))
             .unwrap_or(0.0);
         self.heal_meta(meta.as_ref(), &path);
         let player = sb_media::SeekablePlayer::spawn(&path, dw, dh, seek, meta.as_ref())?;
@@ -2916,7 +2923,7 @@ impl Switchblade {
         let seek = meta
             .as_ref()
             .and_then(|m| m.duration)
-            .map(|d| (d * sb_media::SEEK_FRACTION).max(0.0))
+            .map(|d| (d * self.seek_fraction).max(0.0))
             .unwrap_or(0.0);
         self.heal_meta(meta.as_ref(), &path);
         let Some(player) = sb_media::SeekablePlayer::spawn(&path, tw, th, seek, meta.as_ref())
@@ -3832,7 +3839,8 @@ impl Switchblade {
                 self.jobs_finished_at = None;
             } else {
                 let progress = self.jobs_done as f32 / self.jobs_total as f32;
-                let (bw, bh) = (84.0, 6.0);
+                let op = t.jobs_bar_opacity.clamp(0.0, 1.0);
+                let (bw, bh) = (t.jobs_bar_width.max(8.0), t.jobs_bar_height.max(1.0));
                 let bx = self.viewport.width - bw - 24.0;
                 let by = self.viewport.height - bh - 22.0;
                 let bar = |x: f32, w: f32, a: f32| Tile {
@@ -3840,7 +3848,7 @@ impl Switchblade {
                     y: by,
                     w,
                     h: bh,
-                    color: [0.85, 0.85, 0.9, a * fade],
+                    color: [0.85, 0.85, 0.9, a * op * fade],
                     border_color: [0.0; 4],
                     corner_radius: bh * 0.5,
                     border_width: 0.0,
@@ -3851,8 +3859,8 @@ impl Switchblade {
                     hires: false,
                     pie: 0.0,
                 };
-                tiles.push(bar(bx, bw, 0.03)); // track
-                tiles.push(bar(bx, (bw * progress).max(bh), 0.45)); // fill
+                tiles.push(bar(bx, bw, 0.12)); // track
+                tiles.push(bar(bx, (bw * progress).max(bh), 0.9)); // fill
             }
         }
 
@@ -4033,8 +4041,9 @@ impl App for Switchblade {
                 }
                 // In quickview: the seekbar grabs first (click = seek,
                 // hold = scrub), then a filmstrip chip click selects it;
-                // anywhere else closes. In the grid: click selects, click
-                // on the selection opens quickview.
+                // clicking the VIDEO promotes to fullview (its stream is
+                // already playing — zero handoff); clicking the frosted
+                // background returns to the grid.
                 if self.quickview {
                     if let Some(f) = self.seekbar_hit(x, y) {
                         self.scrubbing = true;
@@ -4057,6 +4066,11 @@ impl App for Switchblade {
                             clip: i,
                             open_quickview: false,
                         });
+                    } else if self.quickview_video_rect().is_some_and(|(vx, vy, vw, vh)| {
+                        (vx..=vx + vw).contains(&x) && (vy..=vy + vh).contains(&y)
+                    }) {
+                        // Click on the video itself: step up to fullview.
+                        self.fullview = true;
                     } else {
                         self.quickview = false;
                     }
@@ -4286,7 +4300,7 @@ fn push_countdown_ring(out: &mut Vec<Tile>, cx: f32, cy: f32, r: f32, frac: f32,
         y: cy - r - scrim,
         w: (r + scrim) * 2.0,
         h: (r + scrim) * 2.0,
-        color: [0.0, 0.0, 0.0, 0.25],
+        color: [0.0, 0.0, 0.0, 0.45],
         border_color: [0.0; 4],
         corner_radius: r + scrim,
         border_width: 0.0,
@@ -4297,7 +4311,7 @@ fn push_countdown_ring(out: &mut Vec<Tile>, cx: f32, cy: f32, r: f32, frac: f32,
         hires: false,
         pie: 0.0,
     });
-    out.push(ring(0.14, 0.0));
+    out.push(ring(0.2, 0.0));
     let sweep = if countdown {
         (1.0 - frac).clamp(0.0, 1.0)
     } else {
@@ -4306,10 +4320,13 @@ fn push_countdown_ring(out: &mut Vec<Tile>, cx: f32, cy: f32, r: f32, frac: f32,
     if sweep > 0.004 {
         // Positive pie drains toward 12; negative grows from 12.
         let pie = if countdown { sweep } else { -sweep };
-        out.push(ring(0.85, pie));
+        // Fully opaque arc + caps: the caps are separate discs drawn over
+        // the arc's ends to round the shader's square angular cut, and any
+        // alpha below 1.0 makes their overlap with the arc double-blend
+        // into visible "bulbs". Opaque white over opaque white is seamless.
+        out.push(ring(1.0, pie));
         // Round caps: little discs on the arc's centerline at both ends —
-        // one fixed at 12, one riding the moving edge (the shader's
-        // angular cut is square; these round it off).
+        // one fixed at 12, one riding the moving edge.
         let rc = r - stroke * 0.5;
         let cap = |turns: f32| {
             let a = turns * std::f32::consts::TAU;
@@ -4318,7 +4335,7 @@ fn push_countdown_ring(out: &mut Vec<Tile>, cx: f32, cy: f32, r: f32, frac: f32,
                 y: cy - a.cos() * rc - stroke * 0.5,
                 w: stroke,
                 h: stroke,
-                color: [1.0, 1.0, 1.0, 0.85],
+                color: [1.0, 1.0, 1.0, 1.0],
                 border_color: [0.0; 4],
                 corner_radius: stroke * 0.5,
                 border_width: 0.0,
@@ -5115,6 +5132,59 @@ mod tests {
         assert_eq!(app.selected, 2, "the strip clamps at the ends");
         // Grid pan must not have moved under the modal.
         assert_eq!(app.scroll_target, 0.0, "the backdrop grid never pans");
+    }
+
+    /// In quickview, a click on the video steps up to fullview (its
+    /// stream is already playing — zero handoff); a click on the frosted
+    /// background returns to the grid.
+    #[test]
+    fn quickview_click_video_enters_fullview_background_exits() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let _ = app.frame(0.016, vp); // sets the viewport
+        // quickview_video_rect needs a Ready thumb (its aspect sizes the
+        // rect); demo tiles start empty, so install one.
+        app.clips[0].thumb = Thumb::Ready {
+            slot: 0,
+            at: Instant::now(),
+            tw: 640,
+            th: 360,
+        };
+        app.selected = 0;
+        app.quickview = true;
+        app.quickview_at = Instant::now();
+
+        let (vx, vy, vw, vh) = app.quickview_video_rect().expect("video rect");
+        // Click dead center of the video: step up to fullview.
+        app.event(InputEvent::MouseDown {
+            x: vx + vw * 0.5,
+            y: vy + vh * 0.5,
+            mods: Mods::default(),
+        });
+        assert!(app.fullview, "clicking the video enters fullview");
+        assert!(
+            app.quickview,
+            "fullview layers over quickview, not replacing it"
+        );
+
+        // Back to quickview, then click the frosted background (top-left
+        // corner, well outside the centered video) → return to the grid.
+        app.fullview = false;
+        app.event(InputEvent::MouseDown {
+            x: 4.0,
+            y: 4.0,
+            mods: Mods::default(),
+        });
+        assert!(!app.quickview, "clicking the background closes to the grid");
+        assert!(!app.fullview, "and does not enter fullview");
     }
 
     /// With strip_scroll_selects off, scrolling the filmstrip only

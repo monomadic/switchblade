@@ -219,6 +219,7 @@ mod tests {
         thumb_h: 360,
         quality: 5,
         anim_grid: 3,
+        seek_fraction: 0.10,
     };
 
     fn meta_for(src: &Path) -> Vec<u8> {
