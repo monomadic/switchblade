@@ -1,10 +1,13 @@
 //! Key → command dispatch (PLAN.md §11): one keymap resolves keys to
 //! internal actions or external programs run on the selected clip.
 //!
-//! Vertical movement keys (jk / up / down arrows) are reserved and never
-//! reach the keymap; forward/back are the remappable `next`/`prev`
-//! actions (h/l and the horizontal arrows by default). User
-//! `[keys]`/`[commands]` entries overlay the built-in defaults.
+//! Movement is fully remappable: hjkl and the arrows bind to the
+//! context-sensitive `move_left`/`move_down`/`move_up`/`move_right`
+//! actions by default (grid/quickview move the selection; in fullview —
+//! chapter bar up or not — left/right step chapters instead). The plain
+//! linear `next`/`prev` actions remain for bindings that always want a
+//! selection move (auto-skip fires `next`). User `[keys]`/`[commands]`
+//! entries overlay the built-in defaults.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -69,12 +72,20 @@ pub enum Action {
         forward: bool,
         amount: Option<f32>,
     },
-    /// Advance the selection to the next clip (linear order — the same
-    /// move `l`/`Right` make; row-end wraps to the next row). Auto-skip
-    /// fires this when its countdown expires.
+    /// Advance the selection to the next clip (linear order; row-end
+    /// wraps to the next row). Auto-skip fires this when its countdown
+    /// expires.
     SelectNext,
-    /// Selection back one clip (linear order, like `h`/`Left`).
+    /// Selection back one clip (linear order).
     SelectPrev,
+    /// Context-sensitive movement — the default hjkl/arrow bindings
+    /// (`move_left`/`move_down`/`move_up`/`move_right`). In the grid and
+    /// quickview it moves the selection; in fullview (chapter bar up or
+    /// not) horizontal moves step the playing clip between chapters.
+    Move {
+        dx: i32,
+        dy: i32,
+    },
     /// Re-ingest from the selected clip's parent directory (siblings view).
     OpenParent,
     /// Select a uniformly random other clip in the library.
@@ -118,10 +129,14 @@ impl Default for KeyMap {
             ("x", "jump_random"),
             ("s", "shuffle_library"),
             ("t", "toggle_auto_skip"),
-            ("h", "prev"),
-            ("l", "next"),
-            ("left", "prev"),
-            ("right", "next"),
+            ("h", "move_left"),
+            ("j", "move_down"),
+            ("k", "move_up"),
+            ("l", "move_right"),
+            ("left", "move_left"),
+            ("down", "move_down"),
+            ("up", "move_up"),
+            ("right", "move_right"),
         ] {
             keys.insert(k.to_string(), v.to_string());
         }
@@ -198,11 +213,12 @@ fn key_name(key: &Key) -> Option<String> {
         Key::Escape => "esc".to_string(),
         Key::Tab => "tab".to_string(),
         Key::Char(c) => c.to_string(),
-        // Horizontal arrows resolve like any key (bound to prev/next by
-        // default); vertical arrows stay reserved movement keys.
+        // Arrows resolve like any key (bound to the move_* actions by
+        // default), so movement is remappable end to end.
         Key::Left => "left".to_string(),
         Key::Right => "right".to_string(),
-        _ => return None,
+        Key::Up => "up".to_string(),
+        Key::Down => "down".to_string(),
     })
 }
 
@@ -230,6 +246,10 @@ fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
         },
         "next" | "select_next" => Action::SelectNext,
         "prev" | "previous" | "select_prev" => Action::SelectPrev,
+        "move_left" => Action::Move { dx: -1, dy: 0 },
+        "move_right" => Action::Move { dx: 1, dy: 0 },
+        "move_up" => Action::Move { dx: 0, dy: -1 },
+        "move_down" => Action::Move { dx: 0, dy: 1 },
         "open_parent" | "browse_parent" => Action::OpenParent,
         "jump_random" | "jump_to_random" => Action::JumpRandom,
         "shuffle_library" | "shuffle" => Action::ShuffleLibrary,
@@ -364,21 +384,39 @@ mod tests {
     #[test]
     fn movement_defaults_resolve_and_stay_remappable() {
         let map = KeyMap::default();
-        for key in [Key::Char('l'), Key::Right] {
-            assert!(matches!(map.action_for(&key), Some(Action::SelectNext)));
+        // hjkl and the arrows bind to the context-sensitive move_* actions.
+        for (key, dx, dy) in [
+            (Key::Char('h'), -1, 0),
+            (Key::Char('l'), 1, 0),
+            (Key::Char('k'), 0, -1),
+            (Key::Char('j'), 0, 1),
+            (Key::Left, -1, 0),
+            (Key::Right, 1, 0),
+            (Key::Up, 0, -1),
+            (Key::Down, 0, 1),
+        ] {
+            assert!(
+                matches!(
+                    map.action_for(&key),
+                    Some(Action::Move { dx: ax, dy: ay }) if ax == dx && ay == dy
+                ),
+                "wrong action for {key:?}"
+            );
         }
-        for key in [Key::Char('h'), Key::Left] {
-            assert!(matches!(map.action_for(&key), Some(Action::SelectPrev)));
-        }
-        // Vertical movement stays reserved — arrows never reach the keymap.
-        assert!(map.action_for(&Key::Up).is_none());
-        assert!(map.action_for(&Key::Down).is_none());
-        // next/prev are ordinary commands: a user config can rebind them.
-        let keys = HashMap::from([("n".to_string(), "next".to_string())]);
+        // move_* and next/prev are ordinary commands: a user config can
+        // rebind any of them.
+        let keys = HashMap::from([
+            ("n".to_string(), "next".to_string()),
+            ("j".to_string(), "prev".to_string()),
+        ]);
         let map = KeyMap::merged(keys, HashMap::new());
         assert!(matches!(
             map.action_for(&Key::Char('n')),
             Some(Action::SelectNext)
+        ));
+        assert!(matches!(
+            map.action_for(&Key::Char('j')),
+            Some(Action::SelectPrev)
         ));
     }
 

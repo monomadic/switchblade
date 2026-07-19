@@ -299,9 +299,13 @@ quickview_max_width = 2560
 quickview_max_height = 1440
 
 # ── Keys & commands (PLAN.md §11) ────────────────────────────────────────
-# j/k and the vertical arrows are reserved for movement; every other key
-# is remappable — including forward/back, which are the ordinary `next`
-# and `prev` actions (h/l and the horizontal arrows by default).
+# Every key is remappable, movement included: hjkl and the arrows bind to
+# the context-sensitive `move_left`/`move_down`/`move_up`/`move_right`
+# actions by default — in the grid and quickview they move the selection,
+# in fullview (chapter bar up or not) left/right step the playing clip
+# between chapters (real chapters, or the synthesized checkpoints the
+# chapter bar shows) instead. The plain `next`/`prev` actions remain for
+# bindings that should always move the selection (auto-skip fires `next`).
 # Built-in defaults: enter/o = open · space = quickview · tab = fullview ·
 # c = copy_path · q = quit · f = fullscreen · a = toggle_anim ·
 # p = toggle_focus_pause · r = reveal · -/=/0 = zoom · [ / ] = skip
@@ -310,9 +314,9 @@ quickview_max_height = 1440
 #
 # A key can name an internal action (quit, fullscreen, fast_fullscreen,
 # copy_path, quickview, fullview, chapter_mode, toggle_anim,
-# toggle_focus_pause, zoom_in, zoom_out, zoom_reset, next, prev,
-# skip_forward, skip_back, open_parent, jump_random, shuffle_library,
-# toggle_auto_skip) or any
+# toggle_focus_pause, zoom_in, zoom_out, zoom_reset, move_left,
+# move_right, move_up, move_down, next, prev, skip_forward, skip_back,
+# open_parent, jump_random, shuffle_library, toggle_auto_skip) or any
 # [commands.*] entry below. In command args, {path}, {dir} and {name}
 # expand against the selected clip.
 #
@@ -334,8 +338,10 @@ D = "open_parent"  # re-ingest from the selected clip's parent dir
 a = "toggle_anim"  # animated thumbnails on/off
 c = "copy_path"
 g = "chapter_mode"  # chapter bar in fullview ("chapters" also works)
-h = "prev"  # selection back one clip (the default vim binding)
-l = "next"  # selection forward one clip — what auto-skip fires
+h = "move_left"  # context-sensitive: selection back, or previous chapter in fullview
+j = "move_down"  # selection down one row
+k = "move_up"  # selection up one row
+l = "move_right"  # context-sensitive: selection forward, or next chapter in fullview
 o = "open"
 p = "toggle_focus_pause"  # pause-when-unfocused on/off
 r = "reveal"  # reveal in Finder (open -R)

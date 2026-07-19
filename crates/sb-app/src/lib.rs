@@ -63,9 +63,17 @@ const AUTO_SKIP_SPAWN_GRACE_S: f32 = 3.0;
 /// Inset of the auto-skip timer from the video's (or window's) top-right
 /// corner; its radius is the `auto_skip_ring_radius` tuning.
 const AUTO_SKIP_RING_MARGIN: f32 = 18.0;
-/// How far the soft dark scrim extends past the ring's edge — keeps the
-/// white-on-white case legible without reading as a drawn border.
-const AUTO_SKIP_RING_SCRIM: f32 = 3.0;
+/// Chapter stepping (`move_left` in fullview): more than this far into a
+/// chapter, "back" restarts the chapter (DVD-player feel); within it,
+/// "back" steps to the previous chapter.
+const CHAPTER_RESTART_S: f64 = 2.0;
+/// How far the soft dark scrim extends past the edge of the shape it
+/// backs (the auto-skip ring, the seekbar) — keeps the white-on-white
+/// case legible without reading as a drawn border.
+const SCRIM_PAD: f32 = 3.0;
+/// The scrim's black opacity — shared by the ring and the seekbar so the
+/// two translucent backings always match.
+const SCRIM_ALPHA: f32 = 0.45;
 
 const DEMO_TILES: usize = 480;
 
@@ -1231,9 +1239,9 @@ impl Switchblade {
     // --- input ---
 
     fn key(&mut self, key: Key) {
-        // Vertical movement keys are reserved; everything else (including
-        // horizontal movement, the `next`/`prev` actions) goes through
-        // the keymap.
+        // Esc is the only hardwired key; everything else — movement
+        // included (the context-sensitive `move_*` actions on hjkl and
+        // the arrows by default) — goes through the keymap.
         match key {
             // Esc peels layers: the chapter bar slides down first, then
             // fullview exits, then quickview.
@@ -1255,8 +1263,6 @@ impl Switchblade {
                 self.wake(0.3);
                 return;
             }
-            Key::Char('k') | Key::Up => return self.move_selection(0, -1),
-            Key::Char('j') | Key::Down => return self.move_selection(0, 1),
             _ => {}
         }
         let Some(action) = self.keymap.action_for(&key) else {
@@ -1297,6 +1303,17 @@ impl Switchblade {
             Action::Skip { forward, amount } => self.skip(forward, amount),
             Action::SelectNext => self.move_selection(1, 0),
             Action::SelectPrev => self.move_selection(-1, 0),
+            // Context-sensitive movement (the default hjkl/arrows): in
+            // fullview — chapter bar up or not — left/right step the
+            // playing clip between chapters; everywhere else (grid,
+            // quickview) every direction moves the selection.
+            Action::Move { dx, dy } => {
+                if dx != 0 && self.fullview {
+                    self.chapter_step(dx > 0);
+                } else {
+                    self.move_selection(dx, dy);
+                }
+            }
             Action::OpenParent => self.open_parent(),
             Action::JumpRandom => self.jump_random(),
             Action::ShuffleLibrary => self.shuffle_library(),
@@ -1574,6 +1591,24 @@ impl Switchblade {
             hires: false,
             pie: 0.0,
         };
+        // Scrim first: the same soft dark backing the auto-skip ring wears,
+        // so the white track/fill stay legible over bright video.
+        tiles.push(Tile {
+            x: bx - SCRIM_PAD,
+            y: bot - bh - SCRIM_PAD,
+            w: bw + SCRIM_PAD * 2.0,
+            h: bh + SCRIM_PAD * 2.0,
+            color: [0.0, 0.0, 0.0, SCRIM_ALPHA * bar_a],
+            border_color: [0.0; 4],
+            corner_radius: bh * 0.5 + SCRIM_PAD,
+            border_width: 0.0,
+            uv: [0.0; 4],
+            uv2: [0.0; 4],
+            frame_fade: 0.0,
+            tex_mix: 0.0,
+            hires: false,
+            pie: 0.0,
+        });
         // Track: a translucent-white tint (reads as a bright frosted line
         // over the video, not a grey slab); the fill is solid white.
         let track_a = t.seekbar_track_opacity.clamp(0.0, 1.0);
@@ -1742,11 +1777,7 @@ impl Switchblade {
         let times: Vec<f64> = if times.len() >= 2 {
             times.to_vec()
         } else {
-            d.map(|d| {
-                let n = checkpoint_count(d);
-                (0..n).map(|k| d * k as f64 / n.max(1) as f64).collect()
-            })
-            .unwrap_or_default()
+            d.map(synth_checkpoints).unwrap_or_default()
         };
         if times.is_empty() {
             log::info!(
@@ -1861,6 +1892,89 @@ impl Switchblade {
             None => l.position(),
         };
         Some(times.partition_point(|&t0| t0 <= p).saturating_sub(1))
+    }
+
+    /// The clip's chapter plan whether or not the bar is up: an open
+    /// bar's resolved plan wins, else the probe cache (fullview pre-warms
+    /// it on entry) — real chapters, or checkpoints synthesized from the
+    /// duration exactly like `apply_chapter_plan`. `None` while nothing
+    /// has answered yet, or when the plan is legitimately empty (a
+    /// chapterless clip under a minute).
+    fn chapter_starts(&self, path: &std::path::Path) -> Option<(Vec<f64>, Option<f64>)> {
+        if let Some(b) = self.chapters.as_ref().filter(|b| b.path == path)
+            && let Some(ts) = &b.times
+        {
+            return Some((ts.clone(), b.duration));
+        }
+        let (times, d) = self.chapter_probe.get(path)?.as_ref()?;
+        let d = d
+            .or_else(|| {
+                self.live_sel
+                    .as_ref()
+                    .filter(|l| l.path == *path)
+                    .and_then(|l| l.duration)
+            })
+            .filter(|d| *d > 0.05);
+        let times = if times.len() >= 2 {
+            times.clone()
+        } else {
+            d.map(synth_checkpoints).unwrap_or_default()
+        };
+        (!times.is_empty()).then_some((times, d))
+    }
+
+    /// `move_left`/`move_right` in fullview (chapter bar up or not):
+    /// step the playing stream between chapter starts — the same plan
+    /// the bar shows. Forward jumps to the next start (wrapping past the
+    /// last); back restarts the current chapter when more than
+    /// `CHAPTER_RESTART_S` into it, else steps to the previous one
+    /// (wrapping before the first). With no plan available (probe still
+    /// in flight, or a chapterless clip under a minute) it falls back to
+    /// a plain `skip_fraction` skip so the key always lands somewhere.
+    fn chapter_step(&mut self, forward: bool) {
+        let Some(path) = self.clips.get(self.selected).map(|c| c.path.clone()) else {
+            return;
+        };
+        let Some((times, d)) = self.chapter_starts(&path) else {
+            return self.skip(forward, None);
+        };
+        let Some(l) = &self.live_sel else { return };
+        if l.path != path {
+            return; // stream not on the selected clip (e.g. mid-swap)
+        }
+        let d = d.or(l.duration).filter(|d| *d > 0.05);
+        let pos = match d {
+            Some(d) => l.position().rem_euclid(d),
+            None => l.position(),
+        };
+        let n = times.len();
+        let cur = times.partition_point(|&t| t <= pos).saturating_sub(1);
+        let target = if forward {
+            (cur + 1) % n
+        } else if pos - times[cur] > CHAPTER_RESTART_S {
+            cur
+        } else {
+            (cur + n - 1) % n
+        };
+        // Stay a frame short of the end, like chapter_seek: an exact
+        // seek to the tail lands on EOF and loops back to 0:00.
+        let t = match d {
+            Some(d) => times[target].clamp(0.0, (d - 0.05).max(0.0)),
+            None => times[target].max(0.0),
+        };
+        l.player.seek(t, true);
+        self.skip_flash_at = Some(Instant::now());
+        // An open bar glides its strip to center the landed-on chapter.
+        if self
+            .chapters
+            .as_ref()
+            .is_some_and(|b| b.open && b.path == path && b.times.is_some())
+        {
+            let (lo, hi) = self.chapter_pos_bounds(n);
+            let b = self.chapters.as_mut().unwrap();
+            b.target = (target as f32).clamp(lo, hi);
+        }
+        self.wake(1.5); // outlive the flash bar's hold + fade
     }
 
     /// True while animation/live playback should rest because the window
@@ -2587,7 +2701,17 @@ impl Switchblade {
     fn update_live(&mut self, lay: &Layout, uploads: &mut Vec<ThumbUpload>) {
         // Live video exists at animation level `normal` and up: the
         // selected stream (tile + quickview modal) and the hover lane.
-        let live_on = !self.demo && !self.paused() && self.level().live();
+        let paused = self.paused();
+        let live_on = !self.demo && !paused && self.level().live();
+        // Focus-pause PARKS the selected stream and the warm pool
+        // instead of killing them: an undrained lane's bounded queue
+        // stalls its decoder within a few frames (same near-zero cost as
+        // offscreen parking), and refocus resumes the very same decoders
+        // on their own timelines — late frames re-anchor, so playback
+        // continues from where it stopped. Reaping here (the old
+        // behavior) made every refocus pay a cold respawn that visibly
+        // jumped the video back to the thumbnail's frame.
+        let paused_live = paused && !self.demo && self.level().live();
         let delay_ms = self.tuning.live_delay_ms;
         // Attention mode (PLAN.md §15 spike): the hires lane follows
         // attention — the hovered tile while mousing, the selection while
@@ -2601,6 +2725,11 @@ impl Switchblade {
             && live_on;
         let sel_target = if live_on {
             self.attention_target()
+        } else if paused_live {
+            // Parked, not dead: keep pointing at the lane's own clip so
+            // the stop-lanes sweep below skips it. A lane-less pause
+            // yields None, so nothing spawns while unfocused.
+            self.live_sel.as_ref().map(|l| l.clip)
         } else {
             None
         };
@@ -2661,7 +2790,12 @@ impl Switchblade {
         // paying a cold spawn (open + decode to the thumb frame — no
         // longer the CLI's ~1s floor, but still the visible latency).
         let mut warm_targets: Vec<usize> = Vec::new();
-        if live_on && !pending {
+        // Computed while paused too (paused_live): the warm pool rides
+        // out a focus loss parked — its players are undrained and
+        // stalled by design, so keeping them costs nothing and refocus
+        // finds every movement destination still warm. Fresh spawns
+        // stay gated on `live_on` below.
+        if (live_on || paused_live) && !pending {
             let s = self.selected;
             let n = self.clips.len();
             // The "down" destination: the horizontally nearest tile in
@@ -2765,7 +2899,8 @@ impl Switchblade {
             .warm
             .iter()
             .any(|w| w.player.buffered() == 0 && w.spawned.elapsed().as_secs_f32() < 5.0);
-        if sel_ready
+        if live_on // parked pause keeps the pool but never spawns into it
+            && sel_ready
             && !warming_up
             && self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
             && let Some(&i) = warm_targets
@@ -2801,27 +2936,29 @@ impl Switchblade {
             });
         }
         // Park the selected stream while its tile is offscreen and no
-        // modal shows it (P0.4): stop draining and the bounded queue
-        // stalls the decoder — decode, copy, upload and mip generation
-        // all cease — while the stream object and its timeline survive.
-        // Panning back resumes the same decoder; no respawn. (Keyboard
+        // modal shows it (P0.4), or whenever focus-pause is active (the
+        // defocus fix): stop draining and the bounded queue stalls the
+        // decoder — decode, copy, upload and mip generation all cease —
+        // while the stream object and its timeline survive. Refocus or
+        // panning back resumes the same decoder; no respawn. (Keyboard
         // moves always scroll to the selection, so only trackpad panning
-        // gets here.)
-        self.sel_parked = self.live_sel.is_some() && !self.quickview && !self.fullview && {
-            let (first, last) = self.visible_rows(lay, 0);
-            // Park by the LANE's tile, not the selection: in attention
-            // mode the lane may be playing the hovered tile (which is
-            // visible by definition, so it never parks). Lane indices can
-            // go stale mid-D-swap — fall back to the selection then.
-            let i = self
-                .live_sel
-                .as_ref()
-                .map(|l| l.clip)
-                .filter(|&c| c < self.clips.len())
-                .unwrap_or(self.selected);
-            let row = self.row_of(lay, i);
-            !(first..=last).contains(&row)
-        };
+        // reaches the offscreen half.)
+        self.sel_parked = paused && self.live_sel.is_some()
+            || self.live_sel.is_some() && !self.quickview && !self.fullview && {
+                let (first, last) = self.visible_rows(lay, 0);
+                // Park by the LANE's tile, not the selection: in attention
+                // mode the lane may be playing the hovered tile (which is
+                // visible by definition, so it never parks). Lane indices can
+                // go stale mid-D-swap — fall back to the selection then.
+                let i = self
+                    .live_sel
+                    .as_ref()
+                    .map(|l| l.clip)
+                    .filter(|&c| c < self.clips.len())
+                    .unwrap_or(self.selected);
+                let row = self.row_of(lay, i);
+                !(first..=last).contains(&row)
+            };
         // Reclaim the previously presented hires buffer (P1.5): the
         // renderer dropped its Frame after the upload, so once we hold
         // the only Arc, the buffer goes back to the playing decoder's
@@ -4357,13 +4494,13 @@ fn push_countdown_ring(out: &mut Vec<Tile>, cx: f32, cy: f32, r: f32, frac: f32,
         hires: false,
         pie,
     };
-    let scrim = AUTO_SKIP_RING_SCRIM;
+    let scrim = SCRIM_PAD;
     out.push(Tile {
         x: cx - r - scrim,
         y: cy - r - scrim,
         w: (r + scrim) * 2.0,
         h: (r + scrim) * 2.0,
-        color: [0.0, 0.0, 0.0, 0.45],
+        color: [0.0, 0.0, 0.0, SCRIM_ALPHA],
         border_color: [0.0; 4],
         corner_radius: r + scrim,
         border_width: 0.0,
@@ -4500,6 +4637,15 @@ fn checkpoint_count(d: f64) -> usize {
     } else {
         0
     }
+}
+
+/// The synthesized checkpoint starts themselves — k/n of the duration
+/// for each of `checkpoint_count` chapters (empty under a minute).
+/// Shared by the chapter bar's plan install and fullview's left/right
+/// chapter stepping so the two can't disagree.
+fn synth_checkpoints(d: f64) -> Vec<f64> {
+    let n = checkpoint_count(d);
+    (0..n).map(|k| d * k as f64 / n.max(1) as f64).collect()
 }
 
 /// Cheap non-crypto randomness (jump_random / shuffle_library) with no new
@@ -5085,6 +5231,116 @@ mod tests {
             app.live_sel.as_ref().unwrap().spawned,
             spawned0,
             "resume must reuse the parked decoder, not respawn"
+        );
+    }
+
+    /// Losing window focus PARKS the selected stream (same machinery as
+    /// offscreen parking) and refocus resumes the SAME decoder near
+    /// where playback stopped. The old behavior reaped every live lane
+    /// on focus loss, so returning paid a cold respawn that visibly
+    /// jumped the video back to the thumbnail's seek-in frame. Needs
+    /// ffmpeg.
+    #[test]
+    fn focus_pause_parks_and_resumes_the_same_stream() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_focus_park_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("focus.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=8:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+        let spawned0 = app.live_sel.as_ref().unwrap().spawned;
+        // Let playback advance a little past the seek-in point, so a
+        // respawn (which restarts there) would be distinguishable from
+        // a genuine resume.
+        let start = app.live_sel.as_ref().unwrap().player.position();
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.player.position() > start + 0.3)),
+            "playback never advanced"
+        );
+
+        app.event(InputEvent::Focus { focused: false });
+        assert!(
+            pump_until(&mut app, |a| a.sel_parked),
+            "focus loss never parked the stream"
+        );
+        let parked_pos = app.live_sel.as_ref().unwrap().player.position();
+
+        // Parked: the stream survives and nothing uploads.
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        for _ in 0..30 {
+            let f = app.frame(0.016, vp);
+            assert!(f.hires_upload.is_none(), "paused stream must not upload");
+        }
+        assert!(app.live_sel.is_some(), "paused stream must survive");
+
+        // Refocus: the SAME decoder resumes near the parked position.
+        app.event(InputEvent::Focus { focused: true });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut resumed = false;
+        while Instant::now() < deadline {
+            if app.frame(0.016, vp).hires_upload.is_some() {
+                resumed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(resumed, "no frames after refocus");
+        assert_eq!(
+            app.live_sel.as_ref().unwrap().spawned,
+            spawned0,
+            "refocus must reuse the parked decoder, not respawn"
+        );
+        let resumed_pos = app.live_sel.as_ref().unwrap().player.position();
+        assert!(
+            resumed_pos >= parked_pos - 0.05 && resumed_pos < parked_pos + 1.0,
+            "playback must continue from the parked position \
+             (parked {parked_pos:.2}s, resumed {resumed_pos:.2}s)"
         );
     }
 
@@ -6103,6 +6359,145 @@ mod tests {
             "the bar slides down after the click"
         );
         assert!(app.fullview, "fullview stays");
+    }
+
+    /// The context-sensitive `move_left`/`move_right` (hjkl/arrows): in
+    /// fullview they step the playing stream between chapters — next
+    /// wraps past the last, back restarts a chapter when well into it —
+    /// while before the probe answers they fall back to a fraction skip,
+    /// and outside fullview they move the selection, never the stream.
+    /// Needs ffmpeg; skipped quietly when missing.
+    #[test]
+    fn fullview_arrows_step_chapters() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_chapter_step_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.mp4");
+        let clip = dir.join("chaptered.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=8:size=320x180:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&plain)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+            let metafile = dir.join("chapters.txt");
+            std::fs::write(
+                &metafile,
+                ";FFMETADATA1\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=3000\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=3000\nEND=6000\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=6000\nEND=8000\n",
+            )
+            .unwrap();
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error"])
+                .arg("-i")
+                .arg(&plain)
+                .arg("-i")
+                .arg(&metafile)
+                .args(["-map_metadata", "1", "-codec", "copy"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to mux chapters");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip.clone()],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+
+        // Tab enters fullview through the keymap; no probe answer yet,
+        // so Right falls back to a plain fraction skip within the clip.
+        app.key(Key::Tab);
+        assert!(app.fullview, "tab enters fullview");
+        let before = app.live_sel.as_ref().unwrap().position();
+        app.key(Key::Right);
+        let p = app.live_sel.as_ref().unwrap().position();
+        let frac = app.tuning.skip_fraction as f64;
+        assert!(
+            (p - before - frac * 8.0).abs() < 0.5,
+            "no plan yet: a fraction skip, got {before} -> {p}"
+        );
+
+        // Fullview's prewarm fires the probe; wait for its answer.
+        assert!(
+            pump_until(&mut app, |a| a
+                .chapter_probe
+                .get(&clip)
+                .is_some_and(|p| p.is_some())),
+            "chapter probe never answered"
+        );
+        app.live_sel.as_ref().unwrap().player.seek(0.5, true);
+
+        // Right steps chapters (starts at 0/3/6), wrapping past the last.
+        app.key(Key::Right);
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!((2.9..=3.1).contains(&p), "right -> chapter 2, got {p}");
+        app.key(Key::Right);
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!((5.9..=6.1).contains(&p), "right -> chapter 3, got {p}");
+        app.key(Key::Right);
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!(p < 0.1, "right past the last chapter wraps, got {p}");
+
+        // At a chapter's opening, Left steps back one; well inside a
+        // chapter (past CHAPTER_RESTART_S) it restarts that chapter.
+        app.live_sel.as_ref().unwrap().player.seek(6.0, true);
+        app.key(Key::Left);
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!((2.9..=3.1).contains(&p), "left at a start steps back: {p}");
+        app.live_sel.as_ref().unwrap().player.seek(5.5, true);
+        app.key(Key::Left);
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!(
+            (2.9..=3.1).contains(&p),
+            "left mid-chapter restarts it, got {p}"
+        );
+
+        // Back in the grid the same keys move the selection instead —
+        // the stream's position is left alone.
+        app.key(Key::Escape);
+        assert!(!app.fullview, "esc leaves fullview");
+        let before = app.live_sel.as_ref().unwrap().position();
+        app.key(Key::Right);
+        assert_eq!(app.selected, 0, "one clip: selection clamps in place");
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!(
+            (p - before).abs() < 0.5,
+            "grid movement never seeks the stream: {before} -> {p}"
+        );
     }
 
     /// `jump_random` always lands somewhere else, and only ever on a clip
