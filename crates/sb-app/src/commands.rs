@@ -248,50 +248,58 @@ fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
 
 /// Launch an external command against the selected clip, detached from the
 /// UI. `{path}`, `{dir}` and `{name}` expand in every arg.
+///
+/// The spawn itself runs on a throwaway thread (P1.6): process creation
+/// costs single-digit milliseconds on macOS, and this is called from the
+/// render thread mid-playback — `o` opening mpv must not eat a video
+/// frame. The same thread reaps the child (no zombies); spawn failures
+/// log from there instead of returning.
 pub fn spawn_external(program: &str, args: &[String], path: &Path) {
     let program = expand_tilde(program);
     let args: Vec<String> = args.iter().map(|a| expand_template(a, path)).collect();
     log::info!("run: {program} {}", args.join(" "));
-    match Command::new(&program)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(mut child) => {
-            // Reap off-thread so finished children don't linger as zombies.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        Err(e) => log::warn!("failed to run {program}: {e}"),
-    }
-}
-
-pub fn copy_path(path: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        use std::io::Write;
-        match Command::new("pbcopy")
-            .stdin(Stdio::piped())
+    std::thread::spawn(move || {
+        match Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
         {
             Ok(mut child) => {
-                let bytes = path.as_os_str().as_encoded_bytes().to_vec();
-                if let Some(mut stdin) = child.stdin.take() {
-                    std::thread::spawn(move || {
+                let _ = child.wait();
+            }
+            Err(e) => log::warn!("failed to run {program}: {e}"),
+        }
+    });
+}
+
+pub fn copy_path(path: &Path) {
+    // Spawn + pipe-feed + reap all on a throwaway thread (P1.6): the
+    // caller is the render thread, and process creation is a hitch.
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        let bytes = path.as_os_str().as_encoded_bytes().to_vec();
+        let shown = path.display().to_string();
+        std::thread::spawn(move || {
+            match Command::new("pbcopy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
                         let _ = stdin.write_all(&bytes);
                         drop(stdin);
-                        let _ = child.wait();
-                    });
+                    }
+                    let _ = child.wait();
+                    log::info!("copied path: {shown}");
                 }
-                log::info!("copied path: {}", path.display());
+                Err(e) => log::warn!("pbcopy failed: {e}"),
             }
-            Err(e) => log::warn!("pbcopy failed: {e}"),
-        }
+        });
     }
     #[cfg(not(target_os = "macos"))]
     log::warn!(

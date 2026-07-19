@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -288,6 +289,11 @@ pub struct Switchblade {
     warm: Vec<SelLive>,
     /// The newest hires frame this tick, routed to Frame.hires_upload.
     hires_frame: Option<HiresFrame>,
+    /// The app's handle on the last presented hires buffer (P1.5): once
+    /// the renderer drops its `Frame` (Arc count back to 1), the ~33MB
+    /// buffer goes to the selected player's recycle pool instead of the
+    /// allocator — steady playback then reuses the same few buffers.
+    hires_reclaim: Option<Arc<Vec<u8>>>,
     /// Which clip's pixels the hires texture currently holds. Lets a
     /// mid-seek stream keep showing its last frame (the texture still
     /// has it) instead of flashing back to the thumbnail while the new
@@ -636,6 +642,7 @@ impl Switchblade {
             warm: Vec::new(),
             hires_frame: None,
             hires_shown: None,
+            hires_reclaim: None,
             pending_reselect: None,
             live_retry: HashMap::new(),
             sel_parked: false,
@@ -2815,6 +2822,21 @@ impl Switchblade {
             let row = self.row_of(lay, i);
             !(first..=last).contains(&row)
         };
+        // Reclaim the previously presented hires buffer (P1.5): the
+        // renderer dropped its Frame after the upload, so once we hold
+        // the only Arc, the buffer goes back to the playing decoder's
+        // pool. If a modal swap left no player (or the Arc is still in
+        // flight after a skipped present), it just drops — old behavior.
+        if self
+            .hires_reclaim
+            .as_ref()
+            .is_some_and(|a| Arc::strong_count(a) == 1)
+            && let Some(a) = self.hires_reclaim.take()
+            && let Ok(buf) = Arc::try_unwrap(a)
+            && let Some(l) = &self.live_sel
+        {
+            l.player.recycle(buf);
+        }
         if !self.sel_parked
             && let Some(live) = &mut self.live_sel
             && let Some(rgba) = live.player.take_frame()
@@ -2830,6 +2852,8 @@ impl Switchblade {
             if self.hires_shown.as_ref() != Some(&live.path) {
                 self.hires_shown = Some(live.path.clone());
             }
+            let rgba = Arc::new(rgba);
+            self.hires_reclaim = Some(rgba.clone());
             self.hires_frame = Some(HiresFrame {
                 w: live.player.w,
                 h: live.player.h,

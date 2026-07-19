@@ -170,11 +170,14 @@ pub struct ThumbUpload {
 }
 
 /// Pixels for the high-res texture (top-left anchored, `w × h ≤ hires
-/// dims`). One producer at a time — the quickview player.
+/// dims`). One producer at a time — the quickview player. The pixels
+/// ride an `Arc` (P1.5): the renderer only reads them, and the app keeps
+/// a second handle so the ~33MB buffer can go back to the decoder's
+/// recycle pool after the upload instead of being freed every frame.
 pub struct HiresFrame {
     pub w: u32,
     pub h: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<Vec<u8>>,
 }
 
 /// One tile to draw. Position/size in logical pixels, origin top-left.

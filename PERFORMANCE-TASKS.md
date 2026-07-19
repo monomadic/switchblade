@@ -75,8 +75,7 @@ and re-confirmed one existing one. Priority within the remaining open work:
 
 1. ~~P0.7 Take `cached_meta` disk I/O (and its silent write-back) off the
    render thread~~ — DONE 2026-07-20.
-2. P1.5 Recycle live RGBA buffers (P1.3's deferred Approach B, promoted with
-   new evidence) — the best sustained-4K-playback smoothness win.
+2. ~~P1.5 Recycle live RGBA buffers~~ — DONE 2026-07-20.
 3. P1.6 Move subprocess launches off the render thread — trivial.
 4. P1.7 Resolve the drag-ghost path at press time — trivial.
 5. P1.1 (spring sweep) is re-confirmed but unchanged: still prefer landing it
@@ -811,9 +810,32 @@ input must continue to request display-rate redraws when active.
 
 ### P1.5 — Recycle live RGBA frame buffers
 
-**Status:** Open (found 2026-07-20). This is P1.3's deferred Approach B,
-promoted into its own task with new evidence about *render-thread* cost, not
-just reader-side residency.
+**Status: DONE (2026-07-20).**
+
+- `SeekablePlayer` gained a per-player recycle pool (`Shared.pool`, capped at
+  queue depth + 2): the reader's `push_rgba` pulls a recycled buffer instead
+  of allocating (same-size reuse touches no allocator — one player, one frame
+  size), `take_frame` recycles superseded catch-up frames, and `seek` drains
+  the stale queue into the pool instead of freeing up to ~100 MB inline on the
+  render thread. Lock order: pool may be taken while `frames` is held, never
+  the reverse. New public `recycle(buf)` hands a presented buffer back.
+- The presented buffer's round trip crosses the App boundary via
+  `HiresFrame.rgba: Arc<Vec<u8>>` (was `Vec<u8>`): the renderer only reads it
+  (`write_texture` deref-coerces), the app keeps a second handle
+  (`hires_reclaim`), and once the renderer drops its `Frame` (Arc count back
+  to 1) the buffer returns to the selected player's pool. A modal swap with no
+  player, or an Arc still in flight, just drops the buffer — old behavior.
+- Scope note: the hover lane's presented frames (ThumbUpload, ~0.9 MB at tile
+  size — under the 1 MiB bar) still drop after upload; its *internal*
+  seek/supersession churn recycles like every SeekablePlayer. `LivePlayer`
+  (CLI fallback, no longer on any live lane) is untouched.
+
+Tests: `recycled_buffers_are_reused` (pointer-identity round trip through
+take → recycle → later frame) plus the pacing/stall/drop trio unchanged.
+Full gate green: fmt, clippy `-D warnings`, workspace tests, serial sb-media
+tests, release build.
+
+**Original problem statement follows.**
 
 **Problem**
 

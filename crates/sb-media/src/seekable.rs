@@ -71,6 +71,36 @@ struct Shared {
     /// display rate, so a frame arriving while the queue was dry needs
     /// its own nudge or it would wait out the idle tick.
     notify: Mutex<Option<crate::Notify>>,
+    /// Recycled frame buffers (P1.5): a hires frame is ~33MB at 4K, and
+    /// allocating/freeing one per decoded frame taxed both the reader
+    /// (alloc) and the render thread (free after upload) with mmap-sized
+    /// allocator churn. Superseded/seek-stale frames and presented
+    /// buffers handed back via `recycle()` land here; the reader reuses
+    /// them for the next copy. Lock order: may be taken while `frames`
+    /// is held, never the reverse.
+    pool: Mutex<Vec<Vec<u8>>>,
+}
+
+/// Recycled buffers kept per player: queue depth + one being copied +
+/// one at the display, with a little slack. Excess just drops.
+const POOL_CAP: usize = LIVE_QUEUE_DEPTH + 2;
+
+impl Shared {
+    /// A buffer sized `len`, recycled when the pool has one. Same-size
+    /// reuse (the steady state — one player, one frame size) touches no
+    /// allocator at all.
+    fn take_buf(&self, len: usize) -> Vec<u8> {
+        let mut buf = self.pool.lock().unwrap().pop().unwrap_or_default();
+        buf.resize(len, 0);
+        buf
+    }
+
+    fn recycle_buf(&self, buf: Vec<u8>) {
+        let mut pool = self.pool.lock().unwrap();
+        if pool.len() < POOL_CAP {
+            pool.push(buf);
+        }
+    }
 }
 
 impl SeekablePlayer {
@@ -133,6 +163,7 @@ impl SeekablePlayer {
             position: AtomicU64::new(seek.max(0.0).to_bits()),
             failed: AtomicBool::new(false),
             notify: Mutex::new(None),
+            pool: Mutex::new(Vec::new()),
         });
         let reader_shared = shared.clone();
         thread::spawn(move || {
@@ -153,7 +184,12 @@ impl SeekablePlayer {
     pub fn seek(&self, target_s: f64, exact: bool) {
         let t = target_s.max(0.0);
         *self.shared.cmd.lock().unwrap() = Some((t, exact));
-        self.shared.frames.lock().unwrap().clear();
+        // Stale frames go back to the pool, not the allocator (P1.5): a
+        // scrub used to free the whole queue — up to ~100MB at 4K — on
+        // the caller's (render) thread.
+        for (_, _, buf) in self.shared.frames.lock().unwrap().drain(..) {
+            self.shared.recycle_buf(buf);
+        }
         // Report the destination as the position while in flight: the bar
         // should show where playback is going, not the frozen frame.
         self.shared.position.store(t.to_bits(), Ordering::Relaxed);
@@ -203,12 +239,22 @@ impl SeekablePlayer {
         while q.front().is_some_and(|(due, _, _)| *due <= now) {
             let (_, pts, rgba) = q.pop_front().unwrap();
             self.shared.position.store(pts.to_bits(), Ordering::Relaxed);
-            out = Some(rgba);
+            // Catch-up after a hiccup: superseded frames recycle instead
+            // of freeing several large buffers in one render frame (P1.5).
+            if let Some(prev) = out.replace(rgba) {
+                self.shared.recycle_buf(prev);
+            }
         }
         if out.is_some() {
             self.shared.space.notify_one();
         }
         out
+    }
+
+    /// Hand a presented frame's buffer back for reuse (P1.5). Callers
+    /// that upload and drop instead lose nothing but the recycling.
+    pub fn recycle(&self, buf: Vec<u8>) {
+        self.shared.recycle_buf(buf);
     }
 }
 
@@ -633,7 +679,9 @@ impl Pump<'_> {
             };
             let stride = (*f).linesize[0] as usize;
             let row = w * 4;
-            let mut buf = vec![0u8; row * h];
+            // Recycled when the pool has a buffer (P1.5) — the copy below
+            // overwrites every byte, so stale contents don't matter.
+            let mut buf = self.shared.take_buf(row * h);
             let src = (*f).data[0];
             if stride == row {
                 ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), row * h);
@@ -868,6 +916,35 @@ mod tests {
             p.take_frame().is_some(),
             "a warmed player must serve a frame on the first take"
         );
+    }
+
+    /// P1.5: a buffer handed back via `recycle()` is reused for a later
+    /// frame instead of a fresh allocation — steady playback cycles the
+    /// same few buffers with the allocator untouched.
+    #[test]
+    fn recycled_buffers_are_reused() {
+        let Some(clip) = test_clip("recycle.mp4", 4) else {
+            return;
+        };
+        let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&meta(&clip))).expect("spawn");
+        let first = take_one(&p, Duration::from_secs(5)).expect("first frame");
+        let ptr = first.as_ptr() as usize;
+        p.recycle(first);
+        // Keep draining and recycling: the buffer set closes over the
+        // pool, so the original pointer must come back around. Bounded
+        // wait — decode-ahead may have allocated a few fresh frames
+        // before the recycle landed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut reused = false;
+        while Instant::now() < deadline && !reused {
+            if let Some(f) = p.take_frame() {
+                reused = f.as_ptr() as usize == ptr;
+                p.recycle(f);
+            } else {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert!(reused, "a recycled buffer never came back around");
     }
 
     /// Bounded wait until the decoder has buffered at least `n` frames
