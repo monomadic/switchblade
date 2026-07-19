@@ -76,7 +76,7 @@ and re-confirmed one existing one. Priority within the remaining open work:
 1. ~~P0.7 Take `cached_meta` disk I/O (and its silent write-back) off the
    render thread~~ — DONE 2026-07-20.
 2. ~~P1.5 Recycle live RGBA buffers~~ — DONE 2026-07-20.
-3. P1.6 Move subprocess launches off the render thread — trivial.
+3. ~~P1.6 Move subprocess launches off the render thread~~ — DONE 2026-07-20.
 4. P1.7 Resolve the drag-ghost path at press time — trivial.
 5. P1.1 (spring sweep) is re-confirmed but unchanged: still prefer landing it
    with M9's view indirection.
@@ -879,7 +879,15 @@ periodic hiccups precisely during sustained playback of the focused video.
 
 ### P1.6 — Move subprocess launches off the render thread
 
-**Status:** Open (found 2026-07-20). Trivial.
+**Status: DONE (2026-07-20).** Both `spawn_external` (launch commands: mpv
+open, Finder reveal, any `[commands]` launch) and `copy_path` (pbcopy) now do
+the `Command::new(...).spawn()` itself on the throwaway thread that already
+existed for the reap/pipe-feed — template/tilde expansion stays on the caller
+(cheap, needs `&Path`), everything process-related moved. Spawn failures log
+from the thread instead of returning; no zombie change (same thread waits).
+Existing command tests green; full gate green.
+
+**Original problem statement follows.**
 
 **Problem**
 
