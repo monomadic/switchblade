@@ -3647,13 +3647,18 @@ impl Switchblade {
         // selection border; clicking seeks and sends the bar back down.
         if let Some(bar) = self.chapters.clone()
             && bar.slide > 0.005
-            && let Some((anim_src, anim_failed)) = self.clips.get(self.selected).map(|c| {
+            && let Some((anim_src, sheet_coming)) = self.clips.get(self.selected).map(|c| {
                 (
                     match c.anim {
                         Thumb::Ready { slot, tw, th, .. } => Some((slot, tw as f32, th as f32)),
                         _ => None,
                     },
-                    matches!(c.anim, Thumb::Failed),
+                    // The sheet can still arrive: generating now, or not
+                    // yet requested but requestable (a Failed THUMB means
+                    // the sheet request will never fire — dots would spin,
+                    // and wake the loop, forever).
+                    matches!(c.anim, Thumb::Pending)
+                        || (matches!(c.anim, Thumb::None) && !matches!(c.thumb, Thumb::Failed)),
                 )
             })
         {
@@ -3777,9 +3782,13 @@ impl Switchblade {
                         } else {
                             tiles.push(tile);
                         }
-                        // Sheet still generating: dots on the chip
-                        // (after the elevated chips so they stay visible).
-                        if uv.is_none() && !anim_failed {
+                        // Sheet still generating: dots on the chip (after
+                        // the elevated chips so they stay visible). Only
+                        // while an image can actually still arrive — a
+                        // failed sheet/thumb or an unmappable timeline
+                        // (unknown duration) must not keep the loop hot
+                        // for as long as the bar stays open.
+                        if uv.is_none() && sheet_coming && d.is_some() {
                             dot_stages.push(tile);
                             self.wake(0.3);
                         }
