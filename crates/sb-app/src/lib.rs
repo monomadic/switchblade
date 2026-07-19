@@ -317,6 +317,14 @@ pub struct Switchblade {
     /// `MediaService::request_reprobe`). Keeps repeat visits from
     /// re-queueing the same clip.
     reprobed: std::collections::HashSet<PathBuf>,
+    /// Session memo of complete cached_meta results by path (P0.7): live
+    /// spawns run on the render thread, so the disk read behind them
+    /// (source stat + meta.json) is paid at most once per clip — every
+    /// warm/re-spawn afterwards is a pure memory hit. Incomplete metas
+    /// (no pix_fmt: pre-heal cache entries) are deliberately NOT
+    /// memoized — they re-read each spawn, which is how the background
+    /// reprobe's heal gets picked up without a cross-thread signal.
+    meta_cache: HashMap<PathBuf, sb_media::Meta>,
     sel_changed_at: Instant,
     hover_changed_at: Instant,
     demo: bool,
@@ -634,6 +642,7 @@ impl Switchblade {
             skip_flash_at: None,
             auto_skip_since: None,
             reprobed: std::collections::HashSet::new(),
+            meta_cache: HashMap::new(),
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
@@ -2840,11 +2849,32 @@ impl Switchblade {
     /// Cache entries written before `Meta.pix_fmt` existed force the
     /// software scale chain (the hw gate can't run blind); queue a
     /// one-time background reprobe so the clip's NEXT spawn goes
-    /// hardware. Never probe on the render thread — that's a hitch.
+    /// hardware. A stale `src` (rename under size_mtime keying) queues
+    /// the same reprobe — the worker rewrites it, since `cached_meta` no
+    /// longer heals inline (P0.7: that was a write on the render thread).
+    /// Never probe on the render thread — that's a hitch.
     fn heal_meta(&mut self, meta: Option<&sb_media::Meta>, path: &std::path::Path) {
-        if meta.is_some_and(|m| m.pix_fmt.is_none()) && self.reprobed.insert(path.to_path_buf()) {
+        if meta.is_some_and(|m| m.pix_fmt.is_none() || m.src != path)
+            && self.reprobed.insert(path.to_path_buf())
+        {
             self.media.request_reprobe(path.to_path_buf());
         }
+    }
+
+    /// `cached_meta` behind the session memo (P0.7): the first read of a
+    /// clip pays the disk (source stat + meta.json — acceptable once, on
+    /// an explicit attention move); every spawn after that is memory.
+    /// Only complete metas (pix_fmt present) are memoized, so pre-heal
+    /// entries keep re-reading until the background reprobe lands.
+    fn clip_meta(&mut self, path: &std::path::Path) -> Option<sb_media::Meta> {
+        if let Some(m) = self.meta_cache.get(path) {
+            return Some(m.clone());
+        }
+        let m = sb_media::cached_meta(path)?;
+        if m.pix_fmt.is_some() {
+            self.meta_cache.insert(path.to_path_buf(), m.clone());
+        }
+        Some(m)
     }
 
     /// The selected clip's decoder: natural resolution, capped at the hires
@@ -2862,7 +2892,7 @@ impl Switchblade {
         if self.live_cooling(&path) {
             return None;
         }
-        let meta = sb_media::cached_meta(&path);
+        let meta = self.clip_meta(&path);
         let (mut sw, mut sh) = meta
             .as_ref()
             .and_then(|m| Some((m.width? as f32, m.height? as f32)))
@@ -2919,7 +2949,7 @@ impl Switchblade {
         let slot = self.alloc_slot(lay, SlotKind::Live)?;
         // Start where the thumbnail was taken, so video continues from
         // the frame the tile already shows instead of jolting to 0:00.
-        let meta = sb_media::cached_meta(&path);
+        let meta = self.clip_meta(&path);
         let seek = meta
             .as_ref()
             .and_then(|m| m.duration)
@@ -4489,6 +4519,55 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         false
+    }
+
+    /// P0.7: live spawns resolve meta through the session memo — a memo
+    /// hit must serve without touching the disk, and a stale recorded
+    /// `src` queues the worker-side heal (once) instead of the old
+    /// inline write on the render thread.
+    #[test]
+    fn clip_meta_memoizes_and_heal_meta_queues_the_src_heal() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+
+        // A memoized meta serves with no disk entry existing at all.
+        let path = PathBuf::from("/nonexistent/sb_app_meta_memo/clip.mp4");
+        let sentinel = sb_media::Meta {
+            src: path.clone(),
+            duration: Some(2.0),
+            width: Some(1280),
+            height: Some(720),
+            codec: Some("h264".into()),
+            fps: Some(30.0),
+            rotation: None,
+            pix_fmt: Some("yuv420p".into()),
+        };
+        app.meta_cache.insert(path.clone(), sentinel);
+        let got = app.clip_meta(&path).expect("memo hit needs no disk");
+        assert_eq!(got.width, Some(1280));
+
+        // A stale src queues exactly one background reprobe.
+        let stale = sb_media::Meta {
+            src: PathBuf::from("/somewhere/else.mp4"),
+            ..got.clone()
+        };
+        app.heal_meta(Some(&stale), &path);
+        assert!(app.reprobed.contains(&path), "stale src queues the heal");
+        app.heal_meta(Some(&stale), &path); // deduped per session
+        assert_eq!(app.reprobed.len(), 1);
+
+        // A complete meta with the right src queues nothing.
+        let other = PathBuf::from("/nonexistent/sb_app_meta_memo/other.mp4");
+        let good = sb_media::Meta {
+            src: other.clone(),
+            ..got
+        };
+        app.heal_meta(Some(&good), &other);
+        assert!(!app.reprobed.contains(&other));
     }
 
     /// `D` rebuilds the library from the selected clip's parent directory

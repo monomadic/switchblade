@@ -69,6 +69,24 @@ was buried in.
 
 10. P2 tasks only after the preceding measurements identify a remaining cost.
 
+**Added 2026-07-20 (render-thread stall review).** A focused audit of "what can
+stall or jank the thread that presents the watched video" found four new items
+and re-confirmed one existing one. Priority within the remaining open work:
+
+1. ~~P0.7 Take `cached_meta` disk I/O (and its silent write-back) off the
+   render thread~~ — DONE 2026-07-20.
+2. P1.5 Recycle live RGBA buffers (P1.3's deferred Approach B, promoted with
+   new evidence) — the best sustained-4K-playback smoothness win.
+3. P1.6 Move subprocess launches off the render thread — trivial.
+4. P1.7 Resolve the drag-ghost path at press time — trivial.
+5. P1.1 (spring sweep) is re-confirmed but unchanged: still prefer landing it
+   with M9's view indirection.
+
+The review also cleared the seekable reader itself: seek commands are
+latest-wins and polled per packet, the backpressure wait drops the lock for
+the copy, and drop wakes the condvar — no open items there. Minor churn
+observations went to P2.6.
+
 ---
 
 ## P0 — immediate efficiency and runaway-work fixes
@@ -471,6 +489,83 @@ corrupting each other.
 
 ---
 
+### P0.7 — Take cached-meta disk I/O (and its write-back) off the render thread
+
+**Status: DONE (2026-07-20).**
+
+- `cached_meta` is now strictly read-only: the inline `m.src` heal-write is
+  gone. The worker-side `reprobe` owns the heal — when the entry is complete
+  (`pix_fmt` present) but `src` is stranded by a rename, it rewrites just the
+  src via `write_atomic`, with no ffprobe; incomplete entries take the full
+  probe path as before. App-side `heal_meta` queues the reprobe on *either*
+  a missing `pix_fmt` or a stale `src` (deduped per session via `reprobed`).
+- `sb-app` gained a session-lived `meta_cache: HashMap<PathBuf, Meta>` behind
+  a `clip_meta` helper used by `start_sel_live` and `start_live`: the first
+  read of a clip pays the disk once (an explicit attention move); every
+  warm/re-spawn after that is a pure memory hit. Only complete metas are
+  memoized — pre-heal entries deliberately re-read each spawn, which is how
+  the background heal gets picked up without a new cross-thread signal (they
+  are rare, transient, and exactly today's behavior).
+- Deliberately not done: the optional stretch (resolving even the first read
+  on the player thread) — first-read cost is one small file on a deliberate
+  user action; revisit only if slow-volume first-spawns prove to matter.
+
+Tests: `cached_meta_is_read_only_and_reprobe_heals_src` (sb-media: stale-src
+entry on a garbage "video" — read leaves the file byte-identical, reprobe
+rewrites src without probing) and
+`clip_meta_memoizes_and_heal_meta_queues_the_src_heal` (sb-app: memo hit
+serves with no disk entry at all; stale src queues exactly one reprobe).
+Full gate green: fmt, clippy `-D warnings`, workspace tests, serial sb-media
+tests, release build.
+
+**Original problem statement follows.**
+
+**Problem**
+
+`cached_meta` ([crates/sb-media/src/lib.rs:1045](crates/sb-media/src/lib.rs))
+stats the **source file**, reads the cache entry's `meta.json`, and — when the
+recorded `src` path is stale under `size_mtime` keying — re-serializes and
+synchronously **writes `meta.json` back**. It is called from `start_sel_live`
+([crates/sb-app/src/lib.rs:2865](crates/sb-app/src/lib.rs)) and `start_live`
+([crates/sb-app/src/lib.rs:2922](crates/sb-app/src/lib.rs)), i.e. on every cold
+spawn *and every warm-pool spawn* — a single selection move can trigger up to
+five calls (new stream + four staggered warm targets). On a local SSD each call
+is sub-millisecond; on a spun-down external drive, a network share, or a
+Spotlight-busy disk it can block for tens of milliseconds to seconds — while
+the user is watching video. This violates the standing rule in this file:
+"never move file stats or media work onto the render thread."
+
+**Suggested implementation**
+
+- Add a session-lived in-memory meta cache in `sb-app` —
+  `HashMap<PathBuf, Option<Meta>>`, the same pattern as `chapter_probe` — so
+  after a clip's first spawn every warm/re-spawn is a pure memory lookup.
+  Update the entry when a reprobe result drains (the heal path), and clear or
+  ignore it across the D swap (paths survive a swap, so keeping it is fine).
+- Move the `m.src` heal-write out of `cached_meta` entirely: queue it through
+  the worker reprobe tier (which already rewrites `meta.json` atomically via
+  `write_atomic`) instead of `fs::write` inline on the caller's thread.
+- Optional stretch: make even the first read asynchronous by resolving meta on
+  the `SeekablePlayer` reader thread — but this changes how spawn dimensions
+  are computed, so only do it if slow-volume first-spawns prove to matter.
+
+**Acceptance criteria**
+
+- Steady-state spawning (warm pool churn, selection moves over already-seen
+  clips) performs zero filesystem calls on the render thread.
+- The `meta.json` src-heal write never happens on the render thread.
+- The no-jolt handoff (thumb frame == first live frame) and the hw-chain gate
+  (`pix_fmt`-driven) behave identically.
+
+**Tests**
+
+- Warm-spawning a previously-spawned clip consults the in-memory map (assert
+  via a counter or by pointing the cache root at a poisoned/missing dir after
+  the first spawn).
+- A stale-src entry is still healed, via the worker tier.
+
+---
+
 ## P1 — make work proportional and remove duplication
 
 ### P1.1 — Replace the all-library spring scan with active spring state
@@ -611,8 +706,8 @@ pre-copied one, and a seek that lands while parked skips the copy
 entirely. The due-stamp moved after the park too, so a long-parked frame
 re-anchors instead of carrying a stale deadline. The lock drops during the
 copy (room only grows — one reader per player); close/seek are re-checked
-before the push. Approach B (buffer recycling) stays deferred until
-profiling shows the alloc itself matters. The pacing/stall/drop trio and
+before the push. Approach B (buffer recycling) was deferred here and has
+since been promoted to its own task, P1.5 (2026-07-20 stall review). The pacing/stall/drop trio and
 the full app-level live tests all pass; live smoke shows unchanged
 first-frame latency and pacing.
 
@@ -711,6 +806,105 @@ input must continue to request display-rate redraws when active.
 - UI tweens remain display-rate smooth.
 - Due frames are not presented late beyond the existing pacing tolerance.
 - Warm parked lanes do not schedule redraws.
+
+---
+
+### P1.5 — Recycle live RGBA frame buffers
+
+**Status:** Open (found 2026-07-20). This is P1.3's deferred Approach B,
+promoted into its own task with new evidence about *render-thread* cost, not
+just reader-side residency.
+
+**Problem**
+
+Every decoded live frame is a fresh `Vec<u8>` allocated in `push_rgba`
+([crates/sb-media/src/seekable.rs:577](crates/sb-media/src/seekable.rs)). At
+quickview 4K that is ~33 MiB per frame, and each buffer's *entire* lifecycle
+taxes the presentation path: the render thread memcpys it in `write_texture`
+([crates/sb-window/src/render.rs:677](crates/sb-window/src/render.rs)) and then
+frees it. Worse, after any hiccup `take_frame`
+([crates/sb-media/src/seekable.rs:199](crates/sb-media/src/seekable.rs)) pops
+*several* due frames and frees them all inside one render frame, and `seek()`
+drops up to the full depth-3 queue inline (~100 MiB of frees at 4K) on the
+render thread. The allocator churn (mmap/munmap at these sizes) shows up as
+periodic hiccups precisely during sustained playback of the focused video.
+
+**Suggested implementation**
+
+- A small per-player buffer pool (queue depth + 2 buffers): the reader pulls a
+  recycled buffer instead of allocating; `take_frame` and `seek` return
+  superseded buffers to the pool instead of dropping them.
+- The pool must span the app-boundary hand-off: `HiresFrame` currently carries
+  the `Vec` by value to the renderer. Either return it to the pool after
+  `upload_hires` (a recycle handle on `HiresFrame`), or have the app hand the
+  previous frame's `Vec` back to the player on the next `take_frame`.
+- Do NOT pull NV12/GPU color conversion forward for this — that stays behind
+  P2.5's entry criteria. This task only removes alloc/free churn.
+
+**Acceptance criteria**
+
+- Steady-state playback performs no large (> 1 MiB) allocations or frees per
+  frame on either the reader or the render thread.
+- Seek/scrub and multi-frame catch-up drops recycle rather than free.
+- Warm promotion, parking, and drop-release behavior are unchanged.
+
+**Tests**
+
+- Keep the seekable pacing/stall/drop trio green.
+- Assert buffer identity is reused across frames (pointer/capacity check).
+
+---
+
+### P1.6 — Move subprocess launches off the render thread
+
+**Status:** Open (found 2026-07-20). Trivial.
+
+**Problem**
+
+`run_launch` spawns the child process inline on the render thread
+([crates/sb-app/src/commands.rs:255](crates/sb-app/src/commands.rs)), as does
+the `pbcopy` copy-path helper
+([crates/sb-app/src/commands.rs:276](crates/sb-app/src/commands.rs)); only the
+`wait()` is threaded. Process spawn on macOS typically costs 1–10 ms — pressing
+`o`/`c`/`r` while a video plays eats a frame or two.
+
+**Suggested implementation**
+
+Move the whole `Command::new(...).spawn()` into the throwaway thread that
+already exists for the `wait()` (log spawn failures from there instead of
+returning them).
+
+**Acceptance criteria**
+
+- No `Command` spawn executes on the render thread.
+- Launch/copy/reveal still work; failures still log.
+
+---
+
+### P1.7 — Resolve the drag-ghost thumb path at press time
+
+**Status:** Open (found 2026-07-20). Trivial.
+
+**Problem**
+
+When a press crosses `drag_threshold`, the CursorMoved handler calls
+`cached_thumb_path` ([crates/sb-app/src/lib.rs:3994](crates/sb-app/src/lib.rs)
+→ [crates/sb-media/src/lib.rs:375](crates/sb-media/src/lib.rs)) — a stat of the
+source file plus an `exists()` on the cache artifact — inside the pointer
+callback, which is the same cadence that feeds scrubbing. On a slow volume
+that's an unbounded block mid-gesture.
+
+**Suggested implementation**
+
+Resolve the ghost-image path once at mouse-down and stash it in `Press`, so
+drag maturation is pure memory. (Mouse-down is a discrete user act; one stat
+there is acceptable, and it can also skip the lookup entirely for cloud clips.)
+
+**Acceptance criteria**
+
+- The CursorMoved path performs no filesystem calls.
+- Drag-out ghost imagery is unchanged
+  (`tile_drag_out_matures_and_click_still_opens_quickview` stays green).
 
 ---
 
@@ -842,6 +1036,21 @@ The existing entry criteria still apply:
 When an entry criterion is met, follow the color-space/range metadata and PSNR
 verification plan in [PERF.md](PERF.md). This is not a substitute for the
 scheduling and residency tasks above.
+
+---
+
+### P2.6 — Minor per-frame churn on the render thread
+
+**Status:** Grouped observations from the 2026-07-20 stall review; none is a
+measured cost. Fold into P2.2's scratch-buffer pass rather than landing alone.
+
+- `self.tuning.clone()` runs twice per frame (`step` and `build_frame`) — if
+  `Tuning` grows heap-carrying fields this becomes real churn; borrow instead.
+- `update_title` formats a fresh `String` (plus `to_string_lossy`) every frame
+  before its changed-check; compare components first.
+- The tuning hot-reload poll stats the config file on the render thread every
+  250 ms ([crates/sb-app/src/tuning.rs:446](crates/sb-app/src/tuning.rs)) —
+  fine on local disks, worth remembering if a network home dir ever stutters.
 
 ---
 

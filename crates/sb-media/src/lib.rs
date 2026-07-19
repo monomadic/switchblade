@@ -1042,21 +1042,21 @@ pub struct Meta {
 
 /// Read the cached meta.json for a clip without probing (cheap: one small
 /// file read; no process spawn). Present for anything with a thumbnail.
+///
+/// Strictly read-only (P0.7): live spawns call this on the render thread,
+/// so a stale `src` (a rename under `size_mtime` keying strands the
+/// recorded path, and `--cleanup-cache` judges entries dead by whether
+/// meta.src still fingerprints) comes back as-is — the caller queues a
+/// background reprobe, whose worker rewrites the entry off-thread. The
+/// heal still happens on first access, just never on this thread.
 pub fn cached_meta(path: &Path) -> Option<Meta> {
+    cached_meta_in(&cache_root(), path)
+}
+
+fn cached_meta_in(root: &Path, path: &Path) -> Option<Meta> {
     let meta = std::fs::metadata(path).ok()?;
-    let file = entry_dir(&cache_root(), path, meta.len(), mtime_secs(&meta)).join("meta.json");
-    let mut m: Meta = serde_json::from_slice(&std::fs::read(&file).ok()?).ok()?;
-    if m.src != path {
-        // Under `size_mtime` a rename keeps the entry but strands the
-        // recorded source path — and `--cleanup-cache` judges entries
-        // dead by whether meta.src still fingerprints here. Heal it on
-        // first access or cleanup eats the entry the keying preserved.
-        m.src = path.to_path_buf();
-        if let Ok(json) = serde_json::to_vec_pretty(&m) {
-            let _ = std::fs::write(&file, json);
-        }
-    }
-    Some(m)
+    let file = entry_dir(root, path, meta.len(), mtime_secs(&meta)).join("meta.json");
+    serde_json::from_slice(&std::fs::read(&file).ok()?).ok()
 }
 
 /// Worker-side half of `request_reprobe`: probe again and rewrite the
@@ -1070,9 +1070,21 @@ fn reprobe(src: &Path, root: &Path) {
     let dir = entry_dir(root, src, st.len(), mtime_secs(&st));
     let file = dir.join("meta.json");
     if let Ok(bytes) = std::fs::read(&file)
-        && serde_json::from_slice::<Meta>(&bytes).is_ok_and(|m| m.pix_fmt.is_some())
+        && let Ok(mut m) = serde_json::from_slice::<Meta>(&bytes)
+        && m.pix_fmt.is_some()
     {
-        return; // already healed
+        // Entry is complete — no probe needed. But a stale `src` (rename
+        // under size_mtime keying) still wants rewriting: cached_meta no
+        // longer heals it inline (P0.7 — that write ran on the render
+        // thread), so the worker owns it now.
+        if m.src != src {
+            m.src = src.to_path_buf();
+            if let Ok(json) = serde_json::to_vec_pretty(&m) {
+                let _ = write_atomic(&file, &json);
+                log::debug!("meta src healed: {}", src.display());
+            }
+        }
+        return;
     }
     let Some(m) = probe(src) else {
         return;
@@ -1469,6 +1481,59 @@ mod tests {
             entry_dir_with(CacheKey::SizeMtime, &root, &src, len, mt),
             new
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `cached_meta` runs on the render thread, so it must never write
+    /// (P0.7 — it used to heal a stale `src` inline); the worker-side
+    /// reprobe owns the heal now, and does it WITHOUT an ffprobe when
+    /// the entry is otherwise complete.
+    #[test]
+    fn cached_meta_is_read_only_and_reprobe_heals_src() {
+        let root = std::env::temp_dir().join("sb_media_meta_heal_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("clip.mp4");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&src, b"not really a video").unwrap();
+        let st = std::fs::metadata(&src).unwrap();
+        let dir = entry_dir(&root, &src, st.len(), mtime_secs(&st));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A complete entry whose recorded src is stranded by a rename.
+        let stale = Meta {
+            src: PathBuf::from("/somewhere/else/clip.mp4"),
+            duration: Some(1.0),
+            width: Some(64),
+            height: Some(36),
+            codec: Some("h264".into()),
+            fps: Some(30.0),
+            rotation: None,
+            pix_fmt: Some("yuv420p".into()),
+        };
+        let file = dir.join("meta.json");
+        std::fs::write(&file, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        let before = std::fs::read(&file).unwrap();
+
+        // The read returns the disk truth untouched — stale src and all
+        // (the caller detects it and queues the heal).
+        let m = cached_meta_in(&root, &src).expect("meta reads");
+        assert_eq!(m.src, stale.src, "read-only: src comes back as stored");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "cached_meta must not write"
+        );
+
+        // The reprobe worker heals src in place. The source is garbage,
+        // so this passing also proves no ffprobe ran (the entry already
+        // carries pix_fmt — a probe would have failed and written nothing).
+        reprobe(&src, &root);
+        let healed: Meta =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).expect("healed meta parses");
+        assert_eq!(healed.src, src, "worker rewrote the stranded src");
+        assert_eq!(healed.pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(healed.duration, Some(1.0), "probe fields survive the heal");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
