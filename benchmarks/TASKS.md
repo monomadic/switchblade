@@ -132,7 +132,15 @@ seed scenarios (cold h264 first-frame ~255ms, hover-lane ~62ms, 4K60 warm spawn 
       animation, viewport, refresh_hz vsync stand-in, max_wall), sequential
       `[[step]]` list (`wait` / `wait_until` / `key` / `hover` / `click` /
       `scroll`) with an explicit `action` discriminator, `[validity].require`,
-      and `intent = """…"""` prose. Reuses the existing toml dep.
+      `intent = """…"""` prose, and a `[tuning]` table of feel-constant
+      overrides. Reuses the existing toml dep.
+- [x] **3.1b Tuning overrides (knob sweeps, no rebuild)**: a scenario `[tuning]`
+      table (partial — `Tuning`'s `#[serde(default)]` fills the rest) is injected
+      via `Options.tuning`, bypassing config load + hot-reload for a hermetic run.
+      `sb-bench run/bench --set k=v` overlays onto that table (floats need a
+      decimal; strings pass bare), and the applied sets are recorded in the
+      summary + shown in the report/compare header so an A/B self-documents which
+      knob differed. Test `bench::tests::set_overrides_patch_the_tuning_table`.
 - [x] **3.2 Runner binary**: hermetic temp `HOME` set in the bin BEFORE any
       sb-media call (cache-root OnceLock); drives `frame()` on a **vsync
       stand-in** while animating (headless has no present to pace it — using the

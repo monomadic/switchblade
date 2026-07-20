@@ -40,6 +40,12 @@ pub struct Scenario {
     pub step: Vec<Step>,
     #[serde(default)]
     pub validity: Validity,
+    /// Feel-constant overrides for this run. A partial `[tuning]` table —
+    /// `Tuning`'s `#[serde(default)]` fills every unspecified field — so a
+    /// scenario can sweep a knob (e.g. `live_delay_ms`) without a rebuild.
+    /// `sb-bench run --set k=v` overlays onto this table.
+    #[serde(default)]
+    pub tuning: crate::Tuning,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +130,10 @@ pub struct Validity {
 pub struct Summary {
     pub scenario: String,
     pub intent: String,
+    /// The `--set k=v` tuning overrides applied to this run (empty when a
+    /// bare scenario ran). Self-documents A/B knob sweeps in the report.
+    #[serde(default)]
+    pub tuning_sets: Vec<String>,
     pub valid: bool,
     pub invalid_reasons: Vec<String>,
     pub wall_s: f64,
@@ -167,13 +177,15 @@ pub struct CondResult {
 // ---------------------------------------------------------------------------
 
 /// Run a scenario file end to end, writing `summary.json` and
-/// `events.jsonl` under `out_dir`, and return the summary. The caller is
-/// responsible for hermetic isolation (a fresh temp `HOME` per run, set
-/// BEFORE this is called — the cache root is a process-global `OnceLock`).
-pub fn run(scenario_path: &Path, out_dir: &Path) -> Result<Summary, String> {
+/// `events.jsonl` under `out_dir`, and return the summary. `sets` are
+/// `key=value` tuning overrides overlaid onto the scenario's `[tuning]`
+/// table (knob sweeps without editing the file). The caller is responsible
+/// for hermetic isolation (a fresh temp `HOME` per run, set BEFORE this is
+/// called — the cache root is a process-global `OnceLock`).
+pub fn run(scenario_path: &Path, out_dir: &Path, sets: &[String]) -> Result<Summary, String> {
     let text = std::fs::read_to_string(scenario_path)
         .map_err(|e| format!("read {}: {e}", scenario_path.display()))?;
-    let scenario: Scenario = toml::from_str(&text).map_err(|e| format!("parse scenario: {e}"))?;
+    let scenario = parse_scenario(&text, sets)?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
 
     let inputs = resolve_inputs(&scenario.setup)?;
@@ -182,6 +194,7 @@ pub fn run(scenario_path: &Path, out_dir: &Path) -> Result<Summary, String> {
         inputs,
         demo: scenario.setup.demo,
         no_config: true, // hermetic: a stray config must never steer a bench
+        tuning: Some(scenario.tuning.clone()),
         ..Options::default()
     };
     let viewport = Viewport {
@@ -224,6 +237,7 @@ pub fn run(scenario_path: &Path, out_dir: &Path) -> Result<Summary, String> {
     let summary = Summary {
         scenario: scenario.name,
         intent: scenario.intent,
+        tuning_sets: sets.to_vec(),
         valid: invalid.is_empty(),
         invalid_reasons: invalid,
         wall_s,
@@ -451,6 +465,43 @@ impl Rig {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Parse a scenario, overlaying `key=value` `--set` overrides onto its
+/// `[tuning]` table before deserializing. Values are written as TOML:
+/// `true`/`false` and anything parsing as a number pass through verbatim
+/// (so **floats need a decimal point** — `live_delay_ms=250.0`), and
+/// everything else is quoted as a string (`grid_layout=flexible`).
+fn parse_scenario(text: &str, sets: &[String]) -> Result<Scenario, String> {
+    if sets.is_empty() {
+        return toml::from_str(text).map_err(|e| format!("parse scenario: {e}"));
+    }
+    let mut doc: toml::Table = toml::from_str(text).map_err(|e| format!("parse scenario: {e}"))?;
+    // Build a `[tuning]` patch from the k=v pairs, then merge it in.
+    let mut patch_src = String::new();
+    for kv in sets {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("--set expects key=value, got {kv:?}"))?;
+        let rhs = if v == "true" || v == "false" || v.parse::<f64>().is_ok() {
+            v.to_string()
+        } else {
+            format!("{v:?}") // quote as a TOML string
+        };
+        patch_src.push_str(&format!("{k} = {rhs}\n"));
+    }
+    let patch: toml::Table =
+        toml::from_str(&patch_src).map_err(|e| format!("bad --set value: {e}"))?;
+    let tuning = doc
+        .entry("tuning".to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let tbl = tuning
+        .as_table_mut()
+        .ok_or_else(|| "scenario [tuning] is not a table".to_string())?;
+    for (k, v) in patch {
+        tbl.insert(k, v);
+    }
+    doc.try_into().map_err(|e| format!("parse scenario: {e}"))
+}
+
 fn resolve_inputs(setup: &Setup) -> Result<Vec<PathBuf>, String> {
     if !setup.inputs.is_empty() {
         return Ok(setup.inputs.iter().map(PathBuf::from).collect());
@@ -640,6 +691,7 @@ pub fn orchestrate(
     reps: usize,
     label: &str,
     reports_root: &Path,
+    sets: &[String],
 ) -> Result<PathBuf, String> {
     let reps = reps.max(1);
     let stem = scenario
@@ -654,16 +706,18 @@ pub fn orchestrate(
         let repdir = bundle.join(format!("rep{rep}"));
         let home = repdir.join("home");
         eprintln!("[orchestrate] rep {}/{}", rep + 1, reps);
-        let status = Command::new(exe)
-            .arg("run")
+        let mut cmd = Command::new(exe);
+        cmd.arg("run")
             .arg(scenario)
             .arg("--out")
             .arg(&repdir)
             .arg("--home")
             .arg(&home)
-            .arg("--keep-home") // orchestrator owns cleanup below
-            .status()
-            .map_err(|e| format!("spawn rep {rep}: {e}"))?;
+            .arg("--keep-home"); // orchestrator owns cleanup below
+        for kv in sets {
+            cmd.arg("--set").arg(kv);
+        }
+        let status = cmd.status().map_err(|e| format!("spawn rep {rep}: {e}"))?;
         let summary = read_summary(&repdir.join("summary.json"))
             .map_err(|e| format!("rep {rep}: {e} (child exit: {status})"))?;
         summaries.push(summary);
@@ -712,6 +766,11 @@ pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> S
          comparative — Tier A has no vsync present, so \"served on time\" is a proxy \
          for \"would have presented\". No verdicts here — judge against the intent.\n\n"
     ));
+    if let Some(sets) = summaries.first().map(|s| &s.tuning_sets)
+        && !sets.is_empty()
+    {
+        out.push_str(&format!("**Tuning overrides:** `{}`\n\n", sets.join("`, `")));
+    }
     out.push_str("## Intent\n\n");
     for line in summaries
         .first()
@@ -816,6 +875,18 @@ pub fn compare_markdown(a: &[Summary], b: &[Summary], la: &str, lb: &str) -> Str
          Comparative, no verdict — judge against the intent. A and B should be \
          run interleaved to dodge thermal drift.\n\n"
     ));
+    let sets = |runs: &[Summary]| {
+        runs.first()
+            .map(|s| s.tuning_sets.join("`, `"))
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("`{s}`"))
+            .unwrap_or_else(|| "(none)".into())
+    };
+    out.push_str(&format!(
+        "- {la} tuning: {}\n- {lb} tuning: {}\n\n",
+        sets(a),
+        sets(b)
+    ));
     out.push_str("## Intent\n\n");
     for line in a.first().map(|s| s.intent.as_str()).unwrap_or("").lines() {
         out.push_str(&format!("> {line}\n"));
@@ -895,6 +966,7 @@ mod tests {
         Summary {
             scenario: scenario.into(),
             intent: "line one\nline two".into(),
+            tuning_sets: vec![],
             valid,
             invalid_reasons: vec![],
             wall_s: 6.0,
@@ -941,6 +1013,31 @@ mod tests {
         // late_frames median of {0,0,4} = 0, spread 0–4.
         assert!(md.contains("0.00 (0.00–4.00)"), "counter median+spread");
         assert!(!md.to_lowercase().contains("regression"), "no verdicts");
+    }
+
+    /// `--set` overrides overlay onto the scenario's `[tuning]` table, with
+    /// the documented value coercion (int/float/bool bare, strings quoted).
+    #[test]
+    fn set_overrides_patch_the_tuning_table() {
+        let text = r#"
+name = "s"
+[setup]
+demo = true
+[tuning]
+live_delay_ms = 100.0
+"#;
+        let sets = vec![
+            "live_delay_ms=250.0".to_string(), // float overrides the base
+            "quickview_max_width=640".to_string(), // int into a u32 field
+        ];
+        let sc = parse_scenario(text, &sets).expect("parse with --set");
+        assert_eq!(sc.tuning.live_delay_ms, 250.0);
+        assert_eq!(sc.tuning.quickview_max_width, 640);
+        // Unspecified fields keep their Tuning defaults.
+        assert_eq!(sc.tuning.quickview_max_height, crate::Tuning::default().quickview_max_height);
+        // A bare scenario (no sets) still parses and uses defaults.
+        let plain = parse_scenario(text, &[]).expect("parse no sets");
+        assert_eq!(plain.tuning.live_delay_ms, 100.0);
     }
 
     /// Compare renders a B−A delta per metric and stays verdict-free.
@@ -1009,7 +1106,7 @@ require = ["selected_served"]
         .unwrap();
 
         let out = dir.join("out");
-        let summary = run(&scenario, &out).expect("runner completes");
+        let summary = run(&scenario, &out, &[]).expect("runner completes");
         assert!(
             summary.valid,
             "run should be valid, reasons: {:?}",

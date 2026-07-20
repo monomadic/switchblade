@@ -315,6 +315,10 @@ pub struct Options {
     /// no hot-reload. For tests and triage, where behavior must not be
     /// steerable by a stray ./switchblade.toml or ~/.config file.
     pub no_config: bool,
+    /// Inject a fully-resolved `Tuning` (the bench runner's scenario
+    /// overrides). When set, no config file is loaded and nothing
+    /// hot-reloads — the injected values are exactly what runs.
+    pub tuning: Option<Tuning>,
 }
 
 pub struct Switchblade {
@@ -636,10 +640,18 @@ impl Switchblade {
         // ingest recurse flag are startup-only (the rest keeps
         // hot-reloading per frame). `--no-config` skips the file entirely
         // — internal defaults, nothing watched.
-        let mut tuning_file = (!opts.no_config).then(|| TuningFile::new(tuning::config_path()));
-        let (tuning, keymap) = match tuning_file.as_mut().and_then(|f| f.poll()) {
-            Some(cfg) => (cfg.tuning, cfg.keymap),
-            None => (Tuning::default(), KeyMap::default()),
+        // An injected `Tuning` (the bench runner's scenario overrides) wins
+        // outright: no config file is loaded and nothing hot-reloads, so a
+        // scenario's knobs are exactly what runs. Otherwise the usual file
+        // load (unless `--no-config`).
+        let mut tuning_file = (opts.tuning.is_none() && !opts.no_config)
+            .then(|| TuningFile::new(tuning::config_path()));
+        let (tuning, keymap) = match opts.tuning.clone() {
+            Some(t) => (t, KeyMap::default()),
+            None => match tuning_file.as_mut().and_then(|f| f.poll()) {
+                Some(cfg) => (cfg.tuning, cfg.keymap),
+                None => (Tuning::default(), KeyMap::default()),
+            },
         };
         // Startup-only, before any cache access (ingest stats, thumb
         // requests): the fingerprint keying can't change under a live

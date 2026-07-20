@@ -34,9 +34,16 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!("usage:");
-    eprintln!("  sb-bench run     <scenario.toml> [--out <dir>] [--home <dir>] [--keep-home]");
-    eprintln!("  sb-bench bench   <scenario.toml> [--reps N] [--label L] [--reports <dir>]");
+    eprintln!(
+        "  sb-bench run     <scenario.toml> [--out <dir>] [--home <dir>] [--keep-home] [--set k=v ...]"
+    );
+    eprintln!(
+        "  sb-bench bench   <scenario.toml> [--reps N] [--label L] [--reports <dir>] [--set k=v ...]"
+    );
     eprintln!("  sb-bench compare <bundleA> <bundleB> [--out <report.md>]");
+    eprintln!();
+    eprintln!("  --set overrides a [tuning] field (knob sweep, no rebuild). Floats need a");
+    eprintln!("  decimal: --set live_delay_ms=250.0. Strings pass bare: --set grid_layout=fixed.");
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
@@ -44,12 +51,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut out: Option<PathBuf> = None;
     let mut home: Option<PathBuf> = None;
     let mut keep_home = false;
+    let mut sets: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out" => out = it.next().map(PathBuf::from),
             "--home" => home = it.next().map(PathBuf::from),
             "--keep-home" => keep_home = true,
+            "--set" => {
+                if let Some(kv) = it.next() {
+                    sets.push(kv.clone());
+                }
+            }
             _ if scenario.is_none() => scenario = Some(PathBuf::from(a)),
             other => {
                 eprintln!("unexpected argument: {other}");
@@ -82,7 +95,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 
     let out = out.unwrap_or_else(|| default_out(&scenario));
-    let code = match sb_app::bench::run(&scenario, &out) {
+    let code = match sb_app::bench::run(&scenario, &out, &sets) {
         Ok(summary) => {
             print_summary(&summary);
             if summary.valid {
@@ -108,6 +121,7 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     let mut reps: usize = 5;
     let mut label = String::from("run");
     let mut reports: Option<PathBuf> = None;
+    let mut sets: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -116,6 +130,11 @@ fn cmd_bench(args: &[String]) -> ExitCode {
             }
             "--label" => label = it.next().cloned().unwrap_or(label),
             "--reports" => reports = it.next().map(PathBuf::from),
+            "--set" => {
+                if let Some(kv) = it.next() {
+                    sets.push(kv.clone());
+                }
+            }
             _ if scenario.is_none() => scenario = Some(PathBuf::from(a)),
             other => {
                 eprintln!("unexpected argument: {other}");
@@ -143,7 +162,7 @@ fn cmd_bench(args: &[String]) -> ExitCode {
             .join("reports")
     });
 
-    match sb_app::bench::orchestrate(&exe, &scenario, reps, &label, &reports) {
+    match sb_app::bench::orchestrate(&exe, &scenario, reps, &label, &reports, &sets) {
         Ok(report) => {
             println!("report: {}", report.display());
             ExitCode::SUCCESS
