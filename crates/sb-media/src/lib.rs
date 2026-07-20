@@ -177,7 +177,20 @@ struct Queues {
     gen_owed: HashMap<PathBuf, u32>,
     thumb_owed: HashMap<PathBuf, u32>,
     anim_owed: HashMap<PathBuf, u32>,
+    /// The selected stream is presenting frames right now (mirrors the
+    /// app's `MEDIA_UPLOAD_BUDGET_LIVE` condition). While set, the gen
+    /// sweep narrows to `GEN_LIVE_CONCURRENCY` concurrent jobs: three
+    /// workers' worth of seeked 4K extracts saturate a slow drive and
+    /// starve the resident decoder's reads — watching wins.
+    live: bool,
+    /// Gen-sweep jobs currently running (the counter the live cap gates).
+    gen_running: usize,
 }
+
+/// Concurrent gen-sweep jobs allowed while the selected stream presents.
+/// One (niced, I/O-throttled via `media_cmd_bg`) keeps the sweep inching
+/// forward; the full worker pool resumes the moment nothing is playing.
+const GEN_LIVE_CONCURRENCY: usize = 1;
 
 impl Queues {
     fn thumb_busy(&self, p: &Path) -> bool {
@@ -245,9 +258,15 @@ impl Queues {
             self.inflight.insert((p.clone(), Art::Anim));
             return Some(Request::Anim(p));
         }
-        if let Some(p) = self.r#gen.pop_front() {
+        // Live cap: leave gen work queued rather than racing the
+        // presenting stream for the drive. Workers park on the condvar;
+        // `set_live(false)` and each finishing gen job re-notify.
+        if !(self.live && self.gen_running >= GEN_LIVE_CONCURRENCY)
+            && let Some(p) = self.r#gen.pop_front()
+        {
             self.in_gen.remove(&p);
             self.inflight.insert((p.clone(), Art::Thumb));
+            self.gen_running += 1;
             return Some(Request::Gen(p));
         }
         None
@@ -321,6 +340,9 @@ pub struct MediaService {
     queue: SharedQueue,
     rx: Receiver<ThumbResult>,
     recipe: Recipe,
+    /// Last value passed to `set_live` — dedupes the app's per-frame
+    /// call down to a relaxed atomic load on the common no-change path.
+    live: std::sync::atomic::AtomicBool,
 }
 
 impl MediaService {
@@ -348,6 +370,25 @@ impl MediaService {
             queue,
             rx: rx_done,
             recipe,
+            live: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Tell the workers whether the selected stream is presenting frames
+    /// (the app's `MEDIA_UPLOAD_BUDGET_LIVE` condition). While true the
+    /// gen sweep narrows to `GEN_LIVE_CONCURRENCY` jobs so its drive
+    /// reads can't starve the resident decoder; on the falling edge every
+    /// parked worker wakes and the sweep resumes at full width. Cheap to
+    /// call every frame — no-ops without a state change.
+    pub fn set_live(&self, live: bool) {
+        use std::sync::atomic::Ordering;
+        if self.live.swap(live, Ordering::Relaxed) == live {
+            return;
+        }
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().live = live;
+        if !live {
+            cv.notify_all();
         }
     }
 
@@ -492,6 +533,26 @@ fn media_cmd(bin: &str) -> Command {
     }
     #[cfg(not(unix))]
     Command::new(bin)
+}
+
+/// Background-BAND variant for the sweep's heavy readers (gen extracts,
+/// anim-sheet cells): `taskpolicy -b` puts the child in Darwin's
+/// background band, which throttles its DISK I/O below normal-priority
+/// reads — the priority `nice` cannot express. That's what protects a
+/// live stream on a slow/external drive: the sweep's seeked extracts of
+/// 4K sources otherwise saturate the drive and the resident decoder's
+/// reads stall for seconds (observed as multi-second `live 0` droughts
+/// on an encrypted USB volume). Foreground work (visible thumbs, cache
+/// jpeg decode) stays on plain `media_cmd` — throttled I/O would add
+/// deliberate sleeps to user-facing loads.
+fn media_cmd_bg(bin: &str) -> Command {
+    #[cfg(target_os = "macos")]
+    if std::path::Path::new("/usr/sbin/taskpolicy").exists() {
+        let mut c = Command::new("/usr/sbin/taskpolicy");
+        c.arg("-b").arg(bin);
+        return c;
+    }
+    media_cmd(bin)
 }
 
 /// Live playback (PLAN.md §6 level 3): an ffmpeg child decodes to raw
@@ -772,8 +833,17 @@ fn worker(
                 });
             }
             Request::Gen(path) => {
-                let jpg = ensure_thumb_file(&path, &root, have_ffmpeg, &recipe);
-                let owed = queue.0.lock().unwrap().complete(&path, Art::Thumb);
+                // Background sweep: software decode (hw=false) keeps this
+                // niced, full-library work off the VT media engine the
+                // live stream needs.
+                let jpg = ensure_thumb_file(&path, &root, have_ffmpeg, &recipe, false);
+                let owed = {
+                    let mut q = queue.0.lock().unwrap();
+                    q.gen_running -= 1;
+                    q.complete(&path, Art::Thumb)
+                };
+                // The freed live-cap slot may unblock a parked worker.
+                queue.1.notify_one();
                 // Visible requests that joined this generation get their
                 // foreground decode now — the file just landed.
                 if owed.thumbs > 0 {
@@ -836,18 +906,22 @@ fn make_thumb(
     have_ffmpeg: bool,
     recipe: &Recipe,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    let jpg = ensure_thumb_file(src, root, have_ffmpeg, recipe)?;
+    // Foreground (a visible tile is waiting on it): VT keeps grid-fill snappy.
+    let jpg = ensure_thumb_file(src, root, have_ffmpeg, recipe, true)?;
     decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
 }
 
 /// Make sure the thumb jpg (+ meta.json) exists on disk, returning its
 /// path — the decode/upload-free half of `make_thumb`, also used by the
-/// background gen sweep.
+/// background gen sweep. `hw` gates VideoToolbox: the sweep passes false
+/// so its niced decodes never contend with live playback for the media
+/// engine (see `extract_frame`).
 fn ensure_thumb_file(
     src: &Path,
     root: &Path,
     have_ffmpeg: bool,
     recipe: &Recipe,
+    hw: bool,
 ) -> Option<PathBuf> {
     let meta = std::fs::metadata(src).ok()?;
     if !meta.is_file() {
@@ -873,7 +947,7 @@ fn ensure_thumb_file(
             .map(|d| (d * recipe.seek_fraction as f64).max(0.0))
             .unwrap_or(0.0);
         let codec = probed.as_ref().and_then(|m| m.codec.clone());
-        extract_frame(src, &jpg, seek, recipe, codec.as_deref())?;
+        extract_frame(src, &jpg, seek, recipe, codec.as_deref(), hw)?;
         log::debug!("thumb generated: {}", src.display());
     }
     Some(jpg)
@@ -900,11 +974,10 @@ fn make_anim(
             return None;
         }
         std::fs::create_dir_all(&dir).ok()?;
-        // Sampling frames across the clip needs its duration + codec.
+        // Sampling frames across the clip needs its duration.
         // The thumb pass usually cached the probe already.
         let m = cached_meta(src).or_else(|| probe(src))?;
         let duration = m.duration.filter(|d| *d > 0.05)?;
-        let codec = m.codec.as_deref();
         let g = recipe.anim_grid.max(1);
         let frames = (g * g) as usize;
         let (fw, fh) = recipe.anim_frame();
@@ -922,7 +995,8 @@ fn make_anim(
 
         // g² individual seeked extracts, then one cheap tile pass over
         // the tiny jpegs. Each extract is a fast keyframe seek plus a
-        // handful of decoded frames (hardware where the codec allows).
+        // handful of software-decoded frames (VT is deliberately off — see
+        // the per-extract note below).
         // The old single-command `fps=` filter decoded the ENTIRE clip
         // in software — minutes of multi-core churn per long 4K source,
         // three workers wide, surviving app quit. Never again.
@@ -940,11 +1014,13 @@ fn make_anim(
             let tmp = frame_tmp(k);
             let mut seek = duration * (k as f64 + 0.5) / frames as f64;
             let ok = loop {
-                let mut cmd = media_cmd("ffmpeg");
+                // Software decode + background-band I/O: these g² seeked
+                // extracts race the live stream, so they must take
+                // neither the VT media engine (see `extract_frame`'s `hw`
+                // note) nor drive bandwidth ahead of the resident
+                // decoder's reads (`media_cmd_bg`).
+                let mut cmd = media_cmd_bg("ffmpeg");
                 cmd.args(["-y", "-v", "error"]);
-                if vt_accel(codec) {
-                    cmd.args(["-hwaccel", "videotoolbox"]);
-                }
                 let out = cmd
                     .args(["-ss", &format!("{seek:.3}")])
                     .arg("-i")
@@ -1214,6 +1290,13 @@ fn extract_frame(
     seek: f64,
     recipe: &Recipe,
     codec: Option<&str>,
+    // Allow VideoToolbox. FALSE for the sustained background sweep (gen)
+    // and anim sheets: a single seeked frame decodes fine in software
+    // (niced, cheap), and keeping niced sweep work off the VT media
+    // engine leaves that shared hardware unit for the live stream the
+    // user is actually watching — `nice` scopes CPU, not the media
+    // engine, so a full-throttle VT sweep still hitched live playback.
+    hw: bool,
 ) -> Option<()> {
     // Write to a unique temp name and rename, so a half-written jpg never
     // looks like a cache hit to another worker or a later run — and a
@@ -1226,9 +1309,16 @@ fn extract_frame(
     // must never spam the console (it becomes one debug line below).
     // `-strict unofficial` lets mjpeg accept full-range YUV sources
     // (common in phone and AI-generated footage; hard error in ffmpeg 8+).
-    let mut cmd = media_cmd("ffmpeg");
+    // Foreground (hw): niced CPU, normal I/O, VideoToolbox. Background
+    // sweep (!hw): software decode AND background-band throttled disk
+    // I/O — see `media_cmd_bg`.
+    let mut cmd = if hw {
+        media_cmd("ffmpeg")
+    } else {
+        media_cmd_bg("ffmpeg")
+    };
     cmd.args(["-y", "-v", "error"]);
-    if vt_accel(codec) {
+    if hw && vt_accel(codec) {
         cmd.args(["-hwaccel", "videotoolbox"]);
     }
     let out = cmd
@@ -1256,7 +1346,7 @@ fn extract_frame(
     if !out.status.success() || !tmp.exists() {
         let _ = std::fs::remove_file(&tmp);
         if seek > 0.0 {
-            return extract_frame(src, dst, 0.0, recipe, codec);
+            return extract_frame(src, dst, 0.0, recipe, codec, hw);
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         log::debug!(
@@ -1742,6 +1832,36 @@ mod tests {
         );
     }
 
+    /// While the selected stream presents, the gen sweep narrows to
+    /// `GEN_LIVE_CONCURRENCY` concurrent jobs — the full pool's seeked
+    /// 4K extracts saturate a slow drive and starve the resident
+    /// decoder's reads (multi-second `live 0` droughts on an external
+    /// volume). Higher tiers are never capped, a finishing job frees its
+    /// slot, and clearing `live` reopens the sweep to every worker.
+    #[test]
+    fn live_playback_caps_gen_sweep_concurrency() {
+        let mut q = Queues::default();
+        for i in 0..3 {
+            q.push_gen(PathBuf::from(format!("clip{i}.mp4")));
+        }
+        q.live = true;
+        let Some(Request::Gen(first)) = q.pop() else {
+            panic!("one gen job runs under the live cap");
+        };
+        assert!(q.pop().is_none(), "the cap parks the other workers");
+        // Visible work is never capped — only the sweep is.
+        q.push_thumb(PathBuf::from("visible.mp4"));
+        assert!(matches!(q.pop(), Some(Request::Thumb(_))));
+        // The finishing job frees its slot for exactly one more.
+        q.gen_running -= 1;
+        q.complete(&first, Art::Thumb);
+        assert!(matches!(q.pop(), Some(Request::Gen(_))));
+        assert!(q.pop().is_none());
+        // Nothing playing: the whole pool sweeps again.
+        q.live = false;
+        assert!(matches!(q.pop(), Some(Request::Gen(_))));
+    }
+
     /// Duplicate gen requests (D-swap re-ingests the same files) coalesce
     /// to one queued job that owes the extra `GenDone`s — progress
     /// accounting stays balanced (P1.2).
@@ -1864,9 +1984,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             let t = {
                 let (clip, root) = (clip.clone(), root.clone());
-                thread::spawn(move || ensure_thumb_file(&clip, &root, true, &recipe))
+                thread::spawn(move || ensure_thumb_file(&clip, &root, true, &recipe, true))
             };
-            let here = ensure_thumb_file(&clip, &root, true, &recipe);
+            let here = ensure_thumb_file(&clip, &root, true, &recipe, true);
             let there = t.join().unwrap();
             let jpg = here.or(there).expect("at least one generation succeeds");
             assert!(

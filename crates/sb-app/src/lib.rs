@@ -2739,13 +2739,17 @@ impl Switchblade {
         // thumb bursts trickle in under a much smaller per-frame budget:
         // the full 64-upload batch staged ~80MB of texture writes
         // between two video frames — a visible playback hitch.
-        let budget = if self
+        let live_now = self
             .live_sel
             .as_ref()
             .is_some_and(|l| l.first_frame.is_some())
             && !self.sel_parked
-            && !self.paused()
-        {
+            && !self.paused();
+        // Same condition narrows the gen sweep's worker concurrency (and
+        // its drive reads) while the stream presents — see
+        // `MediaService::set_live`. Deduped internally; free per frame.
+        self.media.set_live(live_now);
+        let budget = if live_now {
             MEDIA_UPLOAD_BUDGET_LIVE
         } else {
             MEDIA_UPLOAD_BUDGET
