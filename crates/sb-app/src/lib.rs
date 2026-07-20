@@ -1285,20 +1285,29 @@ impl Switchblade {
             Action::Skip { forward, amount } => self.skip(forward, amount),
             Action::SelectNext => self.move_selection(1, 0),
             Action::SelectPrev => self.move_selection(-1, 0),
-            // Context-sensitive movement (the default hjkl/arrows). In
-            // fullview: left/right step the playing clip between chapters
-            // (peeking the chapter bar), up steps out to the filmstrip
-            // quickview. In quickview: down dives into fullview (mirror of
-            // clicking the video). Everywhere else, and on the axes not
-            // claimed above, movement moves the selection. (move_* are
-            // single-axis, so dx and dy are never both nonzero.)
+            // Context-sensitive movement (the default hjkl/arrows).
+            // (move_* are single-axis, so dx and dy are never both
+            // nonzero.) The vertical axis is a view-depth ladder between
+            // the modals, with dead-ends at each end:
+            //   fullview:  left/right step chapters (peeking the bar),
+            //              up → filmstrip quickview, down → nothing (floor)
+            //   quickview: left/right move the selection along the strip,
+            //              down → fullview, up → nothing (ceiling; Esc
+            //              returns to the grid)
+            //   grid:      every direction moves the selection.
             Action::Move { dx, dy } => {
-                if self.fullview && dx != 0 {
-                    self.chapter_step(dx > 0);
-                } else if self.fullview && dy < 0 {
-                    self.to_quickview();
-                } else if self.quickview && !self.fullview && dy > 0 {
-                    self.fullview = true;
+                if self.fullview {
+                    if dx != 0 {
+                        self.chapter_step(dx > 0);
+                    } else if dy < 0 {
+                        self.to_quickview();
+                    }
+                } else if self.quickview {
+                    if dy > 0 {
+                        self.fullview = true;
+                    } else if dy == 0 {
+                        self.move_selection(dx, dy);
+                    }
                 } else {
                     self.move_selection(dx, dy);
                 }
@@ -5940,7 +5949,9 @@ mod tests {
     /// Vertical keys are a view-depth ladder: down dives quickview →
     /// fullview (the strip staying live underneath), up steps fullview →
     /// quickview (bringing the strip up even when fullview was entered
-    /// directly). Other axes still move the selection.
+    /// directly). The ladder's ends are dead-ends: down in fullview and
+    /// up in quickview do nothing (they don't fall through to a selection
+    /// move).
     #[test]
     fn vertical_keys_step_between_quickview_and_fullview() {
         let mut app = Switchblade::with_options(Options {
@@ -5954,9 +5965,23 @@ mod tests {
         // staying true underneath (fullview layers over it).
         app.key(Key::Space);
         assert!(app.quickview && !app.fullview, "space opens quickview");
+        // Up in quickview is a dead-end — no view change, no selection move.
+        app.key(Key::Up);
+        assert!(
+            app.quickview && !app.fullview && app.selected == 0,
+            "up in quickview does nothing"
+        );
         app.key(Key::Down);
         assert!(app.fullview, "down dives into fullview");
         assert!(app.quickview, "quickview stays under fullview");
+
+        // Down in fullview is a dead-end too (the ladder's floor).
+        let sel = app.selected;
+        app.key(Key::Down);
+        assert!(
+            app.fullview && app.selected == sel,
+            "down in fullview does nothing"
+        );
 
         // Up steps back out to the filmstrip quickview.
         app.key(Key::Up);

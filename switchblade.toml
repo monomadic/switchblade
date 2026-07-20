@@ -224,11 +224,13 @@ strip_scroll_selects = true
 # bar down; Esc closes the bar first, then fullview. The bar shares the
 # filmstrip's strip_* tuning above.
 #
-# Vertical keys are a view-depth ladder: in fullview, up (k/↑) steps out
-# to the filmstrip quickview; in quickview, down (j/↓) dives into
-# fullview. Left/right (h/l) in fullview step chapters and briefly reveal
-# the chapter bar for chapter_peek_s seconds (each step refreshes it; a
-# deliberate g open stays up until dismissed). 0 disables the auto-peek.
+# Vertical keys are a view-depth ladder (dead-ends at each end): in
+# fullview, up (k/↑) steps out to the filmstrip quickview and down does
+# nothing; in quickview, down (j/↓) dives into fullview and up does
+# nothing (Esc returns to the grid). Left/right (h/l) in fullview step
+# chapters and briefly reveal the chapter bar for chapter_peek_s seconds
+# (each step refreshes it; a deliberate g open stays up until dismissed).
+# 0 disables the auto-peek.
 chapter_peek_s = 2.5
 
 # ── Startup settings (restart to apply) ─────────────────────────────────
