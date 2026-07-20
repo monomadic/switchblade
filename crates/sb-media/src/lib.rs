@@ -29,9 +29,10 @@ pub struct Recipe {
     pub thumb_h: u32,
     /// ffmpeg -q:v — 2 ≈ visually lossless, 31 = worst.
     pub quality: u8,
-    /// Anim sheets are `anim_grid × anim_grid` crop-filled frames sampled
-    /// evenly across the clip (PLAN.md §6 level 2), packed into one slot.
-    /// Frame resolution = thumb / anim_grid: 3 = more motion, 2 = crisper.
+    /// Anim sheets are `anim_grid × anim_grid` true-aspect frames sampled
+    /// evenly across the clip (PLAN.md §6 level 2), each fit inside a
+    /// thumb/anim_grid cell box, packed into one slot. 3 = more motion,
+    /// 2 = crisper.
     pub anim_grid: u32,
     /// Fraction of the clip's duration the STATIC thumb is extracted at
     /// (0..1). Live playback seeks to the same fraction so it continues
@@ -66,9 +67,12 @@ impl Recipe {
         )
     }
     fn anim_file(&self) -> String {
+        // `_fit`: cells preserve the source aspect (fit into the cell box),
+        // not the legacy 16:9 crop-fill — the suffix regenerates old
+        // cropped sheets rather than serving them.
         let g = self.anim_grid;
         format!(
-            "anim_{g}x{g}_{}x{}_q{}.jpg",
+            "anim_{g}x{g}_{}x{}_q{}_fit.jpg",
             self.thumb_w, self.thumb_h, self.quality
         )
     }
@@ -283,7 +287,7 @@ pub enum ThumbResult {
     Failed {
         path: PathBuf,
     },
-    /// A sprite sheet of ANIM_FRAMES crop-filled frames; `w × h` are the
+    /// A sprite sheet of ANIM_FRAMES true-aspect frames; `w × h` are the
     /// sheet dimensions (frame size = w/ANIM_COLS × h/ANIM_ROWS).
     AnimReady {
         path: PathBuf,
@@ -876,7 +880,8 @@ fn ensure_thumb_file(
 }
 
 /// Generate/serve the animated sprite sheet: ANIM_FRAMES frames sampled
-/// evenly across the clip, crop-filled to 16:9, tiled into one JPEG.
+/// evenly across the clip, each fit to the source's true aspect (no
+/// crop), tiled into one JPEG.
 fn make_anim(
     src: &Path,
     root: &Path,
@@ -904,7 +909,16 @@ fn make_anim(
         let frames = (g * g) as usize;
         let (fw, fh) = recipe.anim_frame();
         let q = recipe.quality.clamp(2, 31).to_string();
-        let vf = format!("scale={fw}:{fh}:force_original_aspect_ratio=increase,crop={fw}:{fh}");
+        // Fit each frame INSIDE the cell box, preserving the source's true
+        // aspect — no crop. (The old `increase,crop` center-cropped every
+        // cell to 16:9 for the removed grid background animation; the
+        // storyboard/chapter consumers then cropped again to display. Both
+        // chops are gone.) All g² frames share the source aspect, so they
+        // share dims and tile cleanly; `force_divisible_by=2` keeps the
+        // mjpeg 4:2:0 encode happy. The sheet's real dims flow out through
+        // `decode_jpeg`, so every consumer sizes cells from them.
+        let vf =
+            format!("scale={fw}:{fh}:force_original_aspect_ratio=decrease:force_divisible_by=2");
 
         // g² individual seeked extracts, then one cheap tile pass over
         // the tiny jpegs. Each extract is a fast keyframe seek plus a
@@ -1913,6 +1927,56 @@ mod tests {
         // sub-second work; a full-decode regression would still pass
         // here, but the per-frame command shape is what this pins.
         assert!(elapsed.as_secs() < 30, "sheet took {elapsed:?}");
+    }
+
+    /// A non-16:9 source must produce true-aspect cells — fit into the
+    /// cell box, NOT center-cropped to 16:9 (the removed grid-animation
+    /// crop that this change undoes). A square source → square cells.
+    #[test]
+    fn anim_sheet_cells_keep_source_aspect() {
+        if !have_binary("ffmpeg") || !have_binary("ffprobe") {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_anim_aspect_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("anim_square.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=4:size=240x240:rate=30")
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+        let root = dir.join("cache");
+        let _ = std::fs::remove_dir_all(&root);
+        let recipe = Recipe {
+            thumb_w: 320,
+            thumb_h: 180,
+            quality: 5,
+            anim_grid: 3,
+            seek_fraction: 0.10,
+        };
+        let (w, h, _) = make_anim(&clip, &root, true, &recipe).expect("sheet generated");
+        // Cell = sheet / grid; a square source must yield ~square cells,
+        // never the 16:9 the crop-fill would have forced.
+        let (cw, ch) = (w as f32 / 3.0, h as f32 / 3.0);
+        let cell_a = cw / ch;
+        assert!(
+            (cell_a - 1.0).abs() < 0.1,
+            "square source should give square cells, got {cw}x{ch} (a={cell_a})"
+        );
     }
 
     /// Dropping a player must release its reader thread even when that
