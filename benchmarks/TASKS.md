@@ -57,29 +57,23 @@ into the apparatus. A scenario states its intent in prose; the runner only measu
 
 ## Phase 0 — definitions & contracts (before any implementation)
 
-- [ ] **0.1 Measurement/event dictionary**: write down every recorded event and
-      timing with precise start/stop points. Latency classes are NOT conflated —
-      at minimum: decoder spawn → first frame ready; user action → first frame
-      *served* by the app; user action → first frame *presented* (Tier B only);
-      warm promotion → queued frame served (a promotion is not a spawn — its
-      decoder may have parked frames long before the action). Every event carries
-      clip ID, lane class, and a lane-generation ID so a late result from an
-      obsolete lane can never be credited to the current action.
-- [ ] **0.2 Scheduler policy extraction**: factor the redraw-scheduling decision
-      (animating → display cadence with `MIN_FRAME` floor; idle → earliest of
-      10Hz tick / `redraw_at` / worker wake) out of `sb-window::about_to_wait`
-      into a small shared, unit-testable component. sb-window adopts it; Tier A
-      reuses it verbatim.
-- [ ] **0.3 Process-per-run orchestration contract**: orchestrator ↔ runner
-      protocol — env prep, scenario handoff, JSONL/summary output paths, exit
-      codes for the validity gate.
-- [ ] **0.4 Readiness semantics**: `wait_until` as a first-class synchronization
-      primitive with timeout + recorded outcome. Named conditions: library count
-      reached, ingest closed, selected stream served a frame, grid settled, cache
-      sweep complete. Scenarios reference fixtures by **name/role**, not raw tile
-      index.
-- [ ] **0.5 Tier A vs Tier B claim boundary doc**: per metric, which tier may
-      support it (see settled decisions).
+Specified in [design/phase-0-contracts.md](design/phase-0-contracts.md). 0.2 is
+implemented; the rest are design contracts consumed by Phase 1–3.
+
+- [x] **0.1 Measurement/event dictionary**: latency taxonomy (decode_spawn_to_ready
+      / action_to_served / action_to_presented[B] / promotion_to_served, kept
+      separate), identity contract (clip_id / lane_class / lane_gen), always-on
+      counters vs. bench-only events, media-emitted re-anchor events. → contracts §0.1
+- [x] **0.2 Scheduler policy extraction**: DONE — factored into
+      [`sb-window::schedule`](../crates/sb-window/src/schedule.rs)
+      (`next_frame` + `IDLE_TICK`/`MIN_FRAME`), `about_to_wait` rewired, 5 unit
+      tests. Tier A drives `frame()` through this, never a fixed cadence. → §0.2
+- [x] **0.3 Process-per-run orchestration contract**: one child process per rep
+      (cache-root `OnceLock`), orchestrator↔runner protocol, exit-code validity. → §0.3
+- [x] **0.4 Readiness semantics**: `wait_until` primitive (named condition +
+      timeout + recorded outcome), the condition table, fixtures by role not index,
+      intent-vs-validity separation. → §0.4
+- [x] **0.5 Tier A vs Tier B claim boundary doc**: per-metric tier ownership. → §0.5
 
 ## Phase 1 — probes (useful standalone)
 
