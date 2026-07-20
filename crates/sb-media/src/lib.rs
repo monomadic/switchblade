@@ -109,7 +109,7 @@ enum Request {
 
 /// Which cached artifact a job produces — the coalescing key (P1.2):
 /// `Thumb` covers both the visible-thumb request and the gen sweep
-/// (identical jpg + meta on disk), `Anim` covers both sheet tiers.
+/// (identical jpg + meta on disk).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Art {
     Thumb,
@@ -127,7 +127,7 @@ struct Owed {
     /// Foreground decode+`Ready`s (visible requests that joined an
     /// in-flight generation).
     thumbs: u32,
-    /// Extra anim results (duplicate sheet requests across tiers).
+    /// Extra anim results (duplicate on-demand sheet requests).
     anims: u32,
 }
 
@@ -137,16 +137,15 @@ struct Owed {
 ///   2. `reprobes`  — meta.json healing for clips the user is playing
 ///      live right now (one cheap ffprobe unblocks the hardware scale
 ///      chain for that clip's next spawn)
-///   3. `anims_now` — the ONE sheet quickview asked for on demand (the
-///      seekbar storyboard): the user is hovering it right now, so it
-///      must not wait behind the sweep — after a thumb-recipe change the
-///      `gen` tier holds the whole library for hours across sessions,
-///      and tier-strict starvation below it silently killed the
-///      storyboard.
+///   3. `anims_now` — the ONE sheet quickview/fullview asked for on
+///      demand (seekbar storyboard, chapter chips): the user is looking
+///      at it right now, so it must not wait behind the sweep — after a
+///      thumb-recipe change the `gen` tier holds the whole library for
+///      hours across sessions, and tier-strict starvation below it
+///      silently killed the storyboard. This is the ONLY sheet tier —
+///      the old library-wide bulk sweep is gone, so sheets exist only
+///      for clips the user actually opened.
 ///   4. `gen`       — background thumb generation for the whole library
-///   5. `anims`     — bulk sprite sheets, always last: every file gets a
-///      thumbnail before library-wide animation work starts, and newly
-///      discovered files (streaming stdin, dir walks) jump ahead too.
 ///
 /// (Live video never queues here at all — it runs in-process; these
 /// workers are niced below it.)
@@ -161,7 +160,6 @@ struct Queues {
     chapters: VecDeque<PathBuf>,
     anims_now: VecDeque<PathBuf>,
     r#gen: VecDeque<PathBuf>,
-    anims: VecDeque<PathBuf>,
     // ── artifact coalescing (P1.2) ──────────────────────────────────
     // Membership mirrors of the four artifact queues (reprobes are
     // self-deduped app-side and cheap): O(1) duplicate checks — the
@@ -169,7 +167,6 @@ struct Queues {
     in_thumbs: std::collections::HashSet<PathBuf>,
     in_gen: std::collections::HashSet<PathBuf>,
     in_anims_now: std::collections::HashSet<PathBuf>,
-    in_anims: std::collections::HashSet<PathBuf>,
     /// Artifacts a worker is generating right now.
     inflight: std::collections::HashSet<(PathBuf, Art)>,
     /// Extra results owed per path when its artifact completes.
@@ -215,29 +212,15 @@ impl Queues {
         }
     }
 
-    /// Quickview's on-demand sheet (tier 3). A bulk-tier entry for the
-    /// same sheet is *promoted* — moved up here — rather than duplicated.
+    /// The on-demand sheet (tier 3). A duplicate request for a sheet
+    /// already queued or generating owes one more result instead of a
+    /// second generation (P1.2).
     fn push_anim_now(&mut self, p: PathBuf) {
-        if self.in_anims.remove(&p) {
-            let i = self.anims.iter().position(|q| q == &p).unwrap();
-            self.anims.remove(i);
-            *self.anim_owed.entry(p.clone()).or_default() += 1;
-        }
         if self.in_anims_now.contains(&p) || self.anim_busy(&p) {
             *self.anim_owed.entry(p).or_default() += 1;
         } else {
             self.in_anims_now.insert(p.clone());
             self.anims_now.push_back(p);
-        }
-    }
-
-    /// Bulk sheet request (tier 5).
-    fn push_anim(&mut self, p: PathBuf) {
-        if self.in_anims_now.contains(&p) || self.in_anims.contains(&p) || self.anim_busy(&p) {
-            *self.anim_owed.entry(p).or_default() += 1;
-        } else {
-            self.in_anims.insert(p.clone());
-            self.anims.push_back(p);
         }
     }
 
@@ -262,11 +245,6 @@ impl Queues {
             self.in_gen.remove(&p);
             self.inflight.insert((p.clone(), Art::Thumb));
             return Some(Request::Gen(p));
-        }
-        if let Some(p) = self.anims.pop_front() {
-            self.in_anims.remove(&p);
-            self.inflight.insert((p.clone(), Art::Anim));
-            return Some(Request::Anim(p));
         }
         None
     }
@@ -419,15 +397,11 @@ impl MediaService {
         cv.notify_one();
     }
 
-    pub fn request_anim(&self, path: PathBuf) {
-        let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().push_anim(path);
-        cv.notify_one();
-    }
-
-    /// Queue one sheet ahead of the background sweep — for quickview's
-    /// storyboard, where the user is hovering the seekbar right now.
-    /// Bulk sheet generation must keep using `request_anim`.
+    /// Queue one clip's anim sheet, above the background gen sweep — the
+    /// only way sheets are made: quickview/fullview request the selected
+    /// clip's sheet on demand (seekbar storyboard, chapter chips). There
+    /// is deliberately no library-wide sheet sweep — clips the user never
+    /// opens never pay for one.
     pub fn request_anim_now(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
         lock.lock().unwrap().push_anim_now(path);
@@ -1544,7 +1518,6 @@ mod tests {
     #[test]
     fn quickview_sheet_outranks_gen_sweep_but_not_visible_thumbs() {
         let mut q = Queues::default();
-        q.anims.push_back("bulk-sheet".into());
         q.r#gen.push_back("sweep".into());
         q.anims_now.push_back("storyboard".into());
         q.chapters.push_back("chapter-probe".into());
@@ -1570,7 +1543,6 @@ mod tests {
                 "chapters:chapter-probe",
                 "anim:storyboard",
                 "gen:sweep",
-                "anim:bulk-sheet",
             ]
         );
     }
@@ -1770,23 +1742,19 @@ mod tests {
         assert_eq!(q.complete(&p, Art::Thumb).gens, 1);
     }
 
-    /// A quickview sheet request promotes the bulk tier's queued entry
-    /// for the same sheet — it moves ABOVE gen instead of duplicating,
-    /// and the bulk request's result is owed (P1.2).
+    /// Duplicate on-demand sheet requests (a D swap re-requests while
+    /// the first job is in flight) coalesce to one generation that owes
+    /// the extra results (P1.2).
     #[test]
-    fn quickview_sheet_promotes_queued_bulk_anim() {
+    fn duplicate_sheet_requests_coalesce() {
         let mut q = Queues::default();
         let p = PathBuf::from("sheet.mp4");
-        q.push_anim(p.clone()); // bulk tier (below gen)
-        q.push_gen(PathBuf::from("other.mp4"));
-        q.push_anim_now(p.clone()); // quickview promotes it
-        let Some(Request::Anim(popped)) = q.pop() else {
-            panic!("promoted sheet must outrank the gen sweep");
-        };
-        assert_eq!(popped, p);
-        assert_eq!(q.complete(&p, Art::Anim).anims, 1, "bulk result owed");
-        assert!(matches!(q.pop(), Some(Request::Gen(_))));
-        assert!(q.pop().is_none(), "bulk entry must not run again");
+        q.push_anim_now(p.clone());
+        q.push_anim_now(p.clone()); // queued duplicate merges
+        assert!(matches!(q.pop(), Some(Request::Anim(_)))); // worker took it
+        q.push_anim_now(p.clone()); // in-flight duplicate merges too
+        assert!(q.pop().is_none(), "one generation, no duplicates");
+        assert_eq!(q.complete(&p, Art::Anim).anims, 2, "merged results owed");
     }
 
     /// The thumb seek fraction is part of the artifact name so a changed

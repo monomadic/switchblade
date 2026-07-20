@@ -126,7 +126,10 @@ The first real media milestone.
 Initial policies: first frame, N% into clip; maybe later a scene-ish frame.
 
 ### Level 2: animated thumbnails *(MVP v2 — after selected preview)*
-This is the "alive grid" feature, deliberately deferred: the grid's fluid motion is the priority, and it must feel great with static tiles first.
+
+> **REMOVED (2026-07-20, user decision):** grid sheet-cycling shipped (M6, animation level `full`) and was then cut — it didn't look good and its library-wide background sheet sweep competed with the thumb sweep and live playback for CPU. The sprite-sheet *artifact* survives as on-demand storyboard data only: quickview/fullview request the selected clip's sheet when opened (seekbar hover previews, chapter-bar chips), gated behind the playing stream's first frame, and clips never opened never generate one. The freed workers finish the static-thumb sweep sooner. Level `full`, the `a` toggle, and the bulk `anims` queue tier are gone ("full" still parses as `normal`). Don't re-add a library-wide sheet sweep without the user.
+
+This was the "alive grid" feature, deliberately deferred: the grid's fluid motion is the priority, and it must feel great with static tiles first.
 
 Animated thumbnails are **cached preview strips or small sidecar previews, not live decoders per tile**.
 
@@ -465,7 +468,7 @@ Sequence:
 ### M8 — Quickview scrub *(MVP v2)* ✅ *feature-complete (2026-07)*
 Pointer-driven seeking + filmstrip feel in the quickview modal; seeking hits **only the quickview main video** (grid never seeks). Every live lane rides the in-process `SeekablePlayer` (§15). Shipped:
 - **Seekbar** — pointer motion over the video reveals a slim bar (shares the `[`/`]` skip flash's drawing), fades after `seekbar_hide_s`; thickens under the pointer. Click seeks; hold-drag scrubs two-phase like mpv — keyframe seeks while dragging (9–30ms), one exact seek on release (GOP-bound, hidden behind the shown keyframe frame). *(`seekbar_click_and_drag_scrubs_the_stream`)*
-- **Storyboard hover thumbs (phase 1)** — hovering the bar draws the anim-sheet cell nearest that timestamp; quickview requests the selected clip's sheet on demand at any animation level (grid only makes sheets at `full`, and the storyboard shouldn't depend on that).
+- **Storyboard hover thumbs (phase 1)** — hovering the bar draws the anim-sheet cell nearest that timestamp; quickview requests the selected clip's sheet on demand (since 2026-07-20 this on-demand path is the ONLY sheet generation — see the Level 2 removal note).
 - **Filmstrip** — chips hover-play instantly (settle delay dropped in quickview); wheel/trackpad scrubs the strip and commits selection to the nearest chip while the backdrop grid stays put. *(`filmstrip_scroll_commits_selection`)*
 - Tuning: `seekbar_hide_s/fade_ms/height/hover_height/thumb_width`, `strip_scroll_sensitivity`.
 

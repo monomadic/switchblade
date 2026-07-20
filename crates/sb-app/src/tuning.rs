@@ -8,16 +8,18 @@ use crate::commands::{CommandSpec, KeyMap};
 use sb_media::CacheKey;
 
 /// How much moves. Each level includes everything below it:
-/// `none` = snap-everything, no tweens, no video, no sheets;
+/// `none` = snap-everything, no tweens, no video;
 /// `minimal` = UI tweens back on; `normal` (default) = live video for
-/// quickview + selected/hovered; `full` = background sheet animation too.
+/// quickview + selected/hovered. The old `full` level (background
+/// sprite-sheet cycling in the grid) is gone — "full" stays accepted as
+/// an alias of `normal` so existing configs keep working.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AnimLevel {
     None,
     Minimal,
+    #[serde(alias = "full")]
     Normal,
-    Full,
 }
 
 impl AnimLevel {
@@ -29,16 +31,11 @@ impl AnimLevel {
     pub fn live(self) -> bool {
         self >= AnimLevel::Normal
     }
-    /// Background sprite-sheet cycling in the grid.
-    pub fn sheets(self) -> bool {
-        self == AnimLevel::Full
-    }
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "none" => AnimLevel::None,
             "minimal" => AnimLevel::Minimal,
-            "normal" => AnimLevel::Normal,
-            "full" => AnimLevel::Full,
+            "normal" | "full" => AnimLevel::Normal,
             _ => return None,
         })
     }
@@ -275,14 +272,6 @@ pub struct Tuning {
     pub quickview_blur: f32,
     /// Fade-in duration when quickview opens (dim + blur + the modal).
     pub quickview_fade_ms: f32,
-    /// Seconds for one full pass through an anim sheet's frames.
-    pub anim_cycle_s: f32,
-    /// Portion (0..1) of each frame interval spent crossfading into the
-    /// next frame; 0 = hard cuts.
-    pub anim_crossfade: f32,
-    /// Don't animate (or generate sheets) below this tile width — motion
-    /// is invisible on tiny tiles and slots are better spent on statics.
-    pub anim_min_tile_w: f32,
     /// Longest-to-shortest side cap for the selected/hovered tile's shape;
     /// clips beyond it get a centered pan-and-scan crop. 1.78 ≈ 16:9.
     pub max_display_aspect: f32,
@@ -366,9 +355,6 @@ impl Default for Tuning {
             quickview_dim: 0.90,
             quickview_blur: 3.0,
             quickview_fade_ms: 150.0,
-            anim_cycle_s: 2.8,
-            anim_crossfade: 0.35,
-            anim_min_tile_w: 140.0,
             max_display_aspect: 1.5,
             selection_border: [0.0, 0.0, 0.0],
             hover_border: [1.0, 1.0, 1.0],

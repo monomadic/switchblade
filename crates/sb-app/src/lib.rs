@@ -344,8 +344,6 @@ pub struct Switchblade {
     demo: bool,
     /// CLI `--animation` override; beats the config's level when set.
     cli_animation: Option<AnimLevel>,
-    /// Runtime sheet toggle (`a` key), ANDed with the level's sheets().
-    anim_on: bool,
     /// Window focus state + the runtime toggle for pause-when-unfocused.
     focused: bool,
     focus_pause_on: bool,
@@ -433,8 +431,6 @@ pub struct Switchblade {
     t0: Instant,
     /// Springs still in flight this frame (drives idle throttling).
     motion: bool,
-    /// An anim-sheet frame was drawn this frame (grid is visibly cycling).
-    anim_rendered: bool,
     /// Stay awake at least until this instant (input, fades, fresh uploads).
     wake_until: Instant,
     /// Render-loop wake handle; worker threads fire it (via `notify`)
@@ -479,7 +475,6 @@ struct RedrawStats {
     frames: u32,
     idle: u32,
     motion: u32,
-    sheets: u32,
     transition: u32,
     live: u32,
     timer: u32,
@@ -498,7 +493,6 @@ impl RedrawStats {
             frames: 0,
             idle: 0,
             motion: 0,
-            sheets: 0,
             transition: 0,
             live: 0,
             timer: 0,
@@ -512,33 +506,22 @@ impl RedrawStats {
         self.slots_demand = self.slots_demand.max(demand);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn record(
-        &mut self,
-        motion: bool,
-        sheets: bool,
-        transition: bool,
-        live: bool,
-        timer: bool,
-        animating: bool,
-    ) {
+    fn record(&mut self, motion: bool, transition: bool, live: bool, timer: bool, animating: bool) {
         if !log::log_enabled!(log::Level::Debug) {
             return;
         }
         self.frames += 1;
         self.idle += u32::from(!animating);
         self.motion += u32::from(motion);
-        self.sheets += u32::from(sheets);
         self.transition += u32::from(transition);
         self.live += u32::from(live);
         self.timer += u32::from(timer);
         if self.at.elapsed() >= Duration::from_secs(1) {
             log::debug!(
-                "redraw: {} frames/s ({} idle; causes: motion {} sheets {} transition {} live {} timer {}); atlas slots used {} / zone demand {}",
+                "redraw: {} frames/s ({} idle; causes: motion {} transition {} live {} timer {}); atlas slots used {} / zone demand {}",
                 self.frames,
                 self.idle,
                 self.motion,
-                self.sheets,
                 self.transition,
                 self.live,
                 self.timer,
@@ -662,7 +645,6 @@ impl Switchblade {
             hover_changed_at: Instant::now(),
             demo,
             cli_animation: opts.animation,
-            anim_on: true,
             focused: true,
             focus_pause_on: true,
             anim_grid: recipe.anim_grid,
@@ -703,7 +685,6 @@ impl Switchblade {
             transition: None,
             t0: Instant::now(),
             motion: true,
-            anim_rendered: false,
             wake_until: Instant::now() + Duration::from_secs(1),
             waker,
             notify,
@@ -1276,13 +1257,6 @@ impl Switchblade {
             Action::ZoomIn => self.set_zoom(self.zoom_target * 1.15),
             Action::ZoomOut => self.set_zoom(self.zoom_target / 1.15),
             Action::ZoomReset => self.set_zoom(1.0),
-            Action::ToggleAnim => {
-                self.anim_on = !self.anim_on;
-                log::info!(
-                    "background animation {}",
-                    if self.anim_on { "on" } else { "off" }
-                );
-            }
             Action::ToggleFocusPause => {
                 self.focus_pause_on = !self.focus_pause_on;
                 log::info!(
@@ -2019,12 +1993,6 @@ impl Switchblade {
         self.cli_animation.unwrap_or(self.tuning.animation)
     }
 
-    /// Sprite sheets cycle (and generate) only at level `full`, further
-    /// gated by the runtime `a` toggle.
-    fn sheets_on(&self) -> bool {
-        self.level().sheets() && self.anim_on
-    }
-
     /// Keep the render loop awake for at least `secs` (covers fades and
     /// settle timers that plain spring-residual checks can't see).
     fn wake(&mut self, secs: f32) {
@@ -2299,18 +2267,64 @@ impl Switchblade {
 
     /// Displayed aspect (w/h) of clip `i`: the thumbnail's true aspect
     /// (fit-scaled, rotation already applied), clamped so a pathological
-    /// source stays browsable; 16:9 until the thumb lands. Sizes both
+    /// source stays browsable; 16:9 until the shape is known. Sizes both
     /// strip chips and the flexible grid's tiles — fixed height, width
-    /// varies, portrait clips are narrower, never taller. Reads the
-    /// session-persistent `Clip.aspect` (with the resident thumb as a
-    /// fallback) so atlas eviction never reshapes anything.
+    /// varies, portrait clips are narrower, never taller. Sources, in
+    /// order: the resident thumb, the session-persistent `Clip.aspect`
+    /// (so atlas eviction never reshapes anything), then the memoized
+    /// probe meta — the chapter bar images its chips from the anim sheet,
+    /// which is crop-filled to 16:9 and can't reveal the true shape, so a
+    /// clip reached without its static thumb atlas-resident (jumped to via
+    /// random/shuffle, or the bar opened before the thumb landed) relies
+    /// on the meta's real dims to avoid a 16:9 default.
     fn chip_aspect(&self, i: usize) -> f32 {
         let c = self.clips.get(i);
         let a = match c.map(|c| &c.thumb) {
             Some(&Thumb::Ready { tw, th, .. }) => tw as f32 / (th as f32).max(1.0),
-            _ => c.and_then(|c| c.aspect).unwrap_or(16.0 / 9.0),
+            _ => c
+                .and_then(|c| c.aspect)
+                .or_else(|| c.and_then(|c| self.meta_aspect(&c.path)))
+                .unwrap_or(16.0 / 9.0),
         };
         a.clamp(9.0 / 16.0, 2.4)
+    }
+
+    /// Displayed aspect (w/h) from the memoized probe meta, rotation
+    /// applied (±90/±270 swap the coded dims): the shape a generated
+    /// thumb's `meta.json` records. Memory-only (`meta_cache`), so safe on
+    /// the render thread; `None` until a spawn has read the clip's meta.
+    fn meta_aspect(&self, path: &std::path::Path) -> Option<f32> {
+        let m = self.meta_cache.get(path)?;
+        Self::meta_aspect_of(m)
+    }
+
+    /// Rotation-aware displayed aspect of a probe meta, `None` unless both
+    /// coded dims are present.
+    fn meta_aspect_of(m: &sb_media::Meta) -> Option<f32> {
+        let (w, h) = (m.width? as f32, m.height? as f32);
+        // ±90/±270 (rotation may be signed) swap the coded dims.
+        let quarter = m.rotation.is_some_and(|r| (r / 90.0).round() as i64 % 2 != 0);
+        let (w, h) = if quarter { (h, w) } else { (w, h) };
+        (h > 0.0).then(|| w / h)
+    }
+
+    /// Pin `Clip.aspect` for the selected clip from its probe meta when the
+    /// thumb never set it (off-screen jump target). One memoized read —
+    /// after it lands, `aspect.is_some()` short-circuits every later call.
+    fn resolve_selected_aspect(&mut self) {
+        let Some(c) = self.clips.get(self.selected) else {
+            return;
+        };
+        if c.aspect.is_some() {
+            return;
+        }
+        let path = c.path.clone();
+        if let Some(a) = self.clip_meta(&path).as_ref().and_then(Self::meta_aspect_of) {
+            self.clips[self.selected].aspect = Some(a);
+            // A newly-known aspect reshapes the flexible grid; the key
+            // can't see it, so bump the revision (like the thumb arm).
+            self.grid_rev = self.grid_rev.wrapping_add(1);
+        }
     }
 
     /// Visible filmstrip chips around fractional position `pos`:
@@ -2400,9 +2414,9 @@ impl Switchblade {
     }
 
     /// Queue thumbnail generation for visible + nearby tiles, center-out,
-    /// within the atlas slot budget: statics claim budget first, anim
-    /// sheets get what's left. Without the budget, a big viewport demands
-    /// more slots than exist and eviction churns everything forever.
+    /// within the atlas slot budget. Without the budget, a big viewport
+    /// demands more slots than exist and eviction churns everything
+    /// forever.
     fn request_visible_thumbs(&mut self, lay: &Layout) {
         if self.demo {
             return;
@@ -2430,42 +2444,17 @@ impl Switchblade {
             }
         }
 
-        if !self.sheets_on() || lay.tile_w < self.tuning.anim_min_tile_w {
-            return;
-        }
-        'anims: for &row in &rows {
-            for i in self.row_range(lay, row) {
-                let Some(clip) = self.clips.get_mut(i) else {
-                    break;
-                };
-                if !clip.readable || matches!(clip.anim, Thumb::Failed) {
-                    continue;
-                }
-                if budget <= 0 {
-                    break 'anims;
-                }
-                match clip.anim {
-                    Thumb::Ready { .. } | Thumb::Pending => budget -= 1,
-                    Thumb::None if matches!(clip.thumb, Thumb::Ready { .. }) => {
-                        budget -= 1;
-                        self.media.request_anim(clip.path.clone());
-                        clip.anim = Thumb::Pending;
-                        self.jobs_total += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 
-    /// The seekbar's storyboard preview samples the anim sheet, which the
-    /// grid only generates at animation level `full` — so quickview
-    /// requests the selected clip's sheet on demand (g² cheap seeked
-    /// extracts, disk-cached) at any level. One clip at a time, never
-    /// library-wide (PLAN.md §14 M8). `request_anim_now`, not
-    /// `request_anim`: the bulk-sheet tier sits below the library gen
-    /// sweep, which can back up for hours after a recipe change — the
-    /// user hovering the seekbar can't wait behind that.
+    /// The ONLY place anim sheets are requested: quickview/fullview ask
+    /// for the selected clip's sheet on demand (g² cheap seeked extracts,
+    /// disk-cached) — the seekbar's storyboard preview and the chapter
+    /// bar's chips sample it. One clip at a time, never library-wide
+    /// (the old bulk sweep is gone: clips the user never opens never pay
+    /// for a sheet, and the freed workers finish the thumb sweep sooner).
+    /// `request_anim_now` runs above the gen sweep, which can back up
+    /// for hours after a recipe change — the user hovering the seekbar
+    /// can't wait behind that.
     fn request_quickview_sheet(&mut self) {
         // Fullview wants the sheet too — the chapter bar's chips sample
         // it, and requesting on fullview ENTRY (not bar-open) means the
@@ -3158,7 +3147,6 @@ impl Switchblade {
         let now = Instant::now();
         let anim_t = now.saturating_duration_since(self.t0).as_secs_f32();
         let skip_bar = self.skip_bar();
-        self.anim_rendered = false;
         let mut tiles = Vec::new();
         // Z-order: grid tiles, then the hovered tile lifted above its
         // neighbors, then the selected tile on top of everything.
@@ -3168,11 +3156,9 @@ impl Switchblade {
         // Modal views freeze the world behind them: the backdrop is a
         // STATIC snapshot of the grid from the moment the modal opened
         // (quickview blurs it; fullview covers it entirely, so it draws
-        // NOTHING), and none of the per-tile work below — dots, sheet
-        // frames, skip bars — runs while one is up. One of the bigger
-        // playback levers: cycling sheets behind the frost kept the loop
-        // at display rate for as long as quickview stayed open. A resize
-        // invalidates the snapshot (it stores window positions).
+        // NOTHING), and none of the per-tile work below — dots, skip
+        // bars — runs while one is up. A resize invalidates the snapshot
+        // (it stores window positions).
         let modal = self.quickview || self.fullview;
         if !modal
             || self
@@ -3218,7 +3204,6 @@ impl Switchblade {
 
                     let selected = i == self.selected;
                     let hovered = Some(i) == self.hovered;
-                    let emphasized = selected || hovered;
                     // The tile the hires lane belongs to: the selection in
                     // classic mode, wherever attention points otherwise.
                     let attn_tile = self.attention_target() == Some(i);
@@ -3296,28 +3281,11 @@ impl Switchblade {
                     let cx = tx + tw_g * 0.5;
                     let cy = ty - self.scroll + th_g * 0.5;
 
-                    // Texture source: in the grid, a cycling anim-sheet frame
-                    // once available (M6); the static thumb otherwise.
-                    // Emphasized tiles never use the sheet: its tiny 16:9
-                    // crop-fill frames zoom horribly when the tile morphs to
-                    // true aspect, and live video (seek-matched to the static
-                    // thumb's frame) would land on different content. The
-                    // emphasis morph itself keeps the tile alive until then.
-                    let anim_allowed = self.sheets_on() && !emphasized && !self.paused();
-                    let anim = if anim_allowed {
-                        match clip.anim {
-                            Thumb::Ready { slot, at, tw, th } => {
-                                Some((slot, at, tw as f32, th as f32))
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-
+                    // Texture source: live hires when the tile is playing,
+                    // the static thumb otherwise. Grid tiles never cycle
+                    // anim-sheet frames — sheets exist only as quickview/
+                    // fullview storyboard data now.
                     let mut mix = tex_mix;
-                    let mut uv2 = [0.0; 4];
-                    let mut frame_fade = 0.0;
                     let mut tile_hires = false;
                     let uv = if let Some((lw, lh)) = live_hires {
                         // Crop the hires video frame to the tile's current
@@ -3339,57 +3307,6 @@ impl Switchblade {
                             (cw - 1.0).max(0.0) / hw,
                             (ch - 1.0).max(0.0) / hh,
                         ]
-                    } else if let Some((slot, at, sw, sh)) = anim {
-                        self.anim_rendered = true;
-                        let cols = self.anim_grid as usize;
-                        let frames = (cols * cols) as f32;
-                        let (fw, fh) = (sw / cols as f32, sh / cols as f32);
-                        // Per-clip phase offset so neighbors don't tick in
-                        // lockstep.
-                        let phase = (i % (cols * cols)) as f32 / frames;
-                        let pos = (anim_t / t.anim_cycle_s.max(0.2) + phase).fract() * frames;
-                        let k = (pos as usize).min(cols * cols - 1);
-
-                        let target_a = w / h.max(1.0);
-                        let (mut cw, mut ch) = (fw, fh);
-                        if fw / fh > target_a {
-                            cw = fh * target_a;
-                        } else {
-                            ch = fw / target_a;
-                        }
-                        let (ox, oy) = ((fw - cw) * 0.5, (fh - ch) * 0.5);
-                        let frame_uv = |kk: usize| {
-                            self.atlas_cfg.uv(
-                                slot,
-                                (kk % cols) as f32 * fw + ox,
-                                (kk / cols) as f32 * fh + oy,
-                                cw,
-                                ch,
-                            )
-                        };
-                        // Crossfade the tail of each frame interval into the
-                        // next frame (blended in the shader — two texture taps).
-                        let win = t.anim_crossfade.clamp(0.0, 1.0);
-                        if win > 0.0 {
-                            let ff = pos - k as f32;
-                            let f = ((ff - (1.0 - win)) / win).clamp(0.0, 1.0);
-                            frame_fade = f * f * (3.0 - 2.0 * f);
-                            uv2 = frame_uv((k + 1) % (cols * cols));
-                        }
-                        let anim_fade = {
-                            let m = (now.saturating_duration_since(at).as_secs_f32()
-                                / THUMB_FADE_S)
-                                .min(1.0);
-                            1.0 - (1.0 - m) * (1.0 - m)
-                        };
-                        // If the static thumb is already showing, swap without
-                        // re-fading (no dip to background).
-                        mix = if thumb.is_some() {
-                            mix.max(anim_fade)
-                        } else {
-                            anim_fade
-                        };
-                        frame_uv(k)
                     } else {
                         // UV window into the static thumb, cropped to the tile's
                         // current shape — the shape morphs with the emphasis
@@ -3464,8 +3381,8 @@ impl Switchblade {
                         corner_radius: radius * s,
                         border_width,
                         uv,
-                        uv2,
-                        frame_fade,
+                        uv2: [0.0; 4],
+                        frame_fade: 0.0,
                         tex_mix: mix,
                         hires: tile_hires,
                         pie: 0.0,
@@ -4369,6 +4286,14 @@ impl App for Switchblade {
                 self.chapter_probe.insert(path.clone(), None);
                 self.media.request_chapters(path);
             }
+            // The chapter bar takes the played clip's true aspect. If its
+            // static thumb never went atlas-resident (jumped here via
+            // random/shuffle) `Clip.aspect` is still None, so resolve it
+            // from the probe meta once — a one-off memoized read, so the
+            // bar opens with the right chip shape instead of a 16:9
+            // default. Levels without live video (no spawn to seed
+            // `meta_cache`) read it straight off disk here.
+            self.resolve_selected_aspect();
         }
         self.tick_auto_skip();
         self.step(dt);
@@ -4382,26 +4307,22 @@ impl App for Switchblade {
         frame.uploads = uploads;
         frame.hires_upload = self.hires_frame.take();
         // Idle throttling: with nothing VISUALLY in motion — springs
-        // settled, no sheets cycling, no live video, no fade in flight —
-        // the loop drops to a slow tick. Pending background jobs and an
-        // open ingest producer deliberately do NOT keep the loop hot
-        // (P0.2): their worker threads fire `waker` per delivery, so each
-        // completion repaints once, and the idle tick still services them
-        // at 10Hz as a safety net.
+        // settled, no live video, no fade in flight — the loop drops to
+        // a slow tick. Pending background jobs and an open ingest
+        // producer deliberately do NOT keep the loop hot (P0.2): their
+        // worker threads fire `waker` per delivery, so each completion
+        // repaints once, and the idle tick still services them at 10Hz
+        // as a safety net.
         if log::log_enabled!(log::Level::Debug) {
             // Atlas sizing evidence (P0.1/P0.5): actual occupancy vs the
-            // zone's demand — a static per in-zone clip, an anim sheet
-            // only when sheets actually cycle (animation level `full` +
-            // the `a` toggle), plus the live/hover lanes.
+            // zone's demand — a static per in-zone clip, plus the
+            // live/hover lanes.
             let used = self.slots.iter().filter(|s| s.is_some()).count();
             let (first, last) = self.visible_rows(&lay, PREFETCH_ROWS);
-            let per_clip = 1 + usize::from(self.sheets_on());
-            let demand =
-                ((last - first + 1) * lay.cols * per_clip).min(self.clips.len() * per_clip) + 2;
+            let demand = ((last - first + 1) * lay.cols).min(self.clips.len()) + 2;
             self.redraw_stats.slots(used, demand);
         }
         let motion = self.motion;
-        let sheets = self.anim_rendered;
         let transition = self.transition.is_some();
         let timer = Instant::now() < self.wake_until;
         // Live video no longer forces display-rate redraws (P1.4): with
@@ -4421,10 +4342,9 @@ impl App for Switchblade {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        frame.animating = motion || sheets || transition || timer;
+        frame.animating = motion || transition || timer;
         self.redraw_stats.record(
             motion,
-            sheets,
             transition,
             frame.redraw_at.is_some(),
             timer,
@@ -6118,6 +6038,96 @@ mod tests {
         assert!(
             (app.chapter_chip_w() - ch * 16.0 / 9.0).abs() < 0.5,
             "…and a 16:9 clip's shape"
+        );
+    }
+
+    /// A clip reached without its static thumb atlas-resident (jumped to
+    /// via random/shuffle, or the chapter bar opened before the thumb
+    /// landed) still gets its true shape: `chip_aspect` falls back to the
+    /// probe meta (rotation applied), and fullview pins `Clip.aspect` so
+    /// the chapter bar never shows a 16:9-default rectangle for a
+    /// portrait clip.
+    #[test]
+    fn chapter_chip_aspect_falls_back_to_meta() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let (_, ch, _) = app.strip_geom();
+        // Clip 0: no atlas thumb, no persisted aspect — exactly the
+        // off-screen jump target the bug hit.
+        app.clips[0].thumb = Thumb::None;
+        app.clips[0].aspect = None;
+        let path = app.clips[0].path.clone();
+        let portrait = sb_media::Meta {
+            src: path.clone(),
+            duration: Some(120.0),
+            width: Some(1080),
+            height: Some(1920),
+            codec: Some("h264".into()),
+            fps: Some(30.0),
+            rotation: None,
+            pix_fmt: Some("yuv420p".into()),
+        };
+        app.meta_cache.insert(path.clone(), portrait.clone());
+
+        // Without the fallback this returned the 16:9 default; now it
+        // reads the meta's true portrait shape.
+        app.selected = 0;
+        assert!(
+            (app.chip_aspect(0) - 9.0 / 16.0).abs() < 0.01,
+            "meta fallback gives the portrait shape, got {}",
+            app.chip_aspect(0)
+        );
+        assert!(
+            (app.chapter_chip_w() - ch * 9.0 / 16.0).abs() < 0.5,
+            "chapter chips take the portrait shape from meta"
+        );
+
+        // A 90° rotation swaps the coded landscape dims to a portrait
+        // display shape.
+        let rotated = sb_media::Meta {
+            width: Some(1920),
+            height: Some(1080),
+            rotation: Some(90.0),
+            ..portrait.clone()
+        };
+        assert!(
+            (Switchblade::meta_aspect_of(&rotated).unwrap() - 9.0 / 16.0).abs() < 0.01,
+            "±90° rotation swaps to a portrait display aspect"
+        );
+        let neg = sb_media::Meta {
+            rotation: Some(-90.0),
+            ..rotated.clone()
+        };
+        assert!(
+            (Switchblade::meta_aspect_of(&neg).unwrap() - 9.0 / 16.0).abs() < 0.01,
+            "signed rotation also swaps"
+        );
+        let half = sb_media::Meta {
+            rotation: Some(180.0),
+            ..rotated.clone()
+        };
+        assert!(
+            (Switchblade::meta_aspect_of(&half).unwrap() - 16.0 / 9.0).abs() < 0.01,
+            "180° keeps the landscape shape"
+        );
+
+        // Fullview pins the aspect onto the clip (one resolve), so it
+        // survives even after the meta memo is cleared.
+        app.fullview = true;
+        app.resolve_selected_aspect();
+        assert_eq!(
+            app.clips[0].aspect,
+            Some(1080.0 / 1920.0),
+            "fullview pins Clip.aspect from meta"
+        );
+        app.meta_cache.clear();
+        assert!(
+            (app.chip_aspect(0) - 9.0 / 16.0).abs() < 0.01,
+            "pinned aspect outlives the meta memo"
         );
     }
 

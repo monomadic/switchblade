@@ -16,7 +16,6 @@ KEYS (defaults; remappable via [keys]/[commands] in ./switchblade.toml):
     Space           quickview: in-app preview (Esc closes, arrows browse)
     c               copy path
     r               reveal in Finder
-    a               toggle animated thumbnails
     p               toggle pause-when-unfocused
     - / = / 0       zoom out / in / reset (also trackpad pinch)
     f               fullscreen
@@ -32,12 +31,11 @@ CONFIG:
     ~/.config/switchblade.toml.
 
 OPTIONS:
-    --animation <none|minimal|normal|full>
+    --animation <none|minimal|normal>
                     how much moves (overrides the config's `animation`):
-                    none = snap everything, no video, no sheets;
-                    minimal = UI tweens only; normal = + live video for
-                    quickview/selected/hovered; full = + background
-                    sheet animation
+                    none = snap everything, no video; minimal = UI tweens
+                    only; normal = + live video for quickview/selected/
+                    hovered ('full' is a legacy alias of normal)
     --no-anim       legacy alias for --animation normal
     --fullscreen    start fullscreen (macOS native: own Space + animation)
     --fast-fullscreen
@@ -79,7 +77,7 @@ fn main() -> anyhow::Result<()> {
                 match level {
                     Some(l) => opts.animation = Some(l),
                     None => {
-                        eprintln!("switchblade: --animation takes none|minimal|normal|full\n");
+                        eprintln!("switchblade: --animation takes none|minimal|normal\n");
                         std::process::exit(2);
                     }
                 }
@@ -88,7 +86,7 @@ fn main() -> anyhow::Result<()> {
                 match sb_app::AnimLevel::parse(&eq["--animation=".len()..]) {
                     Some(l) => opts.animation = Some(l),
                     None => {
-                        eprintln!("switchblade: --animation takes none|minimal|normal|full\n");
+                        eprintln!("switchblade: --animation takes none|minimal|normal\n");
                         std::process::exit(2);
                     }
                 }

@@ -86,11 +86,11 @@ zoom_fade_ms = 180.0
 
 # ── Animation & live video ──────────────────────────────────────────────
 # How much moves — each level includes everything below it:
-#   none     snap everything: no tweens, no live video, no sheets
+#   none     snap everything: no tweens, no live video
 #   minimal  UI tweens back on; still no video
 #   normal   + live video (quickview, selected + hovered tiles)  [default]
-#   full     + animated thumbnails in the grid (sprite sheets)
-# The --animation CLI flag overrides this; 'a' still toggles sheets at full.
+# The --animation CLI flag overrides this. ("full" — the old grid
+# sprite-sheet cycling — is gone; the name still parses as "normal".)
 animation = "normal"
 
 # Live playback starts only after the selection has settled this long,
@@ -150,19 +150,9 @@ jobs_bar_width = 84.0
 jobs_bar_height = 4.0
 jobs_bar_opacity = 0.8
 
-# Pause live playback + sheet animation while the window is unfocused
-# (the grid stays visible, just still — big CPU saver). Toggle at
-# runtime with 'p'.
+# Pause live playback while the window is unfocused (the grid stays
+# visible, just still — big CPU saver). Toggle at runtime with 'p'.
 pause_unfocused = true
-
-# Animated thumbnails (only at animation = "full"): each clip's sheet
-# cycles once per anim_cycle_s, crossfading for anim_crossfade of each
-# frame interval (0 = hard cuts, 1 = always blending). Tiles narrower
-# than anim_min_tile_w stay static. Sheets generate strictly AFTER every
-# file has a plain thumbnail.
-anim_cycle_s = 10.8
-anim_crossfade = 1.0
-anim_min_tile_w = 140.0
 
 # ── Quickview (Space) ───────────────────────────────────────────────────
 # The backdrop: black dim strength (0..1) and frosted-glass blur level —
@@ -255,8 +245,10 @@ thumb_width = 768
 thumb_height = 432
 thumb_quality = 8
 
-# Anim sheet grid: frames = grid², frame size = thumb/grid.
-# 3 = 9 smaller frames (more motion), 2 = 4 crisper frames.
+# Storyboard sheet grid (the seekbar-hover preview + chapter chips):
+# frames = grid², frame size = thumb/grid. 3 = 9 frames, 2 = 4 crisper
+# frames. Sheets only generate on demand, when quickview or fullview
+# opens on a clip — never library-wide.
 anim_grid = 3
 
 # How cached thumbnails are tied to source files (startup-only):
@@ -283,11 +275,11 @@ cache_key = "size_mtime"
 #
 # Sized from measurement (2026-07-16, M3, ~400-clip library): at minimum
 # zoom the whole library sits in the visible+prefetch zone, wanting ~390
-# slots with sheets off (animation level "normal") and ~770 with sheets
-# cycling ("full") — so 777 is the measured sheets-on worst case, not
-# headroom. Startup logs the byte estimate ("gpu residency: ..."); the
-# debug redraw line reports live "slots used / zone demand" if you want
-# to re-measure for your own library/display before shrinking this.
+# slots (one static thumb per in-zone clip; on-demand storyboard sheets
+# add a handful more). Startup logs the byte estimate ("gpu residency:
+# ..."); the debug redraw line reports live "slots used / zone demand"
+# if you want to re-measure for your own library/display before
+# shrinking this.
 atlas_width = 16128
 atlas_height = 15984
 
@@ -307,13 +299,13 @@ quickview_max_height = 1440
 # chapter bar shows) instead. The plain `next`/`prev` actions remain for
 # bindings that should always move the selection (auto-skip fires `next`).
 # Built-in defaults: enter/o = open · space = quickview · tab = fullview ·
-# c = copy_path · q = quit · f = fullscreen · a = toggle_anim ·
-# p = toggle_focus_pause · r = reveal · -/=/0 = zoom · [ / ] = skip
-# back/fwd through the playing clip · D = browse the selected clip's
-# parent dir. Entries here override them.
+# c = copy_path · q = quit · f = fullscreen · p = toggle_focus_pause ·
+# r = reveal · -/=/0 = zoom · [ / ] = skip back/fwd through the playing
+# clip · D = browse the selected clip's parent dir. Entries here
+# override them.
 #
 # A key can name an internal action (quit, fullscreen, fast_fullscreen,
-# copy_path, quickview, fullview, chapter_mode, toggle_anim,
+# copy_path, quickview, fullview, chapter_mode,
 # toggle_focus_pause, zoom_in, zoom_out, zoom_reset, move_left,
 # move_right, move_up, move_down, next, prev, skip_forward, skip_back,
 # open_parent, jump_random, shuffle_library, toggle_auto_skip) or any
@@ -335,7 +327,6 @@ tab = "fullview"  # selected clip fills the window on black; Esc or Tab exits
 # "{" = "skip_back_big"  # a skip with its own amount; see below
 "]" = "skip_forward"
 D = "open_parent"  # re-ingest from the selected clip's parent dir
-a = "toggle_anim"  # animated thumbnails on/off
 c = "copy_path"
 g = "chapter_mode"  # chapter bar in fullview ("chapters" also works)
 h = "move_left"  # context-sensitive: selection back, or previous chapter in fullview
