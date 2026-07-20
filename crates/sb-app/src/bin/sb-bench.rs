@@ -18,6 +18,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("bench") => cmd_bench(&args[1..]),
+        Some("compare") => cmd_compare(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             ExitCode::SUCCESS
@@ -33,8 +34,9 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!("usage:");
-    eprintln!("  sb-bench run   <scenario.toml> [--out <dir>] [--home <dir>] [--keep-home]");
-    eprintln!("  sb-bench bench <scenario.toml> [--reps N] [--label L] [--reports <dir>]");
+    eprintln!("  sb-bench run     <scenario.toml> [--out <dir>] [--home <dir>] [--keep-home]");
+    eprintln!("  sb-bench bench   <scenario.toml> [--reps N] [--label L] [--reports <dir>]");
+    eprintln!("  sb-bench compare <bundleA> <bundleB> [--out <report.md>]");
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
@@ -151,6 +153,59 @@ fn cmd_bench(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_compare(args: &[String]) -> ExitCode {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut out: Option<PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = it.next().map(PathBuf::from),
+            _ if dirs.len() < 2 => dirs.push(PathBuf::from(a)),
+            other => {
+                eprintln!("unexpected argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if dirs.len() != 2 {
+        eprintln!("error: compare needs two bundle dirs (e.g. reports/<scenario>-<label>)");
+        return ExitCode::from(2);
+    }
+    let label = |p: &Path| -> String {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    let (la, lb) = (label(&dirs[0]), label(&dirs[1]));
+    let a = match sb_app::bench::read_bundle(&dirs[0]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let b = match sb_app::bench::read_bundle(&dirs[1]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = sb_app::bench::compare_markdown(&a, &b, &la, &lb);
+    match out {
+        Some(p) => {
+            if let Err(e) = std::fs::write(&p, &md) {
+                eprintln!("error: write {}: {e}", p.display());
+                return ExitCode::FAILURE;
+            }
+            println!("compare report: {}", p.display());
+        }
+        None => print!("{md}"),
+    }
+    ExitCode::SUCCESS
 }
 
 fn default_out(scenario: &Path) -> PathBuf {

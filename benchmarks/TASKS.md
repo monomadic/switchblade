@@ -171,10 +171,11 @@ seed scenarios (cold h264 first-frame ~255ms, hover-lane ~62ms, 4K60 warm spawn 
       alongside. Numbers only, no verdicts. Reports are gitignored (local-only by
       default; force-add a baseline to commit). Markdown first; HTML/charts only
       if tables prove insufficient.
-- [ ] **4.2 Compare mode**: two labeled run sets side by side with computed deltas
-      (numbers only, no verdicts) — the "did it help?" artifact. Supports
-      interleaved A/B runs (alternate binaries to dodge thermal drift). The
-      aggregation (`stat3`, per-key alignment) is already factored out for reuse.
+- [x] **4.2 Compare mode**: `sb-bench compare <bundleA> <bundleB>` →
+      `bench::compare_markdown` (pure, unit-tested): per-metric median for each
+      side + the **B−A delta**, numbers only, intent quoted, with an interleave-
+      to-dodge-thermal-drift note. Verified end-to-end (same-binary A/B → ~0
+      deltas). `read_bundle` reads `repN/summary.json` back.
 
 ## Phase 5 — expansion (as experiments demand)
 

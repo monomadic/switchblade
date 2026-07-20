@@ -607,6 +607,23 @@ pub fn read_summary(path: &Path) -> Result<Summary, String> {
     sb_media::serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
+/// Read every rep's `summary.json` from an orchestration bundle dir
+/// (`repN/summary.json`).
+pub fn read_bundle(dir: &Path) -> Result<Vec<Summary>, String> {
+    let mut out = Vec::new();
+    for rep in 0.. {
+        let p = dir.join(format!("rep{rep}")).join("summary.json");
+        if !p.exists() {
+            break;
+        }
+        out.push(read_summary(&p)?);
+    }
+    if out.is_empty() {
+        return Err(format!("no rep*/summary.json under {}", dir.display()));
+    }
+    Ok(out)
+}
+
 /// Run a scenario `reps` times, each as a fresh child process with an
 /// isolated temp `HOME` (cold cache — the cache root is a process-global
 /// `OnceLock`, so repeats MUST be separate processes), then write a
@@ -765,6 +782,86 @@ pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> S
     out
 }
 
+/// A `(lane, metric)` latency key.
+type LaneKey = (String, String);
+
+/// A named column extractor over a run's summary (for compare tables).
+type SummaryCol = (&'static str, fn(&Summary) -> f64);
+
+/// Median-of-p50 for each `(lane, metric)` across a run set.
+fn latency_medians(runs: &[Summary]) -> std::collections::BTreeMap<LaneKey, f64> {
+    use std::collections::BTreeMap;
+    let mut by: BTreeMap<LaneKey, Vec<f64>> = BTreeMap::new();
+    for s in runs {
+        for l in &s.latencies {
+            by.entry((l.lane.clone(), l.metric.clone()))
+                .or_default()
+                .push(l.p50_ms);
+        }
+    }
+    by.into_iter().map(|(k, xs)| (k, stat3(&xs).0)).collect()
+}
+
+/// Side-by-side compare of two labeled run sets (e.g. before/after a
+/// change). Reports each side's median and the B−A delta. **Numbers only,
+/// no verdict** — the reader decides whether a delta helped, with the
+/// shared intent for context. Interleave the two `bench` invocations
+/// (A, B, A, B, …) to dodge thermal drift before reading this.
+pub fn compare_markdown(a: &[Summary], b: &[Summary], la: &str, lb: &str) -> String {
+    let mut out = String::new();
+    let name = a.first().map(|s| s.scenario.as_str()).unwrap_or("?");
+    out.push_str(&format!("# Benchmark compare — `{name}`: {la} vs {lb}\n\n"));
+    out.push_str(&format!(
+        "Median across runs; **delta = {lb} − {la}** (negative = {lb} lower). \
+         Comparative, no verdict — judge against the intent. A and B should be \
+         run interleaved to dodge thermal drift.\n\n"
+    ));
+    out.push_str("## Intent\n\n");
+    for line in a.first().map(|s| s.intent.as_str()).unwrap_or("").lines() {
+        out.push_str(&format!("> {line}\n"));
+    }
+
+    out.push_str("\n## Latency p50 (ms)\n\n");
+    out.push_str(&format!("| lane / metric | {la} | {lb} | Δ |\n|---|--:|--:|--:|\n"));
+    let (ma, mb) = (latency_medians(a), latency_medians(b));
+    let mut keys: Vec<_> = ma.keys().chain(mb.keys()).cloned().collect();
+    keys.sort();
+    keys.dedup();
+    for k in keys {
+        let va = ma.get(&k).copied();
+        let vb = mb.get(&k).copied();
+        let delta = match (va, vb) {
+            (Some(x), Some(y)) => format!("{:+.0}", y - x),
+            _ => "—".into(),
+        };
+        out.push_str(&format!(
+            "| {} / {} | {} | {} | {} |\n",
+            k.0,
+            k.1,
+            va.map(|x| format!("{x:.0}")).unwrap_or_else(|| "—".into()),
+            vb.map(|x| format!("{x:.0}")).unwrap_or_else(|| "—".into()),
+            delta,
+        ));
+    }
+
+    out.push_str("\n## Counters & totals\n\n");
+    out.push_str(&format!("| metric | {la} | {lb} | Δ |\n|---|--:|--:|--:|\n"));
+    let cols: [SummaryCol; 6] = [
+        ("wall_s", |s| s.wall_s),
+        ("late_frames", |s| s.counters.late_frames as f64),
+        ("reanchors", |s| s.counters.reanchors as f64),
+        ("evictions", |s| s.counters.evictions as f64),
+        ("thumbs_cached", |s| s.counters.thumbs_cached as f64),
+        ("tick_ms p95", |s| s.tick_ms.p95),
+    ];
+    for (label, f) in cols {
+        let xa = stat3(&a.iter().map(f).collect::<Vec<_>>()).0;
+        let xb = stat3(&b.iter().map(f).collect::<Vec<_>>()).0;
+        out.push_str(&format!("| {label} | {xa:.2} | {xb:.2} | {:+.2} |\n", xb - xa));
+    }
+    out
+}
+
 /// A one-block environment fingerprint (git, ffmpeg, platform). Best
 /// effort — missing tools degrade to "unknown" rather than failing.
 fn fingerprint() -> String {
@@ -844,6 +941,20 @@ mod tests {
         // late_frames median of {0,0,4} = 0, spread 0–4.
         assert!(md.contains("0.00 (0.00–4.00)"), "counter median+spread");
         assert!(!md.to_lowercase().contains("regression"), "no verdicts");
+    }
+
+    /// Compare renders a B−A delta per metric and stays verdict-free.
+    #[test]
+    fn compare_shows_signed_deltas_without_verdicts() {
+        let a = vec![summary("s", true, 250.0, 0), summary("s", true, 250.0, 0)];
+        let b = vec![summary("s", true, 300.0, 2), summary("s", true, 300.0, 2)];
+        let md = compare_markdown(&a, &b, "before", "after");
+        // selected/spawn_to_served p50: 250 → 300, delta +50.
+        assert!(md.contains("| 250 | 300 | +50 |"), "latency delta:\n{md}");
+        // late_frames 0 → 2, delta +2.00.
+        assert!(md.contains("+2.00"), "counter delta");
+        assert!(!md.to_lowercase().contains("regression"), "no verdicts");
+        assert!(!md.to_lowercase().contains("better"), "no verdicts");
     }
 
     /// End-to-end: a tiny scenario against a real fixture produces a valid
