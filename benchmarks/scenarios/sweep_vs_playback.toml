@@ -1,0 +1,121 @@
+name = "sweep_vs_playback"
+
+# Prose intent — read retrospectively, never parsed.
+intent = """
+Cold start, a large corpus: one modest 1080p clip first (the one we watch)
+followed by many heavy 4K/60 clips. Open the first clip in quickview and let
+it play for 8s while the background thumbnail gen sweep grinds through the 4K
+sources — exactly the load the "cap gen-sweep concurrency while a live stream
+presents" commit (6f82ad9) targets.
+
+Expected behavior (the commit's thesis): while the stream presents, the sweep
+must not starve it. Watch late_frames / reanchors DURING the 8s window and the
+selected lane's spawn_to_served — the capped build should hold them at/near
+zero; an uncapped build lets the sweep's concurrent 4K extracts contend for
+CPU and the VideoToolbox media engine.
+
+Fidelity note: on a fast LOCAL SSD the disk-band half of the commit
+(taskpolicy -b) has little to bite on — files are ~20MB and warm in the page
+cache. This scenario exercises the CPU + VT-media-engine contention; the
+disk-starvation half needs an external-drive corpus (Phase 5.1) or Tier B.
+"""
+
+[setup]
+animation = "normal"
+viewport = [1280, 800]
+refresh_hz = 60.0
+max_wall_s = 90.0
+inputs = [
+    "benchmarks/fixtures/corpus/aa_played_h264_1080p30.mp4",
+    "benchmarks/fixtures/corpus/sweep_01_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_02_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_03_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_04_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_05_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_06_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_07_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_08_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_09_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_10_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_11_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_12_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_13_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_14_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_15_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_16_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_17_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_18_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_19_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_20_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_21_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_22_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_23_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_24_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_25_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_26_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_27_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_28_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_29_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_30_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_31_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_32_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_33_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_34_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_35_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_36_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_37_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_38_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_39_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_40_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_41_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_42_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_43_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_44_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_45_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_46_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_47_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_48_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_49_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_50_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_51_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_52_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_53_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_54_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_55_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_56_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_57_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_58_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_59_hevc_2160p60.mp4",
+    "benchmarks/fixtures/corpus/sweep_60_hevc_2160p60.mp4",
+]
+
+# Wait for the whole corpus to ingest.
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 61
+timeout = 30.0
+
+# Settle a beat in the grid.
+[[step]]
+action = "wait"
+secs = 0.5
+
+# Open quickview on the default-selected first clip (the 1080p one).
+[[step]]
+action = "key"
+key = "space"
+
+# The modal stream must serve a first frame before we start the clock.
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 20.0
+
+# Watch for 8s WHILE the sweep runs — late_frames / reanchors accrue here.
+[[step]]
+action = "wait"
+secs = 8.0
+
+[validity]
+require = ["library_count", "selected_served"]
