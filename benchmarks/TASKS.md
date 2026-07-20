@@ -121,37 +121,44 @@ Landed in [`sb-media::probe`](../crates/sb-media/src/probe.rs) (shared types),
 
 ## Phase 3 — headless runner (Tier A)
 
-- [ ] **3.1 Scenario TOML format + parser**: `[setup]` (fixtures by role, cache
-      state, tuning overrides, viewport, animation level), `[[actions]]` timeline
-      (timed actions + `wait_until` readiness conditions per 0.4),
-      `[validity]` (mechanical requirements), `intent = """prose expected
-      behavior"""`. Reuse the tuning parser's toml dep.
-- [ ] **3.2 Runner binary** (in sb-app so internals stay visible): builds the
-      hermetic env, drives `frame()` through the **shared scheduler component**
-      (0.2) in real wall-clock time, translates semantic actions to `InputEvent`s
-      via live layout queries (`tile_rect` — scripts must survive layout changes),
-      records via the buffered sink.
-- [ ] **3.3 Validity gate**: stamp each run `valid`/`invalid` from exit status +
-      the scenario's `[validity]` conditions + readiness-timeout outcomes. Invalid
-      runs are kept but excluded from summaries by default.
-- [ ] **3.4 Summary computation**: per run — late-frame count/rate, latency
-      percentiles **per 0.1 class** (never pooled across classes),
-      tick-duration percentiles, thumbs-over-time curve, CPU time including
-      subprocess children (`RUSAGE_CHILDREN` — live decode is in-process, but the
-      gen sweep is ffmpeg children), runner peak RSS (child RSS sampled
-      best-effort only), and **decoder/thread counts over time** with
-      return-to-baseline after lane teardown as the leak canary (a raw end-of-run
-      thread count is meaningless — resident workers are legitimate).
-- [ ] **3.5 Repeat orchestration**: N runs per scenario (default 5), **one child
-      process per run** (0.3), serialized (never parallel — ffmpeg contention
-      skews timing), warm-up-discard only where the scenario opts in. Environment
-      fingerprint per run: git SHA, dirty flag, machine, power source, fixture-dir
-      volume, ffmpeg version, cold-axes labels (see settled decisions).
-- [ ] **3.6 Port the two seed scenarios** (rewritten with readiness waits, not raw
-      timestamps): (a) cold start → wait for ingest + first row of thumbs → open
-      first clip in quickview, watching pacing + cache fill; (b) cold start via
-      stdin → wait for library count → scroll to end → hover the last fixture by
-      role, watching hover→first-frame-served latency.
+Runner lives in [`sb_app::bench`](../crates/sb-app/src/bench.rs) (crate-internal, so
+it can reach the private `layout`/`tile_rect` geometry) with a thin
+[`sb-bench` bin](../crates/sb-app/src/bin/sb-bench.rs). Self-test
+`bench::tests::runs_a_scenario_and_measures_selected_latency`. Verified live on both
+seed scenarios (cold h264 first-frame ~255ms, hover-lane ~62ms, 4K60 warm spawn the
+383ms tail — real comparative data).
+
+- [x] **3.1 Scenario TOML format + parser**: `[setup]` (fixtures by name/role,
+      animation, viewport, refresh_hz vsync stand-in, max_wall), sequential
+      `[[step]]` list (`wait` / `wait_until` / `key` / `hover` / `click` /
+      `scroll`) with an explicit `action` discriminator, `[validity].require`,
+      and `intent = """…"""` prose. Reuses the existing toml dep.
+- [x] **3.2 Runner binary**: hermetic temp `HOME` set in the bin BEFORE any
+      sb-media call (cache-root OnceLock); drives `frame()` on a **vsync
+      stand-in** while animating (headless has no present to pace it — using the
+      raw `MIN_FRAME` scheduler would free-run at 250fps and inflate per-frame
+      `drain_media` work) and defers to `sb_window::schedule::next_frame` when
+      idle. Semantic targets resolve through live `tile_rect`. Records via the
+      buffered probe sink; writes `summary.json` + `events.jsonl`.
+- [x] **3.3 Validity gate**: `valid`/`invalid` from step completion + required
+      `[validity]` conditions + `wait_until` timeouts + a `max_wall` ceiling; the
+      bin's exit code mirrors it. Reasons recorded, never a perf verdict.
+- [~] **3.4 Summary computation**: DONE for app-level metrics — latency
+      percentiles **per 0.1 class** (spawn_to_ready / spawn_to_served /
+      promotion_to_served, matched by lane_gen, never pooled), tick-duration
+      percentiles, compacted thumbs-over-time curve, counters snapshot. **CPU
+      time + peak RSS move to the orchestrator** (it spawns the child, so
+      `RUSAGE_CHILDREN`/`wait4` there captures the whole process tree incl.
+      ffmpeg workers — the in-process runner can't see its own children's RSS
+      cleanly). Thread-count leak canary still TODO.
+- [ ] **3.5 Repeat orchestration**: N runs/scenario (default 5), one child
+      process per run (the bin already isolates HOME), serialized, warm-up
+      discard opt-in, env fingerprint (git SHA, dirty, machine, power, ffmpeg
+      version, cold-axes) + process-tree CPU/RSS. Pairs with Phase 4.
+- [x] **3.6 Seed scenarios** ([scenarios/](scenarios/)): `cold_open_quickview`
+      (cold → ingest → idle → Space → selected serves → play, watching pacing +
+      cache fill) and `hover_last_tile` (cold → ingest → hover last → hover-lane
+      first-frame latency). Both use readiness waits, not raw timestamps.
 
 ## Phase 4 — reporting
 

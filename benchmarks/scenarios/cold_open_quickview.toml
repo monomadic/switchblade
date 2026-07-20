@@ -1,0 +1,58 @@
+name = "cold_open_quickview"
+
+# Prose intent — handed to whoever (usually an agent) reads the recorded
+# summary. NEVER parsed; the runner only measures. Judgment is retrospective.
+intent = """
+Cold start (empty cache), one clip in the grid. Wait for ingest, idle a
+beat, then open the clip in quickview (Space). While it plays, its
+storyboard sheet and thumbnail generate in the background.
+
+Expected behavior: the selected stream plays without frame drops (few or
+no late_frames / reanchors once serving), and the cache fills — at least
+the one clip's thumbnail lands (thumbs_cached >= 1).
+
+Watch: selected-lane spawn_to_served latency, late_frames / reanchors
+after first frame, thumbs-over-time.
+"""
+
+[setup]
+fixtures = ["h264_1080p30.mp4"]
+animation = "normal"
+viewport = [1280, 800]
+
+# Wait for the single clip to ingest.
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 1
+timeout = 10.0
+
+# Idle a second in the grid (the selected stream may already be warming).
+[[step]]
+action = "wait"
+secs = 1.0
+
+# Open quickview on the (default-selected) first clip.
+[[step]]
+action = "key"
+key = "space"
+
+# The modal stream must serve a first frame.
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 15.0
+
+# Let it play so pacing (late_frames / reanchors) and cache fill accrue.
+[[step]]
+action = "wait"
+secs = 5.0
+
+[[step]]
+action = "wait_until"
+cond = "cache_thumbs"
+n = 1
+timeout = 10.0
+
+[validity]
+require = ["library_count", "selected_served"]

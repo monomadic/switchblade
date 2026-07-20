@@ -12,6 +12,9 @@ pub mod probe;
 mod seekable;
 pub use probe::{CounterSnapshot, EventKind, Lane, LaneProbe, Probe, RelEvent};
 pub use seekable::SeekablePlayer;
+/// Re-exported so sb-app's bench runner can serialize its reports without
+/// taking its own serde_json dependency (it's already built for us here).
+pub use serde_json;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};

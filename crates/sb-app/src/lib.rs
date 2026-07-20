@@ -1,6 +1,7 @@
 //! sb-app: application state and grid logic, headless of any OS/GPU types.
 //! Implements the `sb_window::App` trait (PLAN.md §12).
 
+pub mod bench;
 mod commands;
 mod ingest;
 mod tuning;

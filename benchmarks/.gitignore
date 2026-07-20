@@ -1,0 +1,3 @@
+# Generated benchmark run outputs (summary.json, events.jsonl). Raw traces
+# are bundled with a committed report, never checked in loose.
+**/runs/

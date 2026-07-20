@@ -1,0 +1,59 @@
+name = "hover_last_tile"
+
+intent = """
+Cold start, the whole fixture corpus in the grid. Wait for ingest, then
+hover the last tile and hold — the hover lane should cold-spawn a decoder
+and start playing the hovered clip within a reasonable time.
+
+Expected behavior: hovering the last tile starts playing it; measure the
+time from hover to first served frame (hover-lane spawn_to_served). A
+cold spawn's floor is probe + VideoToolbox init + first GOP.
+
+Watch: hover-lane spawn_to_served (the headline number), and whether the
+grid stays responsive (tick_ms) while a decoder cold-starts.
+
+Note: with only the ~7 fixtures the grid fits one screen, so this does
+not exercise scroll-to-end. A dedicated large-corpus scenario (copied
+fixtures) belongs in Phase 5.
+"""
+
+[setup]
+fixtures = [
+    "h264_1080p30.mp4",
+    "hevc_2160p60.mp4",
+    "hevc_1080p30_10bit.mp4",
+    "h264_1080p30_longgop.mp4",
+    "h264_720p30_vfr.mp4",
+    "h264_1080p30_rot90.mp4",
+    "vp9_720p30.webm",
+]
+animation = "normal"
+viewport = [1280, 800]
+
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 7
+timeout = 15.0
+
+# Let thumbs settle so the last tile is a real clip, not a placeholder.
+[[step]]
+action = "wait"
+secs = 1.0
+
+# Scroll to the end (no-op with a one-screen grid, but part of the script).
+[[step]]
+action = "scroll"
+dy = -4000.0
+
+# Hover the last tile and hold.
+[[step]]
+action = "hover"
+target = "last"
+
+[[step]]
+action = "wait"
+secs = 4.0
+
+[validity]
+require = ["library_count"]
