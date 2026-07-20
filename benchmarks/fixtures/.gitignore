@@ -1,0 +1,5 @@
+# Generated fixture corpus — regenerated on demand via generate.sh, never
+# committed (large, and byte-identity isn't guaranteed across ffmpeg builds).
+*
+!.gitignore
+!generate.sh

@@ -102,17 +102,22 @@ Landed in [`sb-media::probe`](../crates/sb-media/src/probe.rs) (shared types),
 
 ## Phase 2 — fixtures
 
-- [ ] **2.1 Fixture generator** (script or xtask): deterministic ffmpeg-synthesized
-      corpus into `benchmarks/fixtures/` (gitignored, regenerated on demand),
-      color bars + burned-in timecode. Matrix targets the known fault lines:
-      h264 1080p30, **4K60 hevc**, **10-bit hevc**, long-GOP sparse-keyframe (for
-      exact-seek cost), a VFR case, a rotated/portrait case, and one software-path
-      codec (VP9 or AV1). ≥8s duration wherever pacing/looping matters. Runs
-      record **ffmpeg version + exact generation command + artifact hash** —
-      identical args do NOT guarantee identical files across ffmpeg builds.
-- [ ] **2.2 Cache seeding helper**: produce a warmed cache dir for a fixture set
-      (run the gen sweep once, snapshot the dir) so warm-start scenarios copy it in
-      instead of regenerating.
+- [x] **2.1 Fixture generator** — [`fixtures/generate.sh`](fixtures/generate.sh),
+      gitignored corpus + `manifest.json` (ffmpeg version + exact argv + sha256 as
+      provenance, never an equality check). 7 fixtures on the fault lines:
+      `h264_1080p30` (VT baseline), `hevc_2160p60` (heavy 4K60 + hw-scale),
+      `hevc_1080p30_10bit` (scale_vt pix_fmt gate), `h264_1080p30_longgop`
+      (single GOP over 16s — exact-seek worst case), `h264_720p30_vfr` (VFR, two
+      concatenated rate segments), `h264_1080p30_rot90` (Display Matrix rotation —
+      ffmpeg 8 needs a `-display_rotation` copy remux, the legacy `rotate` tag is
+      gone), `vp9_720p30` (software decode path). No timecode burn-in (this ffmpeg
+      lacks drawtext; pacing is measured from pts, not pixels). All verified via
+      ffprobe (codec/dims/pix_fmt/fps/rotation/keyframe-count).
+- [ ] **2.2 Cache seeding helper** — DEFERRED to Phase 3: warming the cache means
+      running the app's real gen sweep, which needs the headless driver 3.2 builds.
+      A standalone seeder would duplicate the cache-layout logic and risk drift, so
+      it lands as a runner sub-mode (drive ingest over a fixture set → wait for
+      `cache_swept(all)` → snapshot the temp `HOME` cache dir).
 
 ## Phase 3 — headless runner (Tier A)
 
