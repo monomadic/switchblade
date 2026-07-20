@@ -185,6 +185,11 @@ struct ChapterBar {
     /// but panning only: chapters seek on click, never on scroll.
     pos: f32,
     target: f32,
+    /// Set when the bar was revealed as a transient peek (a fullview
+    /// chapter step), cleared for a deliberate `g` open. Once this
+    /// instant passes the bar auto-closes; each chapter step refreshes
+    /// it. A peeked bar also doesn't intercept Esc — it's ephemeral.
+    peek_until: Option<Instant>,
 }
 
 /// The hovered tile's video playback: tile-sized, into an atlas slot.
@@ -1224,12 +1229,15 @@ impl Switchblade {
         // included (the context-sensitive `move_*` actions on hjkl and
         // the arrows by default) — goes through the keymap.
         match key {
-            // Esc peels layers: the chapter bar slides down first, then
-            // fullview exits, then quickview.
-            Key::Escape if self.chapters.as_ref().is_some_and(|b| b.open) => {
+            // Esc peels layers: a deliberately-opened chapter bar slides
+            // down first, then fullview exits, then quickview. A transient
+            // peek (from a chapter step) doesn't count as a layer — Esc
+            // exits fullview and the peek drops with it.
+            Key::Escape if self.chapters.as_ref().is_some_and(|b| b.open && b.peek_until.is_none()) => {
                 return self.close_chapter_bar();
             }
             Key::Escape if self.fullview => {
+                self.chapters = None; // drop any lingering peek
                 self.fullview = false;
                 return;
             }
@@ -1277,13 +1285,20 @@ impl Switchblade {
             Action::Skip { forward, amount } => self.skip(forward, amount),
             Action::SelectNext => self.move_selection(1, 0),
             Action::SelectPrev => self.move_selection(-1, 0),
-            // Context-sensitive movement (the default hjkl/arrows): in
-            // fullview — chapter bar up or not — left/right step the
-            // playing clip between chapters; everywhere else (grid,
-            // quickview) every direction moves the selection.
+            // Context-sensitive movement (the default hjkl/arrows). In
+            // fullview: left/right step the playing clip between chapters
+            // (peeking the chapter bar), up steps out to the filmstrip
+            // quickview. In quickview: down dives into fullview (mirror of
+            // clicking the video). Everywhere else, and on the axes not
+            // claimed above, movement moves the selection. (move_* are
+            // single-axis, so dx and dy are never both nonzero.)
             Action::Move { dx, dy } => {
-                if dx != 0 && self.fullview {
+                if self.fullview && dx != 0 {
                     self.chapter_step(dx > 0);
+                } else if self.fullview && dy < 0 {
+                    self.to_quickview();
+                } else if self.quickview && !self.fullview && dy > 0 {
+                    self.fullview = true;
                 } else {
                     self.move_selection(dx, dy);
                 }
@@ -1702,11 +1717,38 @@ impl Switchblade {
         if self.chapters.as_ref().is_some_and(|b| b.open) {
             return self.close_chapter_bar();
         }
+        self.open_chapter_bar(false);
+    }
+
+    /// Bring the chapter bar up over fullview. `peek = false` is the
+    /// deliberate `g` open — it stays until dismissed; `peek = true` is a
+    /// transient reveal (a fullview chapter step) that slides back down
+    /// after `chapter_peek_s`, the timer refreshed on each step. Re-opening
+    /// a bar that's already up refreshes the peek window but never
+    /// downgrades a sticky (g-opened) bar to a peek.
+    fn open_chapter_bar(&mut self, peek: bool) {
         let path = match self.clips.get(self.selected) {
             Some(c) if !self.demo && c.readable && !c.cloud => c.path.clone(),
             _ => return,
         };
         self.fullview = true;
+        let peek_until = (peek && self.tuning.chapter_peek_s > 0.0)
+            .then(|| Instant::now() + Duration::from_secs_f32(self.tuning.chapter_peek_s));
+        // Already showing this clip's bar: just refresh, don't rebuild
+        // (rebuilding would re-fire the probe and reset the strip pan).
+        if let Some(b) = self.chapters.as_mut().filter(|b| b.path == path) {
+            b.open = true;
+            if peek {
+                // Refresh a peek's timer; a sticky bar stays sticky.
+                if b.peek_until.is_some() {
+                    b.peek_until = peek_until;
+                }
+            } else {
+                b.peek_until = None;
+            }
+            self.wake(0.8);
+            return;
+        }
         let duration = self
             .live_sel
             .as_ref()
@@ -1720,6 +1762,7 @@ impl Switchblade {
             slide: 0.0,
             pos: 0.0,
             target: 0.0,
+            peek_until,
         });
         match self.chapter_probe.get(&path).cloned() {
             // Pre-warmed answer: the plan installs this same tick.
@@ -1731,6 +1774,22 @@ impl Switchblade {
             }
         }
         self.wake(0.8);
+    }
+
+    /// Step out of fullview to the filmstrip quickview — the `move_up`
+    /// key, the mirror of clicking the quickview video to dive in. Drops
+    /// any chapter bar, and if fullview was entered directly (no quickview
+    /// underneath) brings the strip up centered on the selection.
+    fn to_quickview(&mut self) {
+        self.chapters = None;
+        self.fullview = false;
+        if !self.quickview {
+            self.quickview = true;
+            self.quickview_at = Instant::now();
+            self.strip_pos = self.selected as f32;
+            self.strip_target = self.strip_pos;
+        }
+        self.wake(0.3);
     }
 
     /// Install a probe answer into the open bar: real chapters win, a
@@ -1938,7 +1997,10 @@ impl Switchblade {
         };
         l.player.seek(t, true);
         self.skip_flash_at = Some(Instant::now());
-        // An open bar glides its strip to center the landed-on chapter.
+        // Reveal the bar as a timed peek so the step shows where it
+        // landed (a bar already up via `g` stays sticky), then glide its
+        // strip to center the landed-on chapter.
+        self.open_chapter_bar(true);
         if self
             .chapters
             .as_ref()
@@ -2235,6 +2297,17 @@ impl Switchblade {
             }
         }
 
+        // A peeked bar (revealed by a chapter step) slides itself back
+        // down once its window elapses; a sticky `g`-opened bar has no
+        // deadline.
+        if let Some(b) = &mut self.chapters
+            && b.open
+            && b.peek_until.is_some_and(|t| Instant::now() >= t)
+        {
+            b.open = false;
+            b.peek_until = None;
+            self.wake(0.8);
+        }
         // Chapter bar: the slide-in rides the same spring family, and
         // the strip pans toward its scroll target like the filmstrip.
         // Once a closing bar's slide lands, the state drops.
@@ -5757,6 +5830,7 @@ mod tests {
                 slide: 1.0,
                 pos: last * 0.5,
                 target: last * 0.5,
+                peek_until: None,
             });
         };
 
@@ -5814,6 +5888,91 @@ mod tests {
         assert!(
             app.chapters.is_none(),
             "bar drops when the selection moves off its clip"
+        );
+    }
+
+    /// A fullview chapter step reveals the bar as a timed peek that slides
+    /// itself back down once its window elapses; a deliberate `g` open has
+    /// no deadline and stays up.
+    #[test]
+    fn chapter_peek_auto_closes_but_g_open_stays() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None), // snap-mode slide lands fast
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        app.fullview = true;
+        let bar = |app: &Switchblade, peek_until| ChapterBar {
+            path: app.clips[app.selected].path.clone(),
+            duration: Some(400.0),
+            times: Some(vec![0.0, 50.0, 100.0]),
+            open: true,
+            slide: 1.0,
+            pos: 0.0,
+            target: 0.0,
+            peek_until,
+        };
+
+        // An already-elapsed peek starts closing on the next frame, then
+        // the slide lands and the state drops.
+        app.chapters = Some(bar(&app, Some(Instant::now() - Duration::from_secs(1))));
+        for _ in 0..4 {
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(app.chapters.is_none(), "an expired peek slides down and drops");
+
+        // A sticky (g-opened) bar has no deadline — it never auto-closes.
+        app.chapters = Some(bar(&app, None));
+        for _ in 0..6 {
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(
+            app.chapters.as_ref().is_some_and(|b| b.open),
+            "a deliberate g open never auto-closes"
+        );
+    }
+
+    /// Vertical keys are a view-depth ladder: down dives quickview →
+    /// fullview (the strip staying live underneath), up steps fullview →
+    /// quickview (bringing the strip up even when fullview was entered
+    /// directly). Other axes still move the selection.
+    #[test]
+    fn vertical_keys_step_between_quickview_and_fullview() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+
+        // Quickview ("stripview"): down dives into fullview, quickview
+        // staying true underneath (fullview layers over it).
+        app.key(Key::Space);
+        assert!(app.quickview && !app.fullview, "space opens quickview");
+        app.key(Key::Down);
+        assert!(app.fullview, "down dives into fullview");
+        assert!(app.quickview, "quickview stays under fullview");
+
+        // Up steps back out to the filmstrip quickview.
+        app.key(Key::Up);
+        assert!(!app.fullview, "up leaves fullview");
+        assert!(app.quickview, "up lands on the filmstrip quickview");
+
+        // Fullview entered directly (no quickview under it): up still
+        // brings the strip up rather than dropping to the grid.
+        app.key(Key::Escape);
+        assert!(!app.quickview && !app.fullview, "esc returns to the grid");
+        app.key(Key::Tab);
+        assert!(app.fullview && !app.quickview, "tab enters fullview only");
+        app.key(Key::Up);
+        assert!(
+            !app.fullview && app.quickview,
+            "up opens the filmstrip quickview from a direct fullview"
         );
     }
 
@@ -6475,6 +6634,14 @@ mod tests {
         app.key(Key::Right);
         let p = app.live_sel.as_ref().unwrap().position();
         assert!((2.9..=3.1).contains(&p), "right -> chapter 2, got {p}");
+        // Stepping a chapter also peeks the bar open (a transient reveal,
+        // distinct from a deliberate `g` open).
+        assert!(
+            app.chapters
+                .as_ref()
+                .is_some_and(|b| b.open && b.peek_until.is_some()),
+            "a fullview chapter step peeks the chapter bar open"
+        );
         app.key(Key::Right);
         let p = app.live_sel.as_ref().unwrap().position();
         assert!((5.9..=6.1).contains(&p), "right -> chapter 3, got {p}");
@@ -6496,10 +6663,11 @@ mod tests {
             "left mid-chapter restarts it, got {p}"
         );
 
-        // Back in the grid the same keys move the selection instead —
-        // the stream's position is left alone.
+        // The bar is only peeked (never a deliberate g-open), so Esc does
+        // NOT stop at it — it exits fullview directly and the peek drops.
         app.key(Key::Escape);
-        assert!(!app.fullview, "esc leaves fullview");
+        assert!(!app.fullview, "esc leaves fullview (a peek doesn't intercept)");
+        assert!(app.chapters.is_none(), "the peek drops with fullview");
         let before = app.live_sel.as_ref().unwrap().position();
         app.key(Key::Right);
         assert_eq!(app.selected, 0, "one clip: selection clamps in place");

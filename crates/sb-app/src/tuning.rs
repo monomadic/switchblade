@@ -256,6 +256,11 @@ pub struct Tuning {
     /// selected clip keeps playing; click a chip to select it, and the
     /// strip re-centers whenever the selection actually changes.
     pub strip_scroll_selects: bool,
+    /// Seconds a chapter step (`move_left`/`move_right` in fullview)
+    /// reveals the chapter bar before it slides back down. Each step
+    /// refreshes the window; a deliberate `g` open ignores this and stays
+    /// up until dismissed. 0 disables the peek (the bar only opens via g).
+    pub chapter_peek_s: f32,
     /// Quickview's backdrop: "blur" (frosted, dimmed gallery — default)
     /// or "flat" (opaque backdrop_color; the gallery is hidden).
     pub quickview_backdrop: BackdropStyle,
@@ -349,6 +354,7 @@ impl Default for Tuning {
             seekbar_thumb_width: 190.0,
             strip_scroll_sensitivity: 1.0,
             strip_scroll_selects: true,
+            chapter_peek_s: 2.5,
             quickview_backdrop: BackdropStyle::Blur,
             fullview_backdrop: BackdropStyle::Flat,
             backdrop_color: [0.0, 0.0, 0.0],
