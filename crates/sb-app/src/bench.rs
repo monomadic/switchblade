@@ -742,6 +742,21 @@ fn stat3(xs: &[f64]) -> (f64, f64, f64) {
     (pctl(&v, 0.50), v[0], *v.last().unwrap())
 }
 
+/// (mean, min, max) of a sample set, or all-zero when empty. Used for
+/// **burst counters** (late_frames, reanchors, evictions): those are mostly
+/// zero with occasional spikes, and the spikes ARE the signal — the median
+/// discards them (reports 0), so mean is the honest aggregate. Latency
+/// percentiles keep the outlier-robust median-of-p50 via `stat3`.
+fn mean3(xs: &[f64]) -> (f64, f64, f64) {
+    if xs.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mean = xs.iter().sum::<f64>() / xs.len() as f64;
+    let lo = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    (mean, lo, hi)
+}
+
 fn fmt3(xs: &[f64], unit: &str) -> String {
     let (m, lo, hi) = stat3(xs);
     if xs.len() <= 1 {
@@ -813,28 +828,32 @@ pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> S
         ));
     }
 
-    // Counters + wall/frames.
+    // Counters + wall/frames. Burst counters (late_frames, reanchors,
+    // evictions) aggregate by MEAN — they're mostly zero with occasional
+    // spikes, and a median would report 0 and hide the spikes that are the
+    // whole point. Steady per-run measures (wall/frames/tick) keep the median.
     out.push_str("\n## Counters & totals\n\n");
-    out.push_str("| metric | median (min–max) |\n|---|--:|\n");
+    out.push_str("| metric | agg (min–max) | agg |\n|---|--:|:--|\n");
     let col = |f: &dyn Fn(&Summary) -> f64| -> Vec<f64> { summaries.iter().map(f).collect() };
-    let rows: [(&str, Vec<f64>); 8] = [
-        ("wall_s", col(&|s| s.wall_s)),
-        ("frames", col(&|s| s.frames as f64)),
-        ("late_frames", col(&|s| s.counters.late_frames as f64)),
-        ("reanchors", col(&|s| s.counters.reanchors as f64)),
-        ("evictions", col(&|s| s.counters.evictions as f64)),
-        ("thumbs_cached", col(&|s| s.counters.thumbs_cached as f64)),
-        ("drain_budget_hits", col(&|s| s.counters.drain_budget_hits as f64)),
-        ("tick_ms p95", col(&|s| s.tick_ms.p95)),
+    let rows: [(&str, Vec<f64>, bool); 8] = [
+        ("wall_s", col(&|s| s.wall_s), false),
+        ("frames", col(&|s| s.frames as f64), false),
+        ("late_frames", col(&|s| s.counters.late_frames as f64), true),
+        ("reanchors", col(&|s| s.counters.reanchors as f64), true),
+        ("evictions", col(&|s| s.counters.evictions as f64), true),
+        ("thumbs_cached", col(&|s| s.counters.thumbs_cached as f64), false),
+        ("drain_budget_hits", col(&|s| s.counters.drain_budget_hits as f64), false),
+        ("tick_ms p95", col(&|s| s.tick_ms.p95), false),
     ];
-    for (name, xs) in &rows {
-        let (m, lo, hi) = stat3(xs);
+    for (name, xs, burst) in &rows {
+        let (m, lo, hi) = if *burst { mean3(xs) } else { stat3(xs) };
+        let how = if *burst { "mean" } else { "median" };
         let cell = if xs.len() <= 1 {
             format!("{m:.2}")
         } else {
             format!("{m:.2} ({lo:.2}–{hi:.2})")
         };
-        out.push_str(&format!("| {name} | {cell} |\n"));
+        out.push_str(&format!("| {name} | {cell} | {how} |\n"));
     }
 
     out.push_str("\nRaw per-run `summary.json` + `events.jsonl` are under `repN/` beside this report.\n");
@@ -844,8 +863,9 @@ pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> S
 /// A `(lane, metric)` latency key.
 type LaneKey = (String, String);
 
-/// A named column extractor over a run's summary (for compare tables).
-type SummaryCol = (&'static str, fn(&Summary) -> f64);
+/// A compare-table counter column: label, extractor, and whether it's a burst
+/// counter (mean-aggregated) rather than a steady per-run measure (median).
+type CounterCol = (&'static str, fn(&Summary) -> f64, bool);
 
 /// Median-of-p50 for each `(lane, metric)` across a run set.
 fn latency_medians(runs: &[Summary]) -> std::collections::BTreeMap<LaneKey, f64> {
@@ -915,20 +935,29 @@ pub fn compare_markdown(a: &[Summary], b: &[Summary], la: &str, lb: &str) -> Str
         ));
     }
 
+    // Burst counters aggregate by MEAN (spikes are the signal; a median
+    // would report 0 and hide them); steady measures keep the median.
     out.push_str("\n## Counters & totals\n\n");
-    out.push_str(&format!("| metric | {la} | {lb} | Δ |\n|---|--:|--:|--:|\n"));
-    let cols: [SummaryCol; 6] = [
-        ("wall_s", |s| s.wall_s),
-        ("late_frames", |s| s.counters.late_frames as f64),
-        ("reanchors", |s| s.counters.reanchors as f64),
-        ("evictions", |s| s.counters.evictions as f64),
-        ("thumbs_cached", |s| s.counters.thumbs_cached as f64),
-        ("tick_ms p95", |s| s.tick_ms.p95),
+    out.push_str(&format!("| metric | {la} | {lb} | Δ | agg |\n|---|--:|--:|--:|:--|\n"));
+    let cols: [CounterCol; 6] = [
+        ("wall_s", |s| s.wall_s, false),
+        ("late_frames", |s| s.counters.late_frames as f64, true),
+        ("reanchors", |s| s.counters.reanchors as f64, true),
+        ("evictions", |s| s.counters.evictions as f64, true),
+        ("thumbs_cached", |s| s.counters.thumbs_cached as f64, false),
+        ("tick_ms p95", |s| s.tick_ms.p95, false),
     ];
-    for (label, f) in cols {
-        let xa = stat3(&a.iter().map(f).collect::<Vec<_>>()).0;
-        let xb = stat3(&b.iter().map(f).collect::<Vec<_>>()).0;
-        out.push_str(&format!("| {label} | {xa:.2} | {xb:.2} | {:+.2} |\n", xb - xa));
+    for (label, f, burst) in cols {
+        let agg = |runs: &[Summary]| -> f64 {
+            let xs: Vec<f64> = runs.iter().map(f).collect();
+            if burst { mean3(&xs).0 } else { stat3(&xs).0 }
+        };
+        let (xa, xb) = (agg(a), agg(b));
+        let how = if burst { "mean" } else { "median" };
+        out.push_str(&format!(
+            "| {label} | {xa:.2} | {xb:.2} | {:+.2} | {how} |\n",
+            xb - xa
+        ));
     }
     out
 }
@@ -1010,9 +1039,32 @@ mod tests {
         assert!(md.contains("> line one"), "intent quoted");
         // Median of {250,260,300} = 260, spread 250–300.
         assert!(md.contains("260 (250–300)"), "latency median+spread:\n{md}");
-        // late_frames median of {0,0,4} = 0, spread 0–4.
-        assert!(md.contains("0.00 (0.00–4.00)"), "counter median+spread");
+        // late_frames is a BURST counter → mean of {0,0,4} = 1.33 (a median
+        // would report 0 and hide the spike). Spread still 0–4.
+        assert!(md.contains("1.33 (0.00–4.00)"), "burst counter mean+spread:\n{md}");
         assert!(!md.to_lowercase().contains("regression"), "no verdicts");
+    }
+
+    /// Burst counters must aggregate by MEAN, not median: a run set that is
+    /// mostly zero with a couple of spikes (the disk-contention signature)
+    /// would read as "0" under a median and hide the effect entirely.
+    #[test]
+    fn burst_counters_report_mean_not_median() {
+        // late_frames = {0, 0, 0, 16, 0, 9}: median 0, mean 4.17.
+        let lates = [0u64, 0, 0, 16, 0, 9];
+        let reps: Vec<Summary> = lates.iter().map(|&l| summary("s", true, 300.0, l)).collect();
+        let md = markdown(&reps, reps.len(), "cold", "- git: `abc`\n");
+        assert!(
+            md.contains("| late_frames | 4.17 (0.00–16.00) | mean |"),
+            "burst counter must surface the spike via mean:\n{md}"
+        );
+        // Compare must show the mean delta, not a median 0−0=0.
+        let quiet: Vec<Summary> = (0..6).map(|_| summary("s", true, 300.0, 0)).collect();
+        let cmp = compare_markdown(&quiet, &reps, "capped", "uncapped");
+        assert!(
+            cmp.contains("| late_frames | 0.00 | 4.17 | +4.17 | mean |"),
+            "compare must surface the burst delta, not a median 0:\n{cmp}"
+        );
     }
 
     /// `--set` overrides overlay onto the scenario's `[tuning]` table, with

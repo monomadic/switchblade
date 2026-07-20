@@ -44,11 +44,40 @@ capped rep. Consistent, not noise.
   thumbs every run; capped leaves a few unfinished. The intended "user attention
   wins CPU" trade, now quantified.
 
-## The limit of this run (what it does NOT show)
+## Follow-up: the disk-band half, on a slow drive
 
-The commit's headline pain — multi-second `live 0` **droughts on an
-external/encrypted drive** — did not reproduce, because this ran on a local SSD
-with page-cache-warm ~20 MB files. The `taskpolicy -b` disk-band half of the
-commit had nothing to bite on. **This baseline validates the CPU + VT-media-engine
-mechanism only.** The disk-starvation mechanism needs a slow-drive corpus
-(external / network volume — Phase 5.1) or Tier B, tracked as follow-up.
+The commit's headline pain is multi-second `live 0` **droughts on an
+external/encrypted drive**, which the local-SSD run above can't touch (page-cache-warm
+~20 MB files — the `taskpolicy -b` disk band has nothing to bite on). To chase it,
+a second experiment read a real library over a **wifi/SMB NAS**, giving every run a
+**disjoint slice of never-before-read files** so each sees genuinely cold drive I/O
+(no `sudo purge` available). 6 reps per arm, disjoint files, cold.
+
+| metric (cold wifi) | capped | uncapped |
+|---|--:|--:|
+| selected spawn_to_served — mean / max | 354 / 442 ms | **567 / 1445 ms** |
+| late_frames — sum (reps affected) | 25 (2/6) | **46 (3/6)** |
+| reanchors — sum | 25 | 46 |
+
+**Cold reads off a slow drive DO make playback stutter in bursts**, and the cap
+roughly halves both the dropped-frame count and the cold-spawn tail (1445 ms → 442 ms
+worst case). But it's noisy (n=6; the played stream's own cold read dominates and the
+cap only partially mitigates), so this is *suggestive, not conclusive*. More reps would
+tighten it.
+
+What could NOT be reproduced: the *severe* multi-second droughts. Likely because
+(a) the only slow drives available are SSD-backed (encrypted USB) or SMB-cached (NAS) —
+no HDD to seek-thrash, the most plausible drought mechanism; and (b) the heavy read
+patterns the commit may have been reacting to (the bulk anim-sheet sweep, the full-clip
+`fps=` decode) have since been **removed** (b6bcedf and earlier). The current thumb sweep
+reads only a seeked keyframe region per clip — small — so it doesn't saturate a modern
+drive enough to starve a low-bitrate stream.
+
+### Methodology note (a harness fix this experiment forced)
+
+The disk effect was **invisible in the first cold-wifi `compare.md`**: it aggregated
+counters by **median**, and `late_frames` is mostly zero with occasional spikes, so the
+median read `0` and the delta showed `+0.00`. Burst counters (late_frames, reanchors,
+evictions) now aggregate by **mean** — the spikes are the signal. Steady per-run measures
+(wall, frames, tick_ms) keep the outlier-robust median. Regression test:
+`burst_counters_report_mean_not_median`.
