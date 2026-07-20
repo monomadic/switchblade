@@ -1,0 +1,180 @@
+# Benchmark instrumentation — task plan
+
+Goal: repeatable, scripted benchmark runs of the real app that record everything and
+compute per-run summaries; **interpretation is retrospective and agentic**, not baked
+into the apparatus. A scenario states its intent in prose; the runner only measures.
+
+## Settled design decisions
+
+- **Two tiers, one scenario format.** Tier A drives `sb-app` headlessly through the
+  `App` trait (real decoders, real ffmpeg workers, real cache — no GPU/display).
+  Tier B (`--bench` flag on the real binary) runs the same script inside the real
+  winit/wgpu loop for GPU-side truth.
+- **Tier claim boundaries are explicit** (Phase 0.5): some questions are inherently
+  Tier B — upload stalls, present-to-present gaps, blur cost, visible jank. Tier A
+  may support decode/pacing/latency/cache claims only, and only comparatively.
+  Neither tier replaces the live feel evaluation PLAN §15 requires for the
+  attention-lane verdict.
+- **Tier A shares the real redraw scheduler.** It must NOT step `frame()` at a fixed
+  cadence — the real loop's behavior hangs off `Frame.animating`, `redraw_at`,
+  worker wakes, the 10Hz idle tick, `MIN_FRAME`, and the dt clamp
+  (`sb-window/src/lib.rs` `RedrawRequested` + `about_to_wait`). Fixed polling would
+  manufacture idle redraws AND inflate `drain_media` throughput (upload budget is
+  per-frame), making cache-fill timings fiction. The scheduling policy gets
+  extracted into a small shared component both sb-window and the harness use, so
+  they cannot drift.
+- **One child process per repetition.** `cache_root()` and the cache-key fingerprint
+  are process-global `OnceLock`s (first write wins) — in-process repeats would
+  silently reuse run 1's cache root. The orchestrator prepares each temp
+  environment, then launches a fresh runner process per run; panic/exit codes feed
+  the validity gate.
+- **No expectation engine.** No thresholds, no pass/fail assertions, no baseline
+  regression flags in code. Expected behavior lives as **prose** in the scenario
+  file, handed to whoever (usually an agent) interprets the recorded data later.
+- **Derive mechanically, judge agentically.** The runner emits the full event stream
+  (JSONL) *and* a computed summary (percentiles, counts, curves). Computing a p95 is
+  code's job; deciding whether it means the change helped is the reader's.
+- **Thin validity gate, not assertions.** A run is stamped `valid`/`invalid` on
+  mechanical grounds only (clean exit, script completed, required readiness
+  conditions met, ticks recorded). Never `good`/`bad`. Mechanical requirements
+  ("the stream spawned") live in the scenario as explicit validity conditions,
+  separate from the prose performance intent.
+- **Hermetic environment.** Temp `HOME` isolates the cache; `no_config: true` +
+  programmatic `Tuning` overrides; synthesized fixture clips on the internal disk
+  (external-drive I/O gets its own dedicated scenario, never mixed into decode
+  measurements).
+- **"Cold" is three axes, recorded per run:** app cache (empty / seeded), source
+  page cache (uncontrolled / warmed — flushing the OS cache is intrusive, so we
+  label rather than control it), decoder (cold / resident / warm-promoted).
+  Warm-up-run discard is scenario-specific: discarding the first run of a
+  cold-start scenario discards the condition being measured.
+- Scenario files are TOML under `benchmarks/scenarios/`; runs land under
+  `benchmarks/reports/`.
+- **Retention:** committed reports are self-contained — each report gets a
+  compressed bundle (summaries + raw JSONL + environment fingerprint) alongside it,
+  or is explicitly local-only. No links from committed markdown into gitignored
+  paths.
+
+## Phase 0 — definitions & contracts (before any implementation)
+
+- [ ] **0.1 Measurement/event dictionary**: write down every recorded event and
+      timing with precise start/stop points. Latency classes are NOT conflated —
+      at minimum: decoder spawn → first frame ready; user action → first frame
+      *served* by the app; user action → first frame *presented* (Tier B only);
+      warm promotion → queued frame served (a promotion is not a spawn — its
+      decoder may have parked frames long before the action). Every event carries
+      clip ID, lane class, and a lane-generation ID so a late result from an
+      obsolete lane can never be credited to the current action.
+- [ ] **0.2 Scheduler policy extraction**: factor the redraw-scheduling decision
+      (animating → display cadence with `MIN_FRAME` floor; idle → earliest of
+      10Hz tick / `redraw_at` / worker wake) out of `sb-window::about_to_wait`
+      into a small shared, unit-testable component. sb-window adopts it; Tier A
+      reuses it verbatim.
+- [ ] **0.3 Process-per-run orchestration contract**: orchestrator ↔ runner
+      protocol — env prep, scenario handoff, JSONL/summary output paths, exit
+      codes for the validity gate.
+- [ ] **0.4 Readiness semantics**: `wait_until` as a first-class synchronization
+      primitive with timeout + recorded outcome. Named conditions: library count
+      reached, ingest closed, selected stream served a frame, grid settled, cache
+      sweep complete. Scenarios reference fixtures by **name/role**, not raw tile
+      index.
+- [ ] **0.5 Tier A vs Tier B claim boundary doc**: per metric, which tier may
+      support it (see settled decisions).
+
+## Phase 1 — probes (useful standalone)
+
+- [ ] **1.1 Two-layer probe contract**: cheap monotonic counters/gauges compiled in
+      always (frames by cause, late frames, atlas slots/evictions, drain-budget
+      hits) + **timestamped event tracing enabled only for bench runs**, emitted
+      from BOTH layers — sb-app alone cannot see media-side events (re-anchors
+      happen inside `SeekablePlayer`). Existing `RedrawStats` folds into this
+      rather than growing.
+- [ ] **1.2 Latency events per the 0.1 dictionary**: spawn/serve/promotion events
+      with clip + lane class + lane-generation IDs, from both sb-app and sb-media.
+- [ ] **1.3 Cache progress probe**: thumbs-on-disk count over time via a counter
+      (the gen sweep already knows), not per-tick dir stats.
+- [ ] **1.4 Buffered event sink**: never write JSONL synchronously inside the
+      measured window — bounded in-memory buffer, flushed after the window (or an
+      async sink with quantified overhead). Matters doubly for external-drive
+      scenarios.
+
+## Phase 2 — fixtures
+
+- [ ] **2.1 Fixture generator** (script or xtask): deterministic ffmpeg-synthesized
+      corpus into `benchmarks/fixtures/` (gitignored, regenerated on demand),
+      color bars + burned-in timecode. Matrix targets the known fault lines:
+      h264 1080p30, **4K60 hevc**, **10-bit hevc**, long-GOP sparse-keyframe (for
+      exact-seek cost), a VFR case, a rotated/portrait case, and one software-path
+      codec (VP9 or AV1). ≥8s duration wherever pacing/looping matters. Runs
+      record **ffmpeg version + exact generation command + artifact hash** —
+      identical args do NOT guarantee identical files across ffmpeg builds.
+- [ ] **2.2 Cache seeding helper**: produce a warmed cache dir for a fixture set
+      (run the gen sweep once, snapshot the dir) so warm-start scenarios copy it in
+      instead of regenerating.
+
+## Phase 3 — headless runner (Tier A)
+
+- [ ] **3.1 Scenario TOML format + parser**: `[setup]` (fixtures by role, cache
+      state, tuning overrides, viewport, animation level), `[[actions]]` timeline
+      (timed actions + `wait_until` readiness conditions per 0.4),
+      `[validity]` (mechanical requirements), `intent = """prose expected
+      behavior"""`. Reuse the tuning parser's toml dep.
+- [ ] **3.2 Runner binary** (in sb-app so internals stay visible): builds the
+      hermetic env, drives `frame()` through the **shared scheduler component**
+      (0.2) in real wall-clock time, translates semantic actions to `InputEvent`s
+      via live layout queries (`tile_rect` — scripts must survive layout changes),
+      records via the buffered sink.
+- [ ] **3.3 Validity gate**: stamp each run `valid`/`invalid` from exit status +
+      the scenario's `[validity]` conditions + readiness-timeout outcomes. Invalid
+      runs are kept but excluded from summaries by default.
+- [ ] **3.4 Summary computation**: per run — late-frame count/rate, latency
+      percentiles **per 0.1 class** (never pooled across classes),
+      tick-duration percentiles, thumbs-over-time curve, CPU time including
+      subprocess children (`RUSAGE_CHILDREN` — live decode is in-process, but the
+      gen sweep is ffmpeg children), runner peak RSS (child RSS sampled
+      best-effort only), and **decoder/thread counts over time** with
+      return-to-baseline after lane teardown as the leak canary (a raw end-of-run
+      thread count is meaningless — resident workers are legitimate).
+- [ ] **3.5 Repeat orchestration**: N runs per scenario (default 5), **one child
+      process per run** (0.3), serialized (never parallel — ffmpeg contention
+      skews timing), warm-up-discard only where the scenario opts in. Environment
+      fingerprint per run: git SHA, dirty flag, machine, power source, fixture-dir
+      volume, ffmpeg version, cold-axes labels (see settled decisions).
+- [ ] **3.6 Port the two seed scenarios** (rewritten with readiness waits, not raw
+      timestamps): (a) cold start → wait for ingest + first row of thumbs → open
+      first clip in quickview, watching pacing + cache fill; (b) cold start via
+      stdin → wait for library count → scroll to end → hover the last fixture by
+      role, watching hover→first-frame-served latency.
+
+## Phase 4 — reporting
+
+- [ ] **4.1 Report generator**: subcommand that takes run summaries →
+      `benchmarks/reports/<date>-<sha>-<label>.md` — per-scenario tables (median ±
+      spread), environment fingerprint, the scenario's prose intent quoted at the
+      top, plus the compressed raw-trace bundle per the retention policy.
+      Markdown first; an HTML/chart variant only if tables prove insufficient.
+- [ ] **4.2 Compare mode**: same generator, two labeled run sets side by side with
+      computed deltas (numbers only, no verdicts) — the artifact an agent or human
+      reads to answer "did the change help?". Supports interleaved A/B runs
+      (alternate binaries back-to-back to dodge thermal drift).
+
+## Phase 5 — expansion (as experiments demand)
+
+- [ ] **5.1 More scenarios**: warm-pool advance latency (repeated `l`), quickview
+      open cost, shuffle under load, focus-pause resume, background-sweep-while-
+      watching (priority-inversion guard), external-drive I/O.
+- [ ] **5.2 Tier B `--bench` mode**: real winit/wgpu loop driven by the same
+      scenario script; owns the metrics Tier A is barred from (0.5) —
+      present-to-present intervals, upload bytes/frame, `MEDIA_UPLOAD_BUDGET_LIVE`
+      pressure, blur cost.
+
+## Caveats (stated once, up front)
+
+- Tier A numbers are **comparative, not absolute** — even with scheduler fidelity
+  it has no vsync-blocking present. "Frame served on time" is a proxy for "would
+  have presented on time". Right signal for A/B; wrong for FPS marketing.
+- "Video memory" budgets are simulated via atlas dimensions — that's what actually
+  gates GPU residency here — not a real VRAM cap.
+- Thermal state can swamp small deltas; repeats + medians + interleaved A/B
+  mitigate, never eliminate.
+- The OS page cache is labeled, not controlled (see the cold axes).
