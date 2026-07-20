@@ -6,6 +6,7 @@
 
 mod drag;
 mod render;
+pub mod schedule;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -372,18 +373,6 @@ pub fn run(app: impl App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Redraw cadence while idle — keeps config hot-reload and stdin ingest
-/// ticking without burning CPU on a static grid.
-const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Floor on the continuous-redraw interval. Pacing normally comes from
-/// the blocking vsync present inside `render()`, but any path where the
-/// present is skipped (occluded surface, lost surface) would otherwise
-/// let the Poll loop free-run `frame()` and peg a core. 4ms caps the
-/// runaway at 250fps while staying under every real refresh interval
-/// (240Hz = 4.16ms), so it never throttles a visible window.
-const MIN_FRAME: std::time::Duration = std::time::Duration::from_millis(4);
-
 struct Runner<A: App> {
     app: A,
     /// The app's wake handle (same instance its workers fire) — cleared
@@ -643,42 +632,26 @@ impl<A: App> ApplicationHandler for Runner<A> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Game-style continuous redraw while anything moves; a slow idle
-        // tick otherwise. The app's motion is dt-scaled either way.
-        //
-        // An occluded window never presents (`render()` early-returns
-        // before the blocking vsync wait), so the continuous path has no
-        // pacing there — it would spin `frame()` as fast as the CPU
-        // allows, pegging a core the whole time the app is backgrounded
-        // and leaving the machine saturated by the time it resumes.
-        // Occluded always takes the idle tick, which still keeps stdin
-        // ingest, config reload, and job draining alive at 10Hz.
+        // The redraw cadence lives in `schedule::next_frame` — game-style
+        // continuous redraw while anything moves, a slow idle tick
+        // otherwise, capped by any live-video deadline. The Tier-A
+        // benchmark runner calls the same function so a headless loop
+        // paces exactly like this one; see that module for the rules.
         let Some(w) = &self.window else { return };
-        if self.animating && !self.occluded {
-            // Even here, never trust the present to block: floor the
-            // interval at MIN_FRAME so a skipped present (surface lost,
-            // occlusion the OS didn't report) can't free-run the loop.
-            let next = self.last_frame + MIN_FRAME;
-            if Instant::now() >= next {
-                event_loop.set_control_flow(ControlFlow::Poll);
+        match schedule::next_frame(
+            self.animating,
+            self.occluded,
+            self.redraw_at,
+            self.last_frame,
+            Instant::now(),
+        ) {
+            schedule::NextFrame::Now { poll } => {
+                if poll {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
                 w.request_redraw();
-            } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
             }
-        } else {
-            // Idle — but a live-frame deadline (P1.4) caps the wait so
-            // video presents on schedule between idle ticks. Occluded
-            // ignores the deadline: nothing presents anyway, and the
-            // 10Hz tick keeps the world serviced.
-            let mut next = self.last_frame + IDLE_TICK;
-            if !self.occluded
-                && let Some(t) = self.redraw_at
-            {
-                next = next.min(t);
-            }
-            if Instant::now() >= next {
-                w.request_redraw();
-            } else {
+            schedule::NextFrame::At(next) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(next));
             }
         }
