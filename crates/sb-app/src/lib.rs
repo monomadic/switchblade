@@ -116,6 +116,36 @@ struct FlexRow {
     w: Vec<f32>,
 }
 
+/// Per-clip zoom-reflow animation for the flexible grid (see `step_reflow`).
+/// `rect` is the smoothed content-space rect currently displayed — it chases
+/// the layout's `tile_rect` so a re-justify or slot shift glides instead of
+/// popping. When the clip crosses a row boundary a `WrapEvent` starts: the
+/// tile slides off one window edge while the same clip re-enters on the new
+/// row from the opposite edge. Indexed by clip; reseeded on `grid_rev` bumps.
+#[derive(Clone, Copy, Default)]
+struct TileReflow {
+    /// Smoothed displayed rect (x, y, w, h), content space (scroll not applied).
+    rect: [f32; 4],
+    /// Row the clip is settling into.
+    row: u32,
+    /// False until seeded from a layout — fresh/reset/off-screen clips snap.
+    init: bool,
+    /// Active row crossing, if any.
+    wrap: Option<WrapEvent>,
+}
+
+#[derive(Clone, Copy)]
+struct WrapEvent {
+    /// The rect the clip is leaving (content space) — the exit copy's anchor.
+    from: [f32; 4],
+    /// Milliseconds elapsed, accumulated from `dt` (not wall-clock) so the
+    /// slide stays frame-rate independent. Reaches `zoom_wrap_ms` to finish.
+    elapsed: f32,
+    /// True = crossing to a later row (zoom-in): exit right, enter from left.
+    /// False = earlier row (zoom-out): exit left, enter from right.
+    forward: bool,
+}
+
 /// Cache key for the flexible layout — every input that shapes it.
 /// f32 inputs are compared by bit pattern.
 #[derive(Clone, Copy, PartialEq)]
@@ -432,6 +462,12 @@ pub struct Switchblade {
     last_cols: usize,
     last_tiles: Vec<Tile>,
     transition: Option<(Vec<Tile>, Instant)>,
+    /// Per-clip zoom-reflow state (flexible grid + `zoom_wrap`): smoothed
+    /// displayed rects + active row-wrap events. Empty when the wrap path is
+    /// inactive (fixed grid, modal, `zoom_wrap` off). Deliberately NOT reset
+    /// on `grid_rev` (thumb arrivals bump it constantly); the index-remap
+    /// sites (shuffle, D swap) clear it explicitly instead.
+    reflow: Vec<TileReflow>,
     /// App start, the time base for looping micro-animations (loading dots).
     t0: Instant,
     /// Springs still in flight this frame (drives idle throttling).
@@ -688,6 +724,7 @@ impl Switchblade {
             last_cols: 0,
             last_tiles: Vec::new(),
             transition: None,
+            reflow: Vec::new(),
             t0: Instant::now(),
             motion: true,
             wake_until: Instant::now() + Duration::from_secs(1),
@@ -960,6 +997,114 @@ impl Switchblade {
         }
     }
 
+    /// Whether the row-wrap reflow animation is live this frame (flexible
+    /// grid, `zoom_wrap` on, no modal, animation level with UI tweens).
+    fn reflow_active(&self, lay: &Layout) -> bool {
+        lay.flex.is_some()
+            && self.tuning.zoom_wrap
+            && !(self.quickview || self.fullview)
+            && self.level().ui()
+    }
+
+    /// Advance the per-clip reflow table: seed fresh clips, glide re-justified
+    /// tiles toward their new slot, and — on a frame where the layout zoom
+    /// moved (`zoomed`) — start a wrap for each clip crossing a row boundary.
+    /// Only visible rows are stepped (off-screen clips stay `init = false` and
+    /// snap when they scroll in). Sets `motion` while any wrap or glide runs.
+    fn step_reflow(&mut self, dt: f32, lay: &Layout, zoomed: bool) {
+        if !self.reflow_active(lay) {
+            // Drop the table so a re-enable reseeds cleanly (and so eviction
+            // of the flex grid can't leave stale rects behind).
+            if !self.reflow.is_empty() {
+                self.reflow.clear();
+            }
+            return;
+        }
+        // Grow/shrink to match the library. New entries snap in (init =
+        // false); existing tiles keep animating — an ingest arrival must not
+        // reset the whole grid. Index remaps (shuffle, D swap) instead clear
+        // the table at their call sites, forcing a clean reseed here.
+        if self.reflow.len() != self.clips.len() {
+            self.reflow.resize(self.clips.len(), TileReflow::default());
+        }
+        let a = alpha(self.tuning.zoom_reflow_smoothing, dt);
+        let wrap_ms = self.tuning.zoom_wrap_ms.max(1.0);
+        let dt_ms = dt * 1000.0;
+        // Advance and retire every in-flight wrap first — visible or not. A
+        // tile can wrap and then scroll off before it lands; if only visible
+        // rows were ticked its `elapsed` would freeze and the wrap (and the
+        // motion flag it raises) would live forever, pinning the render loop.
+        let mut any_wrap = false;
+        for r in &mut self.reflow {
+            if let Some(w) = &mut r.wrap {
+                w.elapsed += dt_ms;
+                if w.elapsed >= wrap_ms {
+                    r.wrap = None;
+                } else {
+                    any_wrap = true;
+                }
+            }
+        }
+        let (first, last) = self.visible_rows(lay, 1);
+        let mut gliding = false;
+        for row in first..=last {
+            for i in self.row_range(lay, row) {
+                let (tx, ty, tw, th) = self.tile_rect(lay, i);
+                let target = [tx, ty, tw, th];
+                let trow = self.row_of(lay, i) as u32;
+                let Some(r) = self.reflow.get_mut(i) else {
+                    continue;
+                };
+                if !r.init {
+                    r.rect = target;
+                    r.row = trow;
+                    r.init = true;
+                    r.wrap = None;
+                } else if trow != r.row {
+                    // Crossed a boundary. Only a zoom repack (this frame's
+                    // layout zoom moved) wraps; a row change while settled
+                    // came from an aspect/thumb arrival or a window resize —
+                    // snap those (the glide absorbs shape shifts) so a
+                    // loading library doesn't fling tiles around. An
+                    // arrival mid-wrap must NOT kill other tiles' in-flight
+                    // wraps — only this tile's own state is touched.
+                    if zoomed {
+                        // Anchor the exit copy where the tile was displayed;
+                        // the enter slide carries the new slot in from the
+                        // opposite window edge (build_frame).
+                        r.wrap = Some(WrapEvent {
+                            from: r.rect,
+                            elapsed: 0.0,
+                            forward: trow > r.row,
+                        });
+                    } else {
+                        r.wrap = None;
+                    }
+                    r.row = trow;
+                    r.rect = target;
+                } else {
+                    let mut delta: f32 = 0.0;
+                    for (cur, tgt) in r.rect.iter_mut().zip(target) {
+                        *cur += (tgt - *cur) * a;
+                        delta = delta.max((tgt - *cur).abs());
+                    }
+                    // The glide is motion too: with the layout zoom snapping
+                    // in wrap mode, these tweens ARE the zoom animation — if
+                    // they don't hold the loop awake it freezes mid-glide.
+                    if delta > 0.3 {
+                        gliding = true;
+                    }
+                }
+                if r.wrap.is_some() {
+                    any_wrap = true;
+                }
+            }
+        }
+        if any_wrap || gliding {
+            self.motion = true;
+        }
+    }
+
     fn max_scroll(&self, lay: &Layout) -> f32 {
         (self.content_height(lay) - self.viewport.height).max(0.0)
     }
@@ -1122,6 +1267,9 @@ impl Switchblade {
         self.clips = order.iter().map(|&o| old[o].take().unwrap()).collect();
         // Same length, new order: the flexible layout must rebuild.
         self.grid_rev = self.grid_rev.wrapping_add(1);
+        // reflow[i] now names a different clip — drop it so the wrap table
+        // reseeds cleanly (the shuffle rides the crossfade, not the wrap).
+        self.reflow.clear();
         let remap = |i: &mut usize| {
             if let Some(&ni) = new_of_old.get(*i) {
                 *i = ni;
@@ -1699,6 +1847,7 @@ impl Switchblade {
         // listing stream in (thumbs re-serve from the disk cache).
         self.chapters = None; // the bar's clip context is gone
         self.clips.clear();
+        self.reflow.clear(); // index-keyed wrap state; the siblings restream
         self.grid_rev = self.grid_rev.wrapping_add(1);
         self.index.clear();
         self.slots.fill(None);
@@ -2178,11 +2327,25 @@ impl Switchblade {
         let ui = self.level().ui();
         let a_of = |k: f32| if ui { alpha(k, dt) } else { 1.0 };
 
-        // Zoom spring, anchored so the content at the viewport center stays
-        // put while tile size (and column count) reflows around it.
+        // Zoom, anchored so the content at the viewport center stays put
+        // while tile size (and row packing) reflows around it. In wrap mode
+        // (flexible grid) the LAYOUT zoom snaps straight to its target and
+        // the per-clip reflow tweens (rect glide + row-wrap slide) carry all
+        // the visible motion — one repack, one wrap per crossing tile, like
+        // the prototype tweening two settled layouts. Springing the zoom
+        // instead repacked the rows at every intermediate value, restarting
+        // a far-down tile's wrap several times per glide from an already-
+        // snapped rect: a flickery ghost-fade, then a snap at the spring
+        // tail. The fixed grid keeps the spring + crossfade.
         let old_zoom = self.zoom;
-        self.zoom += (self.zoom_target - self.zoom) * a_of(t.zoom_smoothing);
-        if (self.zoom - old_zoom).abs() > 1e-5 {
+        let wrap_mode = ui && t.zoom_wrap && t.grid_layout == GridStyle::Flexible;
+        if wrap_mode {
+            self.zoom = self.zoom_target;
+        } else {
+            self.zoom += (self.zoom_target - self.zoom) * a_of(t.zoom_smoothing);
+        }
+        let zoomed = (self.zoom - old_zoom).abs() > 1e-5;
+        if zoomed {
             let old_h = self.content_height(&self.layout_with(old_zoom));
             let new_h = self.content_height(&self.layout_with(self.zoom));
             if old_h > 0.0 {
@@ -2288,6 +2451,9 @@ impl Switchblade {
         }
         self.motion = motion;
 
+        // Per-clip zoom-reflow: smooth re-justify glides + row-wrap events.
+        self.step_reflow(dt, &lay, zoomed);
+
         // Quickview filmstrip slides with the same curve as keyboard moves.
         // While a scroll/scrub gesture is live the strip eases toward the
         // free-float `strip_target`; once the gesture settles the target homes
@@ -2355,10 +2521,10 @@ impl Switchblade {
     /// order: the resident thumb, the session-persistent `Clip.aspect`
     /// (so atlas eviction never reshapes anything), then the memoized
     /// probe meta — the chapter bar images its chips from the anim sheet,
-    /// which is crop-filled to 16:9 and can't reveal the true shape, so a
-    /// clip reached without its static thumb atlas-resident (jumped to via
-    /// random/shuffle, or the bar opened before the thumb landed) relies
-    /// on the meta's real dims to avoid a 16:9 default.
+    /// which this shape lookup doesn't consult, so a clip reached without
+    /// its static thumb atlas-resident (jumped to via random/shuffle, or
+    /// the bar opened before the thumb landed) relies on the meta's real
+    /// dims to avoid a 16:9 default.
     fn chip_aspect(&self, i: usize) -> f32 {
         let c = self.clips.get(i);
         let a = match c.map(|c| &c.thumb) {
@@ -3228,6 +3394,7 @@ impl Switchblade {
 
         let now = Instant::now();
         let anim_t = now.saturating_duration_since(self.t0).as_secs_f32();
+        let reflow_on = self.reflow_active(&lay);
         let skip_bar = self.skip_bar();
         let mut tiles = Vec::new();
         // Z-order: grid tiles, then the hovered tile lifted above its
@@ -3265,7 +3432,48 @@ impl Switchblade {
         } else if backdrop_grid {
             for row in first_row..=last_row {
                 for i in self.row_range(&lay, row) {
-                    let (tx, ty, tw_g, th_g) = self.tile_rect(&lay, i);
+                    // Displayed rect: the smoothed reflow rect (so a zoom
+                    // re-justify glides) when active, else the raw layout.
+                    // A wrapping clip draws its enter copy here, slid in from
+                    // the opposite window edge, and an exit copy at the push
+                    // site below sliding off the edge it left.
+                    let rf = self
+                        .reflow
+                        .get(i)
+                        .copied()
+                        .filter(|_| reflow_on)
+                        .filter(|r| r.init);
+                    let mut wrap_exit: Option<[f32; 4]> = None;
+                    let (tx, ty, tw_g, th_g) = match rf {
+                        Some(r) => {
+                            let vw = self.viewport.width;
+                            let gp = t.gap;
+                            if let Some(w) = r.wrap {
+                                let ease = |x: f32| {
+                                    let x = x.clamp(0.0, 1.0);
+                                    if x < 0.5 {
+                                        4.0 * x * x * x
+                                    } else {
+                                        1.0 - (-2.0 * x + 2.0).powi(3) * 0.5
+                                    }
+                                };
+                                let stagger = r.row as f32 * t.zoom_wrap_stagger_ms;
+                                let p = ease((w.elapsed - stagger) / t.zoom_wrap_ms.max(1.0));
+                                // Enter copy slides in from the opposite edge.
+                                let enter0 = if w.forward { -(r.rect[2] + gp) } else { vw + gp };
+                                let ex = enter0 + (r.rect[0] - enter0) * p;
+                                // Exit copy slides the old rect off its edge.
+                                let exit1 = if w.forward { vw + gp } else { -(w.from[2] + gp) };
+                                let mut fr = w.from;
+                                fr[0] += (exit1 - w.from[0]) * p;
+                                wrap_exit = Some(fr);
+                                (ex, r.rect[1], r.rect[2], r.rect[3])
+                            } else {
+                                (r.rect[0], r.rect[1], r.rect[2], r.rect[3])
+                            }
+                        }
+                        None => self.tile_rect(&lay, i),
+                    };
                     let clip = &self.clips[i];
 
                     // Spawn fade/scale-in.
@@ -3476,6 +3684,18 @@ impl Switchblade {
                     } else {
                         &mut tiles
                     };
+                    // The exit copy: same clip/texture, positioned on the row
+                    // it left (its uv crop matches — same aspect, so cloning
+                    // and overriding the rect is exact). Drawn under the enter
+                    // copy; the window bounds clip whatever slides off-edge.
+                    if let Some(fr) = wrap_exit {
+                        let mut exit = tile;
+                        exit.x = fr[0];
+                        exit.y = fr[1] - self.scroll;
+                        exit.w = fr[2];
+                        exit.h = fr[3];
+                        out.push(exit);
+                    }
                     out.push(tile);
                     if clip.cloud && w > 70.0 {
                         push_cloud_badge(out, &tile, ease);
@@ -3505,9 +3725,12 @@ impl Switchblade {
         // the previous layout fades out on top of the new one — never
         // behind a modal, where the frozen backdrop can't reflow and a
         // crossfade would just be invisible churn.
+        // The flexible grid wraps its zoom reflow (per-clip, above), so the
+        // cols-change crossfade is only for the fixed grid here; shuffle and
+        // the D swap still set `transition` directly at their call sites.
         if modal {
             self.transition = None;
-        } else if ui && lay.cols != self.last_cols && !self.last_tiles.is_empty() {
+        } else if ui && !reflow_on && lay.cols != self.last_cols && !self.last_tiles.is_empty() {
             self.transition = Some((std::mem::take(&mut self.last_tiles), now));
         }
         self.last_cols = lay.cols;
@@ -3911,10 +4134,11 @@ impl Switchblade {
                         let (w, h) = (cw * s, chh * s);
                         let cx = vw * 0.5 + (i as f32 - center) * step;
                         // The nearest anim-sheet cell to this chapter's
-                        // timestamp, center-cropped from the 16:9 cell to
-                        // the chip's (= clip's) aspect so nothing ever
-                        // stretches. Landscape clips crop ~nothing;
-                        // portrait chips show the cell's center band.
+                        // timestamp. Cells are now the source's true aspect
+                        // (= the chip's aspect), so this center-crop is
+                        // essentially identity — it stays only to absorb
+                        // rounding between the cell box and the chip shape,
+                        // and never stretches.
                         let uv = match (anim_src, d) {
                             (Some((slot, tw, th)), Some(d)) => {
                                 let g = self.anim_grid.max(1) as usize;
@@ -6438,6 +6662,152 @@ mod tests {
         let lay = app.layout();
         assert_eq!(app.row_of(&lay, app.selected), 0, "moved back to row 0");
         assert_eq!(Some(app.selected), app.nearest_in_row(&lay, 0, cx));
+    }
+
+    /// A zoom reflow in the flexible grid wraps the tiles that cross a row
+    /// boundary — each leaves a `WrapEvent` (forward on zoom-in) so it slides
+    /// off one edge and re-enters on the next row, adding an exit copy to the
+    /// frame — instead of firing the column-count crossfade. Wraps clear after
+    /// `zoom_wrap_ms` and every displayed rect settles onto its layout slot.
+    #[test]
+    fn flexible_zoom_wraps_tiles_across_row_boundaries() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Minimal), // ui() true, so the wrap path runs
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        // Demo tiles fade in on a real-clock stagger into the future; backdate
+        // them so they're fully spawned (this tight loop advances no real time,
+        // and Minimal keeps fades real — unlike the None most tests use).
+        let past = Instant::now() - Duration::from_secs(5);
+        for c in &mut app.clips {
+            c.spawned = past;
+        }
+        // First frame seeds the reflow table at zoom 1.0.
+        let _ = app.frame(0.016, vp);
+        assert!(
+            app.reflow_active(&app.layout()),
+            "wrap path is on for flexible + minimal animation"
+        );
+        assert!(
+            app.reflow.iter().any(|r| r.init),
+            "the first frame seeded the reflow table"
+        );
+        let rows0: Vec<u32> = {
+            let lay = app.layout();
+            (0..app.clips.len())
+                .map(|i| app.row_of(&lay, i) as u32)
+                .collect()
+        };
+
+        // A zoom keypress: the target moves, and in wrap mode the layout zoom
+        // snaps to it in ONE frame (one repack — springing through
+        // intermediate packings restarted wraps mid-flight, the ghost-fade
+        // bug). The per-clip tweens carry the visible motion instead.
+        app.set_zoom(1.7);
+        let f1 = app.frame(0.016, vp);
+        assert!(
+            (app.zoom - 1.7).abs() < 1e-6,
+            "wrap mode snaps the layout zoom to its target in one frame"
+        );
+
+        let wrapped: Vec<usize> = app
+            .reflow
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.wrap.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !wrapped.is_empty(),
+            "a zoom-in reflow wraps boundary-crossing tiles"
+        );
+        for &i in &wrapped {
+            let w = app.reflow[i].wrap.unwrap();
+            assert!(w.forward, "clip {i} wraps forward on zoom-in (exit right)");
+            assert_ne!(
+                w.from[0], app.reflow[i].rect[0],
+                "clip {i} left a slot different from where it lands"
+            );
+        }
+        assert!(
+            app.transition.is_none(),
+            "the flexible grid wraps its zoom reflow instead of crossfading"
+        );
+
+        // Let the wrap window elapse; capture a settled frame at the SAME zoom.
+        for _ in 0..40 {
+            let _ = app.frame(0.016, vp);
+        }
+        let settled = app.frame(0.016, vp);
+        assert!(
+            app.reflow.iter().all(|r| r.wrap.is_none()),
+            "every wrap clears after zoom_wrap_ms"
+        );
+        assert!(
+            f1.tiles.len() > settled.tiles.len(),
+            "exit copies added tiles during the wrap ({} vs settled {})",
+            f1.tiles.len(),
+            settled.tiles.len()
+        );
+
+        let lay = app.layout();
+        let (first, last) = app.visible_rows(&lay, 0);
+        for row in first..=last {
+            for i in app.row_range(&lay, row) {
+                let (x, y, w, h) = app.tile_rect(&lay, i);
+                let r = app.reflow[i].rect;
+                assert!(
+                    (r[0] - x).abs() < 0.6
+                        && (r[1] - y).abs() < 0.6
+                        && (r[2] - w).abs() < 0.6
+                        && (r[3] - h).abs() < 0.6,
+                    "clip {i} reflow rect settles onto its layout slot"
+                );
+            }
+        }
+        let rows1: Vec<u32> = (0..app.clips.len())
+            .map(|i| app.row_of(&lay, i) as u32)
+            .collect();
+        assert_ne!(rows0, rows1, "the zoom-in actually changed the row packing");
+
+        // Regression: a real library bumps grid_rev constantly as thumbs and
+        // aspects land. That must neither reset the wrap table mid-zoom nor
+        // kill in-flight wraps (both made the whole grid snap). Zoom while
+        // thrashing grid_rev every frame: wraps fire on the repack frame and
+        // keep running through later arrival frames.
+        app.set_zoom(app.zoom_target * 1.3);
+        let mut saw_wrap = false;
+        let mut survived = false;
+        for f in 0..8 {
+            app.grid_rev = app.grid_rev.wrapping_add(1); // a thumb "arrives"
+            let _ = app.frame(0.016, vp);
+            if app.reflow.iter().any(|r| r.wrap.is_some()) {
+                saw_wrap = true;
+                if f >= 2 {
+                    survived = true; // still wrapping frames after its start
+                }
+            }
+        }
+        assert!(
+            saw_wrap && survived,
+            "zoom wraps fire and outlive grid_rev bumps from arrivals \
+             (saw {saw_wrap}, survived {survived})"
+        );
+
+        // zoom_wrap off: the path disengages and the table is dropped (the
+        // fixed-grid/shuffle crossfade takes over instead).
+        app.tuning.zoom_wrap = false;
+        let _ = app.frame(0.016, vp);
+        assert!(
+            app.reflow.is_empty(),
+            "turning zoom_wrap off clears the reflow table"
+        );
     }
 
     /// End to end: `g` enters fullview and raises the bar, the probe

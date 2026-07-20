@@ -76,13 +76,21 @@ scale_smoothing = 0.35  # tiles growing/shrinking (hover, selection)
 fade_in_ms = 20.0  # newly appearing tiles fade in over this long
 
 # ── Feel: zoom ──────────────────────────────────────────────────────────
-# Pinch-to-zoom (also the -/=/0 keys). Zoom scales the ideal tile width,
-# so columns reflow; the reflow crossfades over zoom_fade_ms.
+# Pinch-to-zoom (also the -/=/0 keys). Zoom scales the ideal tile width, so
+# rows reflow. In the flexible grid the reflow WRAPS: a tile crossing a row
+# boundary slides off one window edge and re-enters on the next row from the
+# opposite edge (no fade), while tiles that just re-justify glide to their new
+# slot. zoom_fade_ms is the crossfade used by the fixed grid and by shuffle/
+# library-swap rearranges (and by the flexible grid when zoom_wrap = false).
 pinch_sensitivity = 1.0
 zoom_min = 0.35
 zoom_max = 3.0
-zoom_smoothing = 0.35
+zoom_smoothing = 0.35       # fixed grid only; with zoom_wrap the layout snaps and the tile tweens ARE the zoom animation
 zoom_fade_ms = 180.0
+zoom_wrap = true            # flexible grid: wrap the zoom reflow (off = crossfade)
+zoom_wrap_ms = 220.0        # duration of one tile's row-wrap slide
+zoom_wrap_stagger_ms = 0.0  # per-row delay (0 = all rows wrap in lockstep)
+zoom_reflow_smoothing = 0.25  # glide rate toward the new layout (also paces the zoom feel in wrap mode)
 
 # ── Animation & live video ──────────────────────────────────────────────
 # How much moves — each level includes everything below it:

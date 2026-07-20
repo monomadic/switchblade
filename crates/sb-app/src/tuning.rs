@@ -138,7 +138,23 @@ pub struct Tuning {
     /// 0..1, how fast zoom approaches its target per 60fps frame.
     pub zoom_smoothing: f32,
     /// Crossfade duration when the column count reflows (Photos-style).
+    /// Used for the fixed grid and for shuffle/library-swap rearranges; in
+    /// the flexible grid a zoom reflow instead wraps tiles (see `zoom_wrap`).
     pub zoom_fade_ms: f32,
+    /// Flexible grid only: animate a zoom reflow by *wrapping* tiles that
+    /// cross a row boundary — the tile slides off one window edge and the
+    /// same clip re-enters on the adjacent row from the opposite edge (no
+    /// fade), while tiles that merely re-justify glide to their new slot.
+    /// Off falls back to the crossfade. Fixed grid always crossfades.
+    pub zoom_wrap: bool,
+    /// Duration of a single tile's row-wrap slide.
+    pub zoom_wrap_ms: f32,
+    /// Per-row delay applied to the wrap so the reflow ripples top-to-bottom
+    /// instead of all rows wrapping at once. 0 = every row wraps in lockstep.
+    pub zoom_wrap_stagger_ms: f32,
+    /// 0..1, how fast a non-wrapping tile glides to its re-justified slot
+    /// during a zoom reflow (per 60fps frame, like `scale_smoothing`).
+    pub zoom_reflow_smoothing: f32,
     /// Pause live playback and sheet animation while the window is
     /// unfocused (the grid stays visible, just still — big CPU saver).
     pub pause_unfocused: bool,
@@ -316,6 +332,10 @@ impl Default for Tuning {
             zoom_max: 3.0,
             zoom_smoothing: 0.35,
             zoom_fade_ms: 180.0,
+            zoom_wrap: true,
+            zoom_wrap_ms: 220.0,
+            zoom_wrap_stagger_ms: 0.0,
+            zoom_reflow_smoothing: 0.25,
             pause_unfocused: true,
             recurse: true,
             live_delay_ms: 100.0,
