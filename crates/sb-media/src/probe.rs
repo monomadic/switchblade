@@ -103,7 +103,7 @@ pub struct Counters {
 }
 
 /// A point-in-time read of the counters (serializable for the summary).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CounterSnapshot {
     pub frames: u64,
     pub late_frames: u64,

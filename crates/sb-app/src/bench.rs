@@ -23,6 +23,7 @@ use crate::{AnimLevel, Options, Switchblade};
 use sb_window::{schedule, App, InputEvent, Key, Mods, Viewport};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -119,7 +120,7 @@ pub struct Validity {
 // Report schema (JSON)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Summary {
     pub scenario: String,
     pub intent: String,
@@ -137,7 +138,7 @@ pub struct Summary {
     pub conditions: Vec<CondResult>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LatencyStat {
     pub lane: String,
     pub metric: String,
@@ -147,14 +148,14 @@ pub struct LatencyStat {
     pub max_ms: f64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TickStat {
     pub p50: f64,
     pub p95: f64,
     pub max: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CondResult {
     pub cond: String,
     pub met: bool,
@@ -595,9 +596,255 @@ fn write_events_jsonl(out_dir: &Path, events: &[sb_media::RelEvent]) -> Result<(
     std::fs::write(out_dir.join("events.jsonl"), s).map_err(|e| format!("write events.jsonl: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Orchestration + reporting (Phase 3.5 / 4.1)
+// ---------------------------------------------------------------------------
+
+/// Read a `summary.json` written by [`run`].
+pub fn read_summary(path: &Path) -> Result<Summary, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    sb_media::serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Run a scenario `reps` times, each as a fresh child process with an
+/// isolated temp `HOME` (cold cache — the cache root is a process-global
+/// `OnceLock`, so repeats MUST be separate processes), then write a
+/// markdown report aggregating the per-rep summaries. Runs are serialized
+/// (never parallel — ffmpeg contention skews timing). Returns the report
+/// path.
+///
+/// `exe` is the path to this same `sb-bench` binary (its `run` subcommand
+/// is spawned per rep). The per-rep run dirs and the report land under
+/// `reports_root/<scenario>-<label>/`.
+pub fn orchestrate(
+    exe: &Path,
+    scenario: &Path,
+    reps: usize,
+    label: &str,
+    reports_root: &Path,
+) -> Result<PathBuf, String> {
+    let reps = reps.max(1);
+    let stem = scenario
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("scenario");
+    let bundle = reports_root.join(format!("{stem}-{label}"));
+    std::fs::create_dir_all(&bundle).map_err(|e| format!("mkdir {}: {e}", bundle.display()))?;
+
+    let mut summaries = Vec::new();
+    for rep in 0..reps {
+        let repdir = bundle.join(format!("rep{rep}"));
+        let home = repdir.join("home");
+        eprintln!("[orchestrate] rep {}/{}", rep + 1, reps);
+        let status = Command::new(exe)
+            .arg("run")
+            .arg(scenario)
+            .arg("--out")
+            .arg(&repdir)
+            .arg("--home")
+            .arg(&home)
+            .arg("--keep-home") // orchestrator owns cleanup below
+            .status()
+            .map_err(|e| format!("spawn rep {rep}: {e}"))?;
+        let summary = read_summary(&repdir.join("summary.json"))
+            .map_err(|e| format!("rep {rep}: {e} (child exit: {status})"))?;
+        summaries.push(summary);
+        // The per-rep cache (tens of MB of jpegs) is disposable; keep the
+        // summary + events, drop the home so a large sweep doesn't balloon.
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    let md = markdown(&summaries, reps, label, &fingerprint());
+    let report = bundle.join("report.md");
+    std::fs::write(&report, md).map_err(|e| format!("write {}: {e}", report.display()))?;
+    Ok(report)
+}
+
+/// (median, min, max) of a sample set, or all-zero when empty.
+fn stat3(xs: &[f64]) -> (f64, f64, f64) {
+    if xs.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (pctl(&v, 0.50), v[0], *v.last().unwrap())
+}
+
+fn fmt3(xs: &[f64], unit: &str) -> String {
+    let (m, lo, hi) = stat3(xs);
+    if xs.len() <= 1 {
+        format!("{m:.0}{unit}")
+    } else {
+        format!("{m:.0}{unit} ({lo:.0}–{hi:.0})")
+    }
+}
+
+/// Render the median±spread markdown report over `reps` summaries. Numbers
+/// only — no verdicts; the scenario's prose intent is quoted at the top so
+/// the reader (human or agent) can judge with full context.
+pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> String {
+    use std::collections::BTreeMap;
+    let mut out = String::new();
+    let name = summaries.first().map(|s| s.scenario.as_str()).unwrap_or("?");
+    let valid = summaries.iter().filter(|s| s.valid).count();
+
+    out.push_str(&format!("# Benchmark report — `{name}` [{label}]\n\n"));
+    out.push_str(&format!(
+        "**{valid}/{reps} runs valid.** Median (min–max) across runs; numbers are \
+         comparative — Tier A has no vsync present, so \"served on time\" is a proxy \
+         for \"would have presented\". No verdicts here — judge against the intent.\n\n"
+    ));
+    out.push_str("## Intent\n\n");
+    for line in summaries
+        .first()
+        .map(|s| s.intent.as_str())
+        .unwrap_or("")
+        .lines()
+    {
+        out.push_str(&format!("> {line}\n"));
+    }
+    out.push_str("\n## Environment\n\n");
+    out.push_str(env);
+    out.push('\n');
+
+    // Latency: align (lane, metric) across reps, report median-of-p50 etc.
+    out.push_str("\n## Latency (per lane / class)\n\n");
+    out.push_str("| lane | metric | n (last run) | p50 ms | p95 ms | max ms |\n");
+    out.push_str("|---|---|--:|--:|--:|--:|\n");
+    let mut p50: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let mut p95: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let mut pmax: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let mut lastn: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for s in summaries {
+        for l in &s.latencies {
+            let k = (l.lane.clone(), l.metric.clone());
+            p50.entry(k.clone()).or_default().push(l.p50_ms);
+            p95.entry(k.clone()).or_default().push(l.p95_ms);
+            pmax.entry(k.clone()).or_default().push(l.max_ms);
+            lastn.insert(k, l.count);
+        }
+    }
+    for k in p50.keys() {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            k.0,
+            k.1,
+            lastn.get(k).copied().unwrap_or(0),
+            fmt3(&p50[k], ""),
+            fmt3(&p95[k], ""),
+            fmt3(&pmax[k], ""),
+        ));
+    }
+
+    // Counters + wall/frames.
+    out.push_str("\n## Counters & totals\n\n");
+    out.push_str("| metric | median (min–max) |\n|---|--:|\n");
+    let col = |f: &dyn Fn(&Summary) -> f64| -> Vec<f64> { summaries.iter().map(f).collect() };
+    let rows: [(&str, Vec<f64>); 8] = [
+        ("wall_s", col(&|s| s.wall_s)),
+        ("frames", col(&|s| s.frames as f64)),
+        ("late_frames", col(&|s| s.counters.late_frames as f64)),
+        ("reanchors", col(&|s| s.counters.reanchors as f64)),
+        ("evictions", col(&|s| s.counters.evictions as f64)),
+        ("thumbs_cached", col(&|s| s.counters.thumbs_cached as f64)),
+        ("drain_budget_hits", col(&|s| s.counters.drain_budget_hits as f64)),
+        ("tick_ms p95", col(&|s| s.tick_ms.p95)),
+    ];
+    for (name, xs) in &rows {
+        let (m, lo, hi) = stat3(xs);
+        let cell = if xs.len() <= 1 {
+            format!("{m:.2}")
+        } else {
+            format!("{m:.2} ({lo:.2}–{hi:.2})")
+        };
+        out.push_str(&format!("| {name} | {cell} |\n"));
+    }
+
+    out.push_str("\nRaw per-run `summary.json` + `events.jsonl` are under `repN/` beside this report.\n");
+    out
+}
+
+/// A one-block environment fingerprint (git, ffmpeg, platform). Best
+/// effort — missing tools degrade to "unknown" rather than failing.
+fn fingerprint() -> String {
+    let cmd = |bin: &str, args: &[&str]| -> Option<String> {
+        let o = Command::new(bin).args(args).output().ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let sha = cmd("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = cmd("git", &["status", "--porcelain"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let ffmpeg = cmd("ffmpeg", &["-hide_banner", "-version"])
+        .and_then(|s| s.lines().next().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into());
+    let host = cmd("hostname", &[]).unwrap_or_else(|| "unknown".into());
+    format!(
+        "- git: `{sha}`{}\n- ffmpeg: `{ffmpeg}`\n- platform: `{} {}`\n- host: `{host}`\n",
+        if dirty { " (dirty tree)" } else { "" },
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(scenario: &str, valid: bool, p50: f64, late: u64) -> Summary {
+        Summary {
+            scenario: scenario.into(),
+            intent: "line one\nline two".into(),
+            valid,
+            invalid_reasons: vec![],
+            wall_s: 6.0,
+            frames: 200,
+            counters: sb_media::CounterSnapshot {
+                late_frames: late,
+                thumbs_cached: 1,
+                ..Default::default()
+            },
+            latencies: vec![LatencyStat {
+                lane: "selected".into(),
+                metric: "spawn_to_served".into(),
+                count: 1,
+                p50_ms: p50,
+                p95_ms: p50,
+                max_ms: p50,
+            }],
+            thumbs_curve: vec![[0.0, 0.0], [0.3, 1.0]],
+            tick_ms: TickStat {
+                p50: 0.05,
+                p95: 0.1,
+                max: 0.2,
+            },
+            events: 3,
+            events_dropped: 0,
+            conditions: vec![],
+        }
+    }
+
+    /// The markdown report aggregates median (min–max) across reps, quotes
+    /// the intent, and never emits a verdict.
+    #[test]
+    fn markdown_aggregates_reps_with_spread() {
+        let reps = vec![
+            summary("s", true, 250.0, 0),
+            summary("s", true, 260.0, 0),
+            summary("s", false, 300.0, 4),
+        ];
+        let md = markdown(&reps, 3, "baseline", "- git: `abc`\n");
+        assert!(md.contains("2/3 runs valid"));
+        assert!(md.contains("> line one"), "intent quoted");
+        // Median of {250,260,300} = 260, spread 250–300.
+        assert!(md.contains("260 (250–300)"), "latency median+spread:\n{md}");
+        // late_frames median of {0,0,4} = 0, spread 0–4.
+        assert!(md.contains("0.00 (0.00–4.00)"), "counter median+spread");
+        assert!(!md.to_lowercase().contains("regression"), "no verdicts");
+    }
 
     /// End-to-end: a tiny scenario against a real fixture produces a valid
     /// summary with the selected lane's spawn→served latency recorded.

@@ -151,10 +151,12 @@ seed scenarios (cold h264 first-frame ~255ms, hover-lane ~62ms, 4K60 warm spawn 
       `RUSAGE_CHILDREN`/`wait4` there captures the whole process tree incl.
       ffmpeg workers — the in-process runner can't see its own children's RSS
       cleanly). Thread-count leak canary still TODO.
-- [ ] **3.5 Repeat orchestration**: N runs/scenario (default 5), one child
-      process per run (the bin already isolates HOME), serialized, warm-up
-      discard opt-in, env fingerprint (git SHA, dirty, machine, power, ffmpeg
-      version, cold-axes) + process-tree CPU/RSS. Pairs with Phase 4.
+- [x] **3.5 Repeat orchestration**: `sb-bench bench <scenario> --reps N --label L`
+      spawns N `run` children (one process per rep → fresh temp HOME → cold
+      cache), serialized, drops each rep's cache after reading its summary. Env
+      fingerprint (git SHA + dirty, ffmpeg version, platform, host) captured in
+      the report. TODO: warm-up-discard opt-in, power-source + cold-axes labels,
+      process-tree CPU/RSS (`RUSAGE_CHILDREN`/`wait4` around each child).
 - [x] **3.6 Seed scenarios** ([scenarios/](scenarios/)): `cold_open_quickview`
       (cold → ingest → idle → Space → selected serves → play, watching pacing +
       cache fill) and `hover_last_tile` (cold → ingest → hover last → hover-lane
@@ -162,15 +164,17 @@ seed scenarios (cold h264 first-frame ~255ms, hover-lane ~62ms, 4K60 warm spawn 
 
 ## Phase 4 — reporting
 
-- [ ] **4.1 Report generator**: subcommand that takes run summaries →
-      `benchmarks/reports/<date>-<sha>-<label>.md` — per-scenario tables (median ±
-      spread), environment fingerprint, the scenario's prose intent quoted at the
-      top, plus the compressed raw-trace bundle per the retention policy.
-      Markdown first; an HTML/chart variant only if tables prove insufficient.
-- [ ] **4.2 Compare mode**: same generator, two labeled run sets side by side with
-      computed deltas (numbers only, no verdicts) — the artifact an agent or human
-      reads to answer "did the change help?". Supports interleaved A/B runs
-      (alternate binaries back-to-back to dodge thermal drift).
+- [x] **4.1 Report generator**: `bench::markdown` (pure, unit-tested) →
+      `benchmarks/reports/<scenario>-<label>/report.md` — per-scenario latency +
+      counter tables as **median (min–max) across reps**, environment fingerprint,
+      the prose intent quoted at the top, raw `repN/{summary,events}` bundled
+      alongside. Numbers only, no verdicts. Reports are gitignored (local-only by
+      default; force-add a baseline to commit). Markdown first; HTML/charts only
+      if tables prove insufficient.
+- [ ] **4.2 Compare mode**: two labeled run sets side by side with computed deltas
+      (numbers only, no verdicts) — the "did it help?" artifact. Supports
+      interleaved A/B runs (alternate binaries to dodge thermal drift). The
+      aggregation (`stat3`, per-key alignment) is already factored out for reuse.
 
 ## Phase 5 — expansion (as experiments demand)
 

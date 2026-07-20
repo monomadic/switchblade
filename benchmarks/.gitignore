@@ -1,3 +1,4 @@
-# Generated benchmark run outputs (summary.json, events.jsonl). Raw traces
-# are bundled with a committed report, never checked in loose.
+# Generated benchmark run outputs (summary.json, events.jsonl) and reports.
+# Local-only by default; force-add a meaningful baseline report to commit it.
 **/runs/
+reports/
