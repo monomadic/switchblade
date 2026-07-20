@@ -62,10 +62,8 @@ pub fn next_frame(
         }
     } else {
         let mut next = last_frame + IDLE_TICK;
-        if !occluded {
-            if let Some(t) = redraw_at {
-                next = next.min(t);
-            }
+        if !occluded && let Some(t) = redraw_at {
+            next = next.min(t);
         }
         if now >= next {
             NextFrame::Now { poll: false }

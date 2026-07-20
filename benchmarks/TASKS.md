@@ -75,22 +75,30 @@ implemented; the rest are design contracts consumed by Phase 1–3.
       intent-vs-validity separation. → §0.4
 - [x] **0.5 Tier A vs Tier B claim boundary doc**: per-metric tier ownership. → §0.5
 
-## Phase 1 — probes (useful standalone)
+## Phase 1 — probes (useful standalone) — IMPLEMENTED
 
-- [ ] **1.1 Two-layer probe contract**: cheap monotonic counters/gauges compiled in
-      always (frames by cause, late frames, atlas slots/evictions, drain-budget
-      hits) + **timestamped event tracing enabled only for bench runs**, emitted
-      from BOTH layers — sb-app alone cannot see media-side events (re-anchors
-      happen inside `SeekablePlayer`). Existing `RedrawStats` folds into this
-      rather than growing.
-- [ ] **1.2 Latency events per the 0.1 dictionary**: spawn/serve/promotion events
-      with clip + lane class + lane-generation IDs, from both sb-app and sb-media.
-- [ ] **1.3 Cache progress probe**: thumbs-on-disk count over time via a counter
-      (the gen sweep already knows), not per-tick dir stats.
-- [ ] **1.4 Buffered event sink**: never write JSONL synchronously inside the
-      measured window — bounded in-memory buffer, flushed after the window (or an
-      async sink with quantified overhead). Matters doubly for external-drive
-      scenarios.
+Landed in [`sb-media::probe`](../crates/sb-media/src/probe.rs) (shared types),
+`SeekablePlayer::attach_probe` (media-thread events), and the sb-app wiring
+(`Switchblade::probe()` accessor). Tests: `probe::tests::*` (3),
+`attached_probe_records_decode_ready_from_the_reader_thread` (media thread → sink).
+
+- [x] **1.1 Two-layer probe contract**: `Probe` holds always-on monotonic
+      `Counters` (frames, late_frames, reanchors, drain_budget_hits, evictions,
+      thumbs_cached) + a bench-only event buffer armed by `record_events()`. Emitted
+      from BOTH layers: app-side via `Probe::mark`, media-side via a `LaneProbe`
+      attached to each decoder so the reader thread can emit re-anchors it alone
+      sees. Emission is a no-op (one relaxed load, no `Event` built) until armed.
+- [x] **1.2 Latency events per the 0.1 dictionary**: `DecodeSpawn` /
+      `DecodeReady` / `FrameServed` / `Promotion` / `Reanchor`, each carrying clip
+      path + `Lane` + a monotonic `lane_gen` minted per spawn (`instrument_lane`).
+      Spawn/served/promotion from sb-app; ready/reanchor from the sb-media reader.
+- [x] **1.3 Cache progress probe**: `thumbs_cached` counter bumped on the
+      false→true `cached` transition; the runner samples it per tick for the fill
+      curve (no per-tick dir stats).
+- [x] **1.4 Buffered event sink**: events accumulate in a bounded in-memory Vec
+      (`EVENT_CAP`, overflow counted not written) and are drained/serialized after
+      the window via `Probe::drain(anchor) -> (Vec<RelEvent>, dropped)` — no JSONL
+      I/O inside the measured interval.
 
 ## Phase 2 — fixtures
 

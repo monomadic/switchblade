@@ -79,6 +79,11 @@ struct Shared {
     /// them for the next copy. Lock order: may be taken while `frames`
     /// is held, never the reverse.
     pool: Mutex<Vec<Vec<u8>>>,
+    /// Benchmark instrumentation, attached after spawn (bench runs only,
+    /// `None` otherwise). The reader thread tags its media-side events —
+    /// first-frame-ready and pacing re-anchors — with this lane's
+    /// identity; see `probe.rs`. Locked only at those (rare) branches.
+    probe: Mutex<Option<crate::LaneProbe>>,
 }
 
 /// Recycled buffers kept per player: queue depth + one being copied +
@@ -164,6 +169,7 @@ impl SeekablePlayer {
             failed: AtomicBool::new(false),
             notify: Mutex::new(None),
             pool: Mutex::new(Vec::new()),
+            probe: Mutex::new(None),
         });
         let reader_shared = shared.clone();
         thread::spawn(move || {
@@ -228,6 +234,14 @@ impl SeekablePlayer {
     /// Install the wake fired when a frame lands in an empty queue.
     pub fn set_notify(&self, f: crate::Notify) {
         *self.shared.notify.lock().unwrap() = Some(f);
+    }
+
+    /// Attach benchmark instrumentation so this lane's reader thread emits
+    /// identity-tagged media events (first-frame-ready, re-anchors) and
+    /// bumps the shared counters. Bench runs only; normal runs never call
+    /// it, so the reader's probe branches stay `None`.
+    pub fn attach_probe(&self, lp: crate::LaneProbe) {
+        *self.shared.probe.lock().unwrap() = Some(lp);
     }
 
     /// The newest frame that's due for presentation, if any — identical
@@ -375,6 +389,8 @@ struct Pump<'a> {
     skip_until: Option<f64>,
     /// (wall, pts) pacing anchor; None re-anchors on the next frame.
     anchor: Option<(Instant, f64)>,
+    /// Bench probe: emit `DecodeReady` on the first queued frame only.
+    first_ready: bool,
 }
 
 /// libav's default log callback prints straight to the process's stderr,
@@ -461,6 +477,7 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
             filtered: FramePtr(ffi::av_frame_alloc()),
             skip_until: None,
             anchor: None,
+            first_ready: true,
         };
 
         let seek_to = |target: f64| -> bool {
@@ -665,6 +682,11 @@ impl Pump<'_> {
                     let d = w0 + Duration::from_secs_f64(pts_s - p0);
                     if d + LATE_SLACK < now {
                         self.anchor = Some((now, pts_s)); // late: re-anchor
+                        if let Some(lp) = &*self.shared.probe.lock().unwrap() {
+                            lp.sink.counters.late_frames.fetch_add(1, Ordering::Relaxed);
+                            lp.sink.counters.reanchors.fetch_add(1, Ordering::Relaxed);
+                            lp.mark(now, crate::EventKind::Reanchor);
+                        }
                         now
                     } else {
                         d
@@ -700,6 +722,14 @@ impl Pump<'_> {
             let was_dry = q.is_empty();
             q.push_back((due, pts_s, buf));
             drop(q);
+            // First frame the decoder ever queued: the media end of the
+            // spawn→ready latency (bench probe, no-op otherwise).
+            if self.first_ready {
+                self.first_ready = false;
+                if let Some(lp) = &*self.shared.probe.lock().unwrap() {
+                    lp.mark(now, crate::EventKind::DecodeReady);
+                }
+            }
             // A deadline-sleeping render loop (P1.4) has no due time to
             // wait for while the queue is dry — this push is its wake.
             if was_dry && let Some(f) = &*self.shared.notify.lock().unwrap() {
@@ -891,6 +921,39 @@ mod tests {
             "expected ~30 paced frames in 1s, got {frames}"
         );
         assert!(!p.failed(), "reader reported failure");
+    }
+
+    /// An attached probe records the media-side `DecodeReady` event from
+    /// the reader thread, tagged with this lane's identity — the proof
+    /// that media events reach the shared sink (phase-0-contracts §0.1).
+    #[test]
+    fn attached_probe_records_decode_ready_from_the_reader_thread() {
+        use crate::probe::{Lane, LaneProbe, Probe};
+        let Some(clip) = test_clip("probe.mp4", 4) else {
+            return;
+        };
+        let sink = Probe::new();
+        sink.record_events();
+        let p = SeekablePlayer::spawn(&clip, 320, 180, 0.4, Some(&meta(&clip))).expect("spawn");
+        p.attach_probe(LaneProbe {
+            sink: sink.clone(),
+            lane: Lane::Selected,
+            generation: 7,
+            clip: Arc::from(clip.to_string_lossy().as_ref()),
+        });
+        let anchor = Instant::now();
+        assert!(
+            take_one(&p, Duration::from_secs(3)).is_some(),
+            "no first frame within 3s"
+        );
+        // Give the reader a beat to push+emit before draining.
+        thread::sleep(Duration::from_millis(20));
+        let (evs, _) = sink.drain(anchor);
+        let ready = evs.iter().find(|e| e.kind == "decode_ready");
+        let ready = ready.expect("a decode_ready event was recorded");
+        assert_eq!(ready.lane, "selected");
+        assert_eq!(ready.lane_gen, 7);
+        assert!(ready.clip.as_deref().unwrap().ends_with("probe.mp4"));
     }
 
     /// The pre-warm contract (the warm pool rides SeekablePlayer now): an

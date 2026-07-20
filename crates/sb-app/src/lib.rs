@@ -234,6 +234,8 @@ struct LiveState {
     slot: usize,
     /// Set when the first frame arrives; the tile switches to video then.
     first_frame: Option<Instant>,
+    /// Lane-incarnation id for benchmark events (phase-0-contracts §0.1).
+    generation: u64,
 }
 
 /// The selected clip's live stream: decoded once at quickview resolution
@@ -251,6 +253,8 @@ struct SelLive {
     first_frame: Option<Instant>,
     /// Cached probe duration, for skip targets and the skip flash bar.
     duration: Option<f64>,
+    /// Lane-incarnation id for benchmark events (phase-0-contracts §0.1).
+    generation: u64,
 }
 
 impl SelLive {
@@ -318,6 +322,15 @@ pub struct Switchblade {
     index: HashMap<PathBuf, usize>,
     rx: Option<Receiver<ingest::Ingested>>,
     media: MediaService,
+    /// Benchmark instrumentation (benchmarks/design/phase-0-contracts.md).
+    /// Always present so counters tally in every run; event recording is
+    /// armed only under the bench runner. Cloned into each live decoder
+    /// lane so its media thread can emit identity-tagged events.
+    probe: Arc<sb_media::Probe>,
+    /// Monotonic lane-incarnation id, minted per decoder spawn. Stamped on
+    /// every event so a late frame from an obsolete lane is never credited
+    /// to the current action (phase-0-contracts §0.1).
+    next_lane_gen: u64,
     /// Atlas slot → owner. Fixed pool shared by static thumbs, anim sheets
     /// and the live frame; class+distance-based eviction (see alloc_slot).
     slots: Vec<Option<(usize, SlotKind)>>,
@@ -610,6 +623,13 @@ impl Switchblade {
         Self::with_options(Options::default())
     }
 
+    /// The benchmark instrumentation handle (benchmarks/design/phase-0-contracts.md).
+    /// The bench runner arms event recording on it, samples counters each
+    /// tick, and drains events at the end; normal runs never touch it.
+    pub fn probe(&self) -> Arc<sb_media::Probe> {
+        self.probe.clone()
+    }
+
     pub fn with_options(opts: Options) -> Self {
         // Load config up front: atlas geometry, the media recipe, and the
         // ingest recurse flag are startup-only (the rest keeps
@@ -730,6 +750,8 @@ impl Switchblade {
             wake_until: Instant::now() + Duration::from_secs(1),
             waker,
             notify,
+            probe: sb_media::Probe::new(),
+            next_lane_gen: 0,
             redraw_stats: RedrawStats::new(),
             last_scroll_event: Instant::now(),
             viewport: Viewport {
@@ -2749,6 +2771,12 @@ impl Switchblade {
         // its drive reads) while the stream presents — see
         // `MediaService::set_live`. Deduped internally; free per frame.
         self.media.set_live(live_now);
+        if live_now {
+            self.probe
+                .counters
+                .drain_budget_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let budget = if live_now {
             MEDIA_UPLOAD_BUDGET_LIVE
         } else {
@@ -2791,7 +2819,13 @@ impl Switchblade {
                     };
                     // Decoded pixels arrived, so the artifact is on disk —
                     // cached even if the atlas drops it below.
-                    self.clips[i].cached = true;
+                    if !self.clips[i].cached {
+                        self.clips[i].cached = true;
+                        self.probe
+                            .counters
+                            .thumbs_cached
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // Idempotent install (P1.2 follow-up): coalescing can
                     // legitimately deliver the same artifact twice (a D
                     // swap re-requests while the first job is still in
@@ -2866,8 +2900,14 @@ impl Switchblade {
                     // result — a second increment here overran jobs_total.
                     // The sweep just proved (or wrote) this clip's cache
                     // entry: it becomes fair game for jump/shuffle.
-                    if let Some(&i) = self.index.get(&path) {
+                    if let Some(&i) = self.index.get(&path)
+                        && !self.clips[i].cached
+                    {
                         self.clips[i].cached = true;
+                        self.probe
+                            .counters
+                            .thumbs_cached
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 // Consumed before the ledger above.
@@ -2926,6 +2966,10 @@ impl Switchblade {
         }
         if let Some((victim, kind)) = self.slots[j] {
             log::debug!("evict slot {j} (clip {victim})");
+            self.probe
+                .counters
+                .evictions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match kind {
                 SlotKind::Static => self.clips[victim].thumb = Thumb::None,
                 SlotKind::Anim => self.clips[victim].anim = Thumb::None,
@@ -3107,6 +3151,13 @@ impl Switchblade {
                     "promoted warm decoder for clip {i} ({} frames buffered)",
                     l.player.buffered()
                 );
+                let clip: Arc<str> = Arc::from(l.path.to_string_lossy().as_ref());
+                self.probe.mark(
+                    sb_media::EventKind::Promotion,
+                    sb_media::Lane::Selected,
+                    l.generation,
+                    &clip,
+                );
                 self.live_sel = Some(l);
             } else if self.quickview
                 || if attn_hover {
@@ -3118,7 +3169,7 @@ impl Switchblade {
                     self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
                 }
             {
-                self.live_sel = self.start_sel_live(i);
+                self.live_sel = self.start_sel_live(i, sb_media::Lane::Selected);
             }
         }
         self.warm.retain(|w| warm_targets.contains(&w.clip));
@@ -3147,7 +3198,7 @@ impl Switchblade {
             && let Some(&i) = warm_targets
                 .iter()
                 .find(|&&i| self.warm.iter().all(|w| w.clip != i))
-            && let Some(l) = self.start_sel_live(i)
+            && let Some(l) = self.start_sel_live(i, sb_media::Lane::Warm)
         {
             self.warm.push(l);
         }
@@ -3163,11 +3214,13 @@ impl Switchblade {
             }
         }
 
+        let mut hover_served: Option<(u64, usize)> = None;
         if let Some(live) = &mut self.live_hover
             && let Some(rgba) = live.player.take_frame()
         {
             if live.first_frame.is_none() {
                 live.first_frame = Some(Instant::now());
+                hover_served = Some((live.generation, live.clip));
             }
             uploads.push(ThumbUpload {
                 slot: live.slot,
@@ -3175,6 +3228,13 @@ impl Switchblade {
                 h: live.player.h,
                 rgba,
             });
+        }
+        if let Some((generation, ci)) = hover_served
+            && let Some(path) = self.clips.get(ci).map(|c| c.path.clone())
+        {
+            let clip: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
+            self.probe
+                .mark(sb_media::EventKind::FrameServed, sb_media::Lane::Hover, generation, &clip);
         }
         // Park the selected stream while its tile is offscreen and no
         // modal shows it (P0.4), or whenever focus-pause is active (the
@@ -3215,6 +3275,7 @@ impl Switchblade {
         {
             l.player.recycle(buf);
         }
+        let mut sel_served: Option<(u64, PathBuf)> = None;
         if !self.sel_parked
             && let Some(live) = &mut self.live_sel
             && let Some(rgba) = live.player.take_frame()
@@ -3226,6 +3287,7 @@ impl Switchblade {
                     live.clip,
                     live.spawned.elapsed().as_secs_f32() * 1000.0
                 );
+                sel_served = Some((live.generation, live.path.clone()));
             }
             if self.hires_shown.as_ref() != Some(&live.path) {
                 self.hires_shown = Some(live.path.clone());
@@ -3237,6 +3299,15 @@ impl Switchblade {
                 h: live.player.h,
                 rgba,
             });
+        }
+        if let Some((generation, path)) = sel_served {
+            let clip: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
+            self.probe.mark(
+                sb_media::EventKind::FrameServed,
+                sb_media::Lane::Selected,
+                generation,
+                &clip,
+            );
         }
     }
 
@@ -3283,7 +3354,31 @@ impl Switchblade {
     /// texture (never upscaled past the source when its dims are known).
     /// Resident and seekable — repositioning after this is `player.seek()`,
     /// never another spawn.
-    fn start_sel_live(&mut self, i: usize) -> Option<SelLive> {
+    /// Mint a lane-incarnation id, emit its `DecodeSpawn` event, and
+    /// attach the probe context so the player's reader thread can tag its
+    /// own media events (first-frame-ready, re-anchors) with this lane's
+    /// identity. Returns the generation to stamp on the lane state.
+    fn instrument_lane(
+        &mut self,
+        player: &sb_media::SeekablePlayer,
+        lane: sb_media::Lane,
+        path: &std::path::Path,
+    ) -> u64 {
+        let generation = self.next_lane_gen;
+        self.next_lane_gen = self.next_lane_gen.wrapping_add(1);
+        let clip: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
+        self.probe
+            .mark(sb_media::EventKind::DecodeSpawn, lane, generation, &clip);
+        player.attach_probe(sb_media::LaneProbe {
+            sink: self.probe.clone(),
+            lane,
+            generation,
+            clip,
+        });
+        generation
+    }
+
+    fn start_sel_live(&mut self, i: usize, lane: sb_media::Lane) -> Option<SelLive> {
         let clip = self.clips.get(i)?;
         let (tw, th, path) = match clip.thumb {
             Thumb::Ready { tw, th, .. } if clip.readable && !clip.cloud => {
@@ -3324,6 +3419,7 @@ impl Switchblade {
         // Deadline-paced redraws (P1.4): a frame landing in a dry queue
         // must nudge the sleeping loop.
         player.set_notify(self.notify.clone());
+        let generation = self.instrument_lane(&player, lane, &path);
         log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
         Some(SelLive {
             clip: i,
@@ -3332,6 +3428,7 @@ impl Switchblade {
             spawned: Instant::now(),
             first_frame: None,
             duration,
+            generation,
         })
     }
 
@@ -3364,6 +3461,7 @@ impl Switchblade {
             return None;
         };
         player.set_notify(self.notify.clone()); // P1.4 dry-queue wake
+        let generation = self.instrument_lane(&player, sb_media::Lane::Hover, &path);
         log::debug!("hover live: {}", path.display());
         self.slots[slot] = Some((i, SlotKind::Live));
         Some(LiveState {
@@ -3371,6 +3469,7 @@ impl Switchblade {
             player,
             slot,
             first_frame: None,
+            generation,
         })
     }
 
@@ -4559,6 +4658,10 @@ impl App for Switchblade {
     }
 
     fn frame(&mut self, dt: f32, viewport: Viewport) -> Frame {
+        self.probe
+            .counters
+            .frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.viewport = viewport;
         if let Some(f) = &mut self.tuning_file
             && let Some(cfg) = f.poll()
@@ -5315,6 +5418,7 @@ mod tests {
             spawned: Instant::now(),
             first_frame: None,
             duration: None,
+            generation: 0,
         });
         assert!(
             pump_until(&mut app, |a| a.live_sel.is_none()),

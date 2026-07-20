@@ -8,7 +8,9 @@
 //! RGBA for the renderer's atlas. The render thread never blocks on this.
 
 pub mod maintenance;
+pub mod probe;
 mod seekable;
+pub use probe::{CounterSnapshot, EventKind, Lane, LaneProbe, Probe, RelEvent};
 pub use seekable::SeekablePlayer;
 
 use std::collections::{HashMap, VecDeque};
