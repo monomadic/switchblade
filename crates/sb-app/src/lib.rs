@@ -250,6 +250,9 @@ struct LiveState {
     first_frame: Option<Instant>,
     /// Lane-incarnation id for benchmark events (phase-0-contracts §0.1).
     generation: u64,
+    /// Frames served so far — drives the SB_HANDOFF_DUMP field
+    /// instrumentation (first few frames only) at zero steady-state cost.
+    served: u32,
 }
 
 /// The selected clip's live stream: decoded once at quickview resolution
@@ -269,6 +272,9 @@ struct SelLive {
     duration: Option<f64>,
     /// Lane-incarnation id for benchmark events (phase-0-contracts §0.1).
     generation: u64,
+    /// Frames served so far — drives the SB_HANDOFF_DUMP field
+    /// instrumentation (first few frames only) at zero steady-state cost.
+    served: u32,
 }
 
 impl SelLive {
@@ -3390,6 +3396,22 @@ impl Switchblade {
                 );
                 hover_served = Some((live.generation, live.clip, live.player.position()));
             }
+            if live.served < 6
+                && let Some(c) = self.clips.get(live.clip)
+            {
+                handoff_dump(
+                    &c.path.file_stem().unwrap_or_default().to_string_lossy(),
+                    "hover",
+                    live.generation,
+                    live.served,
+                    live.player.position(),
+                    live.player.w,
+                    live.player.h,
+                    &rgba,
+                    self.media.cached_thumb_path(&c.path),
+                );
+            }
+            live.served += 1;
             uploads.push(ThumbUpload {
                 slot: live.slot,
                 w: live.player.w,
@@ -3467,6 +3489,20 @@ impl Switchblade {
                 );
                 sel_served = Some((live.generation, live.path.clone(), live.player.position()));
             }
+            if live.served < 6 {
+                handoff_dump(
+                    &live.path.file_stem().unwrap_or_default().to_string_lossy(),
+                    "sel",
+                    live.generation,
+                    live.served,
+                    live.player.position(),
+                    live.player.w,
+                    live.player.h,
+                    &rgba,
+                    self.media.cached_thumb_path(&live.path),
+                );
+            }
+            live.served += 1;
             if self.hires_shown.as_ref() != Some(&live.path) {
                 self.hires_shown = Some(live.path.clone());
             }
@@ -3624,6 +3660,7 @@ impl Switchblade {
             first_frame: None,
             duration,
             generation,
+            served: 0,
         })
     }
 
@@ -3665,6 +3702,7 @@ impl Switchblade {
             slot,
             first_frame: None,
             generation,
+            served: 0,
         })
     }
 
@@ -5204,6 +5242,58 @@ fn checkpoint_count(d: f64) -> usize {
     }
 }
 
+/// SB_HANDOFF_DUMP field instrumentation: with the env var set to a
+/// directory, the first few frames every hover/selected lane serves are
+/// written there as PPMs named with lane, generation, serve index and the
+/// frame's content pts — next to a copy of the clip's cached thumbnail
+/// jpg. The on-screen thumb→live handoff becomes diffable artifacts
+/// (locate each PPM's true timestamp in the source with an SSIM sweep)
+/// instead of a perception argument. Completely inert without the env
+/// var; costs nothing in steady state (callers gate on the first serves).
+fn handoff_dump(
+    stem: &str,
+    lane: &str,
+    generation: u64,
+    k: u32,
+    pts: f64,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+    thumb: Option<PathBuf>,
+) {
+    let Some(dir) = std::env::var_os("SB_HANDOFF_DUMP") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let stem: String = stem
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .chars()
+        .rev()
+        .take(48)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if k == 0 && let Some(t) = thumb {
+        let _ = std::fs::copy(&t, dir.join(format!("{stem}__thumb.jpg")));
+    }
+    let (w, h) = (w as usize, h as usize);
+    if rgba.len() < w * h * 4 {
+        return;
+    }
+    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+    ppm.reserve(w * h * 3);
+    for px in rgba[..w * h * 4].chunks_exact(4) {
+        ppm.extend_from_slice(&px[..3]);
+    }
+    let name = format!("{stem}__{lane}_g{generation}_f{k}_pts{pts:.3}.ppm");
+    let _ = std::fs::write(dir.join(name), ppm);
+    log::debug!("handoff dump: {lane} g{generation} f{k} pts={pts:.3}");
+}
+
 /// Reconcile the position-derived chapter index with a navigation intent
 /// (`ChapterBar::nav`). Chapter seeks are keyframe seeks (no decode-forward
 /// freeze), so a jump to chapter `k` lands on the nearest keyframe *before*
@@ -5791,6 +5881,7 @@ mod tests {
             first_frame: None,
             duration: None,
             generation: 0,
+            served: 0,
         });
         assert!(
             pump_until(&mut app, |a| a.live_sel.is_none()),
