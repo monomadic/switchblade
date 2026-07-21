@@ -1,7 +1,7 @@
 # Chapter-bar chips take ~a minute to appear after opening fullview
 
-**Status:** diagnosed, partial fix applied + measured (2026-07-21) — 48s → 27s;
-two further levers identified (see "Fix applied" below).
+**Status:** fixed + measured (2026-07-21). Warm grid (the real case): **~a
+minute → ~2.8s**. Levers A and B applied; one edge case remains (see bottom).
 **Scenario:** [`chapter_sheet_fullview.toml`](../scenarios/chapter_sheet_fullview.toml)
 
 ## Symptom
@@ -114,3 +114,37 @@ Under the 60-clip sweep, `selected_anim − requested` ≈ 22s, of which:
 
 With a trivial sweep (3 clips) the total collapses to ~9s (just the generation
 floor), confirming the ~13s is sweep contention.
+
+## Levers A + B applied (2026-07-21)
+
+**Lever A — one ffmpeg process for the whole sheet** (`make_anim`): the g²
+cells are now extracted by a single ffmpeg invocation (g² inputs, each a fast
+`-ss` seek, mapped to g² mjpeg outputs) instead of g² separate processes. That
+amortizes the per-process VideoToolbox init that WAS the floor. Software decode,
+no VT — measured fastest for single-frame extracts inside one process (2.6s vs
+3.8s VT vs 8.4s the old 9-process VT), and it leaves the media engine entirely
+to the watched stream. **Generation floor 8.7s → ~2s.** (This reverted the
+VT-for-anim change from the first fix — VT only helped in the 9-process world.)
+
+**Lever B — throttle engaged at construction** (`MediaService::new`): the
+workers drain the queue during ingest, before the app's first `set_live`, so an
+uncapped default let the sweep grab every worker with slow 4K gen extracts at
+startup. Starting `live = true` caps that burst; the app opens the sweep on the
+first no-video frame. **Watched-stream first frame 4.9s → 2.1s** as a bonus.
+
+### Measured end-to-end (`selected_anim − fullview`)
+
+| case | before | after |
+|---|--:|--:|
+| warm grid (browsed first — the real case) | ~a minute | **~2.8s** |
+| cold grid, fullview opened instantly | ~48s | ~16s |
+
+### Remaining edge case (not fixed — a judgment call)
+
+Opening fullview *instantly* on a stone-cold library leaves ~45 visible
+grid-thumb jobs queued at tier 1, above the storyboard (tier 3); the chapter
+chips wait behind them even though the grid is hidden in fullview. Promoting the
+storyboard above visible thumbs would fix it, BUT visible thumbs also feed the
+**quickview filmstrip chips**, which ARE visible — so the reorder is only
+correct when the grid AND strip are hidden (fullview), i.e. it needs a
+context signal, not a blanket tier swap. Deferred pending that decision.

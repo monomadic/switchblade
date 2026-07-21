@@ -369,9 +369,18 @@ impl MediaService {
     /// `gen_live_cap` = concurrent gen-sweep jobs allowed while the selected
     /// stream presents (config `gen_live_concurrency`; 0 = unlimited).
     pub fn new(recipe: Recipe, notify: Notify, gen_live_cap: usize) -> Self {
+        // Start with the gen throttle ENGAGED. The workers begin draining the
+        // queue during ingest, BEFORE the app's first `set_live` call — so an
+        // uncapped default let the sweep grab all workers with slow 4K gen
+        // extracts at startup, starving the watched stream's cold spawn (first
+        // frame delayed to ~5s) and the on-demand storyboard behind it. The
+        // app opens the sweep to full width on the first frame where nothing
+        // is being watched (`set_live(false)`), so a no-video session pays at
+        // most one frame of throttling.
         let queue: SharedQueue = Arc::new((
             Mutex::new(Queues {
                 gen_live_cap,
+                live: true,
                 ..Default::default()
             }),
             Condvar::new(),
@@ -398,7 +407,10 @@ impl MediaService {
             queue,
             rx: rx_done,
             recipe,
-            live: std::sync::atomic::AtomicBool::new(false),
+            // Kept in sync with the queue's `live` above so the app's first
+            // `set_live(false)` (no video) registers as a real change and
+            // opens the sweep; a first `set_live(true)` is a correct no-op.
+            live: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -1005,12 +1017,10 @@ fn make_anim(
             return None;
         }
         std::fs::create_dir_all(&dir).ok()?;
-        // Sampling frames across the clip needs its duration + codec (the
-        // codec gates VideoToolbox below). The thumb pass usually cached the
-        // probe already.
+        // Sampling frames across the clip needs its duration.
+        // The thumb pass usually cached the probe already.
         let m = cached_meta(src).or_else(|| probe(src))?;
         let duration = m.duration.filter(|d| *d > 0.05)?;
-        let codec = m.codec.clone();
         let g = recipe.anim_grid.max(1);
         let frames = (g * g) as usize;
         let (fw, fh) = recipe.anim_frame();
@@ -1051,66 +1061,61 @@ fn make_anim(
         // starvation rather than disk or the prewarm gates (see
         // benchmarks/reports/chapter_sheet_latency.md).
         let gen_t0 = std::time::Instant::now();
-        let mut per_cell = Vec::with_capacity(frames);
+        // Extract all g² cells in ONE ffmpeg process: g² inputs, each a fast
+        // input `-ss` seek, mapped to one mjpeg output. This amortizes the
+        // per-process startup + decoder init that DOMINATED the sheet's wall
+        // time — nine separate 4K spawns cost ~8s (each paying its own
+        // VideoToolbox session init), one process ~2.5s
+        // (benchmarks/reports/chapter_sheet_latency.md, lever A). Software
+        // decode, no VideoToolbox: for single-frame extracts inside one
+        // process sw is actually FASTER than VT (no per-input VT session init)
+        // AND leaves the media engine entirely to the watched stream — the
+        // storyboard is user-attention work but must not steal the hardware
+        // decoder the video the user is watching runs on.
+        let seeks: Vec<String> = (0..frames)
+            .map(|k| format!("{:.3}", duration * (k as f64 + 0.5) / frames as f64))
+            .collect();
+        let mut cmd = media_cmd("ffmpeg");
+        cmd.args(["-y", "-v", "error"]);
+        for s in &seeks {
+            cmd.args(["-ss", s]).arg("-i").arg(src);
+        }
         for k in 0..frames {
-            let tmp = frame_tmp(k);
-            let mut seek = duration * (k as f64 + 0.5) / frames as f64;
-            let cell_t0 = std::time::Instant::now();
-            let ok = loop {
-                // The on-demand storyboard is USER-ATTENTION work — the user
-                // opened quickview/fullview and is waiting on it. Decode it
-                // with VideoToolbox (foreground I/O), like any visible thumb:
-                // software decode of 4K HEVC is intrinsically slow (deep seeks
-                // decode-forward most of a GOP on the CPU), so g² sw extracts
-                // stretched the sheet to ~30s while stalling the watched
-                // stream (benchmarks/reports/chapter_sheet_latency.md). The
-                // sweep is paused while this runs (Queues::pop), so the brief
-                // VT sharing with the watched stream is the right trade. (The
-                // sw+background-band treatment dated to the removed bulk anim
-                // sweep — there is no background anim work anymore.)
-                let mut cmd = media_cmd("ffmpeg");
-                cmd.args(["-y", "-v", "error"]);
-                if vt_accel(codec.as_deref()) {
-                    cmd.args(["-hwaccel", "videotoolbox"]);
-                }
-                let out = cmd
-                    .args(["-ss", &format!("{seek:.3}")])
-                    .arg("-i")
-                    .arg(src)
-                    .args(["-frames:v", "1", "-vf", &vf, "-q:v", &q])
-                    .args(["-strict", "unofficial", "-f", "mjpeg"])
-                    .arg(&tmp)
-                    .stdin(Stdio::null())
-                    .output()
-                    .ok();
-                let done = out.as_ref().is_some_and(|o| o.status.success()) && tmp.exists();
-                if done {
-                    break true;
-                }
-                // A seek past EOF (VFR/short files) produces nothing:
-                // retry that cell from the start of the clip.
-                if seek > 0.0 {
-                    seek = 0.0;
-                    continue;
-                }
-                if let Some(o) = out {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    log::debug!(
-                        "anim frame {k} failed for {}: {}",
-                        src.display(),
-                        stderr.lines().last().unwrap_or("(no output)")
-                    );
-                }
-                break false;
-            };
+            let map = format!("{k}:v:0");
+            cmd.args([
+                "-map", map.as_str(), "-frames:v", "1", "-vf", vf.as_str(), "-q:v", q.as_str(),
+                "-strict", "unofficial", "-f", "mjpeg",
+            ])
+            .arg(frame_tmp(k));
+        }
+        let _ = cmd.stdin(Stdio::null()).output();
+        // Per-cell fallback: any frame the batch missed (a seek past EOF on a
+        // VFR/short source) is retried alone from the clip start.
+        for k in 0..frames {
+            if frame_tmp(k).exists() {
+                continue;
+            }
+            let ok = media_cmd("ffmpeg")
+                .args(["-y", "-v", "error", "-ss", "0"])
+                .arg("-i")
+                .arg(src)
+                .args([
+                    "-frames:v", "1", "-vf", vf.as_str(), "-q:v", q.as_str(),
+                    "-strict", "unofficial", "-f", "mjpeg",
+                ])
+                .arg(frame_tmp(k))
+                .stdin(Stdio::null())
+                .output()
+                .is_ok_and(|o| o.status.success())
+                && frame_tmp(k).exists();
             if !ok {
-                cleanup(k);
+                log::debug!("anim frame {k} failed for {}", src.display());
+                cleanup(frames);
                 return None;
             }
-            per_cell.push((cell_t0.elapsed().as_secs_f32() * 1000.0) as u32);
         }
         log::debug!(
-            "animgen {}: {frames} cells in {:.2}s, per-cell ms={per_cell:?}",
+            "animgen {}: {frames} cells in {:.2}s (single process)",
             src.display(),
             gen_t0.elapsed().as_secs_f32(),
         );
