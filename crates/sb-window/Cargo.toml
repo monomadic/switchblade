@@ -37,5 +37,6 @@ objc2-app-kit = { version = "0.2", features = [
     "NSPasteboardItem",
     "NSEvent",
     "NSView",
+    "NSWindow",
     "NSWorkspace",
 ] }

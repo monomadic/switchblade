@@ -435,10 +435,19 @@ fn toggle_fullscreen(w: &Window, fast: bool) {
         use winit::platform::macos::WindowExtMacOS;
         if w.simple_fullscreen() {
             w.set_simple_fullscreen(false);
+            set_window_shadow(w, true);
         } else if w.fullscreen().is_some() {
             w.set_fullscreen(None);
         } else if fast {
+            // macOS Tahoe (26) draws a ~1px translucent contour around
+            // every non-native-fullscreen window. A simple-fullscreen
+            // window is still a normal-level window, so it gets the
+            // border (native `Fullscreen::Borderless` lives in its own
+            // Space and escapes it). AppKit ties that edge to the window
+            // shadow — dropping `hasShadow` removes the contour, and a
+            // desktop-filling window has no visible shadow to lose.
             w.set_simple_fullscreen(true);
+            set_window_shadow(w, false);
         } else {
             w.set_fullscreen(Some(Fullscreen::Borderless(None)));
         }
@@ -454,6 +463,24 @@ fn toggle_fullscreen(w: &Window, fast: bool) {
             Some(Fullscreen::Borderless(None))
         };
         w.set_fullscreen(next);
+    }
+}
+
+/// Toggle the native window shadow. On macOS Tahoe this doubles as the
+/// only lever over the system-drawn window contour: the border is drawn
+/// with the shadow, so `hasShadow(false)` suppresses it (see
+/// `toggle_fullscreen`). No-op if the AppKit handle can't be obtained.
+#[cfg(target_os = "macos")]
+fn set_window_shadow(w: &Window, on: bool) {
+    use objc2_app_kit::NSView;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = w.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return;
+    };
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    if let Some(window) = view.window() {
+        window.setHasShadow(on);
     }
 }
 
