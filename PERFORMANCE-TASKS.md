@@ -827,8 +827,8 @@ input must continue to request display-rate redraws when active.
   player, or an Arc still in flight, just drops the buffer — old behavior.
 - Scope note: the hover lane's presented frames (ThumbUpload, ~0.9 MB at tile
   size — under the 1 MiB bar) still drop after upload; its *internal*
-  seek/supersession churn recycles like every SeekablePlayer. `LivePlayer`
-  (CLI fallback, no longer on any live lane) is untouched.
+  seek/supersession churn recycles like every SeekablePlayer. (The old
+  ffmpeg-CLI `LivePlayer`, which this note predates, was removed 2026-07-22.)
 
 Tests: `recycled_buffers_are_reused` (pointer-identity round trip through
 take → recycle → later frame) plus the pacing/stall/drop trio unchanged.
@@ -1097,7 +1097,9 @@ sites — `unwatched_*_stalls_then_serves_instantly` and
 `dropped_*_releases_its_reader` for both `LivePlayer` and `SeekablePlayer`
 — now use a bounded `wait_buffered(player, LIVE_QUEUE_DEPTH, 15s)` before
 asserting bounded depth, immediate first take, and drop-release. Three
-consecutive parallel workspace runs green.
+consecutive parallel workspace runs green. (The `LivePlayer` half was
+removed with the player itself, 2026-07-22; the `SeekablePlayer` tests
+keep the bounded-wait pattern.)
 
 ### T2 — Restore a clean clippy baseline
 

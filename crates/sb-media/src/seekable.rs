@@ -1,13 +1,15 @@
 //! In-process libav playback with a real seek channel (PLAN.md §15
 //! "Low-latency seek", settled 2026-07; spike numbers in `spikes/seek-bench`).
 //!
-//! `SeekablePlayer` is `LivePlayer`'s replacement for the selected/warm
-//! lanes: same paced bounded queue, same backpressure warmth, same due-frame
-//! contract — but the demuxer + VideoToolbox session live in a reader thread
-//! instead of behind an ffmpeg CLI pipe, so `seek()` is a demuxer jump +
-//! decoder flush (keyframe: ~10–30ms; exact: bounded by GOP decode, worst
-//! ~600ms on long-GOP 4K) instead of a full process respawn (~1s floor:
-//! exec + probe + VT session init + GOP, benchmarked unfixable via flags).
+//! `SeekablePlayer` is the sole live player — every lane (selected, warm,
+//! hover) rides it. It replaced an earlier CLI-pipe player (an ffmpeg child
+//! decoding raw RGBA to stdout): same paced bounded queue, same backpressure
+//! warmth, same due-frame contract — but the demuxer + VideoToolbox session
+//! live in a reader thread instead of behind an ffmpeg pipe, so `seek()` is a
+//! demuxer jump + decoder flush (keyframe: ~10–30ms; exact: bounded by GOP
+//! decode, worst ~600ms on long-GOP 4K) instead of a full process respawn
+//! (~1s floor: exec + probe + VT session init + GOP, benchmarked unfixable
+//! via flags) — which is why the CLI player couldn't seek at all.
 //!
 //! Decode/scale parity with the CLI chain is deliberate, gate for gate:
 //! VideoToolbox decode only for h264/hevc/prores (`vt_accel`); on-GPU
@@ -19,12 +21,12 @@
 //! autorotate like the CLI; 90/180/270 are handled, odd angles are not —
 //! same clips the hw chain already refuses).
 //!
-//! Pacing stamps frames due by *pts delta* from a wall-clock anchor (the
-//! CLI forced CFR with `-r` and stamped 1/fps; pts-based stamping degrades
-//! VFR/wrong-meta sources the same way — correct wall-clock speed). Late
-//! frames re-anchor instead of accruing debt, and a drop must wake a reader
-//! parked on the full-queue condvar — both regressions inherited from
-//! `LivePlayer`, both covered by tests below.
+//! Pacing stamps frames due by *pts delta* from a wall-clock anchor (the old
+//! CLI player forced CFR with `-r` and stamped 1/fps; pts-based stamping
+//! degrades VFR/wrong-meta sources the same way — correct wall-clock speed).
+//! Late frames re-anchor instead of accruing debt, and a drop must wake a
+//! reader parked on the full-queue condvar — both regressions carried over
+//! from that CLI player, both covered by tests below.
 
 use rsmpeg::ffi;
 use std::collections::VecDeque;
@@ -50,7 +52,7 @@ pub struct SeekablePlayer {
 }
 
 struct Shared {
-    /// (due, pts seconds, rgba) — same paced bounded queue as LivePlayer.
+    /// (due, pts seconds, rgba) — the paced, bounded live decode queue.
     frames: Mutex<VecDeque<(Instant, f64, Vec<u8>)>>,
     /// Signalled when the consumer pops (or a seek/drop needs the reader).
     space: Condvar,
@@ -109,12 +111,13 @@ impl Shared {
 }
 
 impl SeekablePlayer {
-    /// Mirror of `LivePlayer::spawn`: `seek` starts that many seconds in
-    /// (exact, like CLI `-ss` before `-i`), `meta` gates hardware decode
-    /// and scaling. Hardware-scaled dims round DOWN to mod-8 exactly like
-    /// the CLI chain. Returns immediately; open/decode errors surface as a
-    /// stream that never produces frames (`failed()`), same as a dead
-    /// ffmpeg child.
+    /// `seek` starts that many (content-relative) seconds in — a keyframe
+    /// start matching the CLI thumbnail's `-ss … -noaccurate_seek`, so live
+    /// video continues from the exact frame the tile showed. `meta` gates
+    /// hardware decode and scaling; hardware-scaled dims round DOWN to mod-8
+    /// exactly like the ffmpeg thumbnail chain. Returns immediately; open/
+    /// decode errors surface as a stream that never produces frames
+    /// (`failed()`).
     pub fn spawn(path: &Path, w: u32, h: u32, seek: f64, meta: Option<&Meta>) -> Option<Self> {
         let (mut w, mut h) = (w.max(2), h.max(2));
         let codec = meta.and_then(|m| m.codec.as_deref());
@@ -244,8 +247,8 @@ impl SeekablePlayer {
         *self.shared.probe.lock().unwrap() = Some(lp);
     }
 
-    /// The newest frame that's due for presentation, if any — identical
-    /// contract to `LivePlayer::take_frame` (pacing on the render clock).
+    /// The newest frame that's due for presentation, if any — pacing on
+    /// the render clock (a frame surfaces only once its due time arrives).
     pub fn take_frame(&self) -> Option<Vec<u8>> {
         let now = Instant::now();
         let mut q = self.shared.frames.lock().unwrap();
@@ -870,9 +873,8 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// Generate (once) a small h264 test clip — the same recipe as the
-    /// LivePlayer tests, so both players are measured against identical
-    /// input. Returns None when ffmpeg isn't on PATH (tests skip quietly).
+    /// Generate (once) a small h264 test clip for the pacing/seek tests.
+    /// Returns None when ffmpeg isn't on PATH (tests skip quietly).
     fn test_clip(name: &str, secs: u32) -> Option<PathBuf> {
         if !crate::have_binary("ffmpeg") {
             eprintln!("skipping: ffmpeg not on PATH");

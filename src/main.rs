@@ -211,7 +211,7 @@ fn reduce_cache(target_mb: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--benchmark <clip>`: measure `LivePlayer` delivery exactly as the
+/// `--benchmark <clip>`: measure `SeekablePlayer` delivery exactly as the
 /// app consumes it (poll take_frame at a 60Hz render tick) for the
 /// lanes the current config would spawn: the tile-size lane and the
 /// quickview/hires lane. When the config's chain is hardware-scaled, a
@@ -323,7 +323,7 @@ fn bench_pass(
     use std::time::{Duration, Instant};
     let fps = meta.fps.unwrap_or(30.0).clamp(1.0, 240.0);
     let t_spawn = Instant::now();
-    let Some(player) = sb_media::LivePlayer::spawn(clip, w, h, 0.5, Some(meta)) else {
+    let Some(player) = sb_media::SeekablePlayer::spawn(clip, w, h, 0.5, Some(meta)) else {
         println!("  spawn failed (is ffmpeg on PATH?)");
         return;
     };

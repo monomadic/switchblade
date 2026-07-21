@@ -241,9 +241,7 @@ struct ChapterBar {
 /// The hovered tile's video playback: tile-sized, into an atlas slot.
 /// Rides `SeekablePlayer` like every live lane since the libav port (it
 /// never seeks, but the in-process spawn reaches first frame ~2× sooner
-/// than the CLI pipe — hover-play is all about that latency); the CLI
-/// `LivePlayer` stays in sb-media as the tested fallback until the
-/// in-process path has soaked a release.
+/// than the old CLI pipe — hover-play is all about that latency).
 struct LiveState {
     clip: usize,
     player: sb_media::SeekablePlayer,

@@ -5,9 +5,10 @@ Open performance and efficiency work is routed through
 [PERFORMANCE-TASKS.md](PERFORMANCE-TASKS.md).
 **Phases 0–4 shipped 2026-07-10** (investigated on an Apple M3, 8-core
 fanless, 60Hz panel, ffmpeg 8.1.1 Homebrew); **Phase 5 is deferred**
-(below). The per-lane player later moved from the ffmpeg-CLI `LivePlayer`
-to the in-process `SeekablePlayer` (PLAN.md §15, 2026-07); the hw/sw scale
-chains and pacing invariants below carried over verbatim.
+(below). The per-lane player later moved from an ffmpeg-CLI player to the
+in-process `SeekablePlayer` (PLAN.md §15, 2026-07; the CLI player was
+removed 2026-07-22); the hw/sw scale chains and pacing invariants below
+carried over verbatim.
 
 ## Root cause (measured, not theorized)
 
@@ -97,11 +98,13 @@ with the PSNR-vs-thumbnail check and a BT.601/709/full-range clip matrix.
   deterministic asset-gen commands live in its doc comment). Discard each
   clip's first (cold) run; use ≥8s assets (short clips gap on
   `-stream_loop` restarts).
-- Every perf change re-runs the sb-media regression tests: the four
-  `LivePlayer` ones (`live_player_paces_frames`,
-  `unwatched_player_stalls_then_serves_instantly`,
-  `dropped_player_releases_its_reader`, `anim_sheet_generates_and_tiles`)
-  plus the `SeekablePlayer` mirror trio and
-  `seek_jumps_in_place_without_respawn`.
+- Every perf change re-runs the sb-media regression tests: the
+  `SeekablePlayer` pacing/stall/drop trio (`seekable_player_paces_frames`,
+  `unwatched_seekable_player_stalls_then_serves_instantly`,
+  `dropped_seekable_player_releases_its_reader`),
+  `seek_jumps_in_place_without_respawn`,
+  `start_time_offset_is_content_relative`, and
+  `anim_sheet_generates_and_tiles`. (The old ffmpeg-CLI `LivePlayer` and
+  its mirror trio were removed 2026-07-22.)
 - Pacing invariants (CLAUDE.md) still bind: promotion before pruning;
   bounded queue = free warmth; drop must wake the condvar.

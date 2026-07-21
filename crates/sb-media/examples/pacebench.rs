@@ -1,6 +1,6 @@
 //! Live-playback pacing benchmark (PERF.md Phase 0).
 //!
-//! Measures `LivePlayer` frame delivery exactly as the app consumes it:
+//! Measures `SeekablePlayer` frame delivery exactly as the app consumes it:
 //! poll `take_frame()` every 16.67ms (a 60Hz render tick) and report
 //! delivered fps, interval percentiles, and gap count. Acceptance
 //! criteria for the PERF.md phases are runs of this benchmark.
@@ -9,7 +9,7 @@
 //! cargo run --release -p sb-media --example pacebench -- <clip> <w> <h> <fps> [secs] [sw|swscale]
 //! ```
 //!
-//! `fps` is the pacing rate handed to `LivePlayer` (what cached meta
+//! `fps` is the pacing rate handed to `SeekablePlayer` (what cached meta
 //! would supply); codec and pix_fmt come from a real ffprobe of the
 //! clip. A trailing `sw` forces the all-software chain (Phase 2
 //! acceptance); `swscale` keeps hardware decode but software scaling —
@@ -77,7 +77,7 @@ fn main() {
     );
 
     let t_spawn = Instant::now();
-    let player = sb_media::LivePlayer::spawn(&path, w, h, 0.5, Some(&meta)).expect("spawn");
+    let player = sb_media::SeekablePlayer::spawn(&path, w, h, 0.5, Some(&meta)).expect("spawn");
     let mut deliveries: Vec<f64> = Vec::new(); // seconds since spawn
     let tick = Duration::from_secs_f64(1.0 / 60.0);
     let mut next_tick = Instant::now();
