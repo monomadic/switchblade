@@ -1025,9 +1025,19 @@ fn make_anim(
                 let _ = std::fs::remove_file(frame_tmp(k));
             }
         };
+        // Anim-gen latency diagnostic (RUST_LOG=sb_media=debug): per-cell
+        // and total extract wall time. A cell's software decode-forward
+        // cost scales with GOP depth, and concurrent gen-sweep 4K decodes
+        // inflate every cell 2-15x under contention — this log is what let
+        // us attribute the "chapter chips take ~a minute" delay to sweep
+        // starvation rather than disk or the prewarm gates (see
+        // benchmarks/reports/chapter_sheet_latency.md).
+        let gen_t0 = std::time::Instant::now();
+        let mut per_cell = Vec::with_capacity(frames);
         for k in 0..frames {
             let tmp = frame_tmp(k);
             let mut seek = duration * (k as f64 + 0.5) / frames as f64;
+            let cell_t0 = std::time::Instant::now();
             let ok = loop {
                 // Software decode + background-band I/O: these g² seeked
                 // extracts race the live stream, so they must take
@@ -1070,7 +1080,14 @@ fn make_anim(
                 cleanup(k);
                 return None;
             }
+            per_cell.push((cell_t0.elapsed().as_secs_f32() * 1000.0) as u32);
         }
+        log::debug!(
+            "animgen {}: {frames} cells in {:.2}s, per-cell ms={per_cell:?}",
+            src.display(),
+            gen_t0.elapsed().as_secs_f32(),
+        );
+        let tile_t0 = std::time::Instant::now();
 
         let tmp = staging_path(&jpg);
         let pattern = dir.join(format!("animf_{uid}_%d.jpg"));
@@ -1091,7 +1108,12 @@ fn make_anim(
             return None;
         }
         std::fs::rename(&tmp, &jpg).ok()?;
-        log::debug!("anim sheet generated: {}", src.display());
+        log::debug!(
+            "animgen {}: tile pass {:.2}s (total {:.2}s)",
+            src.display(),
+            tile_t0.elapsed().as_secs_f32(),
+            gen_t0.elapsed().as_secs_f32(),
+        );
     }
     decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
 }

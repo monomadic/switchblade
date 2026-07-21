@@ -220,18 +220,32 @@ pub fn run(scenario_path: &Path, out_dir: &Path, sets: &[String]) -> Result<Summ
 
     // Mechanical validity: every step ran (no early break) + required
     // conditions all met. NEVER a performance verdict.
-    let mut conditions = Vec::new();
     for req in &scenario.validity.require {
-        let hit = rig.conds.iter().find(|(c, _)| c == req);
-        let met = hit.is_some();
-        if !met {
+        if !rig.conds.iter().any(|(c, _)| c == req) {
             invalid.push(format!("required condition never met: {req}"));
         }
-        conditions.push(CondResult {
-            cond: req.clone(),
-            met,
-            at_s: hit.map(|(_, t)| *t),
-        });
+    }
+    // Surface EVERY recorded condition (each `wait_until` records its
+    // met-time, not only the validity-required ones), so diagnostic
+    // brackets like the anim-sheet lifecycle appear in the summary with
+    // timings. Required-but-never-met conds still show, flagged unmet.
+    let mut conditions: Vec<CondResult> = rig
+        .conds
+        .iter()
+        .map(|(cond, t)| CondResult {
+            cond: cond.clone(),
+            met: true,
+            at_s: Some(*t),
+        })
+        .collect();
+    for req in &scenario.validity.require {
+        if !rig.conds.iter().any(|(c, _)| c == req) {
+            conditions.push(CondResult {
+                cond: req.clone(),
+                met: false,
+                at_s: None,
+            });
+        }
     }
 
     let summary = Summary {
@@ -435,6 +449,24 @@ impl Rig {
                 .is_some_and(|l| l.first_frame.is_some()),
             "grid_settled" => !self.animating,
             "cache_thumbs" => self.probe.snapshot().thumbs_cached >= n as u64,
+            // Anim-sheet (storyboard) lifecycle for the SELECTED clip — the
+            // sheet whose cells the seekbar hover and chapter-bar chips
+            // sample. `requested` leaves Thumb::None the moment
+            // request_quickview_sheet fires (past the prewarm_ok /
+            // warm_filling gates); `selected_anim` is Ready, i.e. decoded
+            // AND atlas-resident, the point the chips can actually draw.
+            // The two bracket the delay: requested-since-served = the gate
+            // cascade cost, ready-since-requested = gen + install cost.
+            "selected_anim_requested" => self
+                .app
+                .clips
+                .get(self.app.selected)
+                .is_some_and(|c| !matches!(c.anim, crate::Thumb::None)),
+            "selected_anim" => self
+                .app
+                .clips
+                .get(self.app.selected)
+                .is_some_and(|c| matches!(c.anim, crate::Thumb::Ready { .. })),
             _ => false,
         }
     }
