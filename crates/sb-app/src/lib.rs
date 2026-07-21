@@ -332,11 +332,11 @@ pub struct Options {
     /// overrides). When set, no config file is loaded and nothing
     /// hot-reloads — the injected values are exactly what runs.
     pub tuning: Option<Tuning>,
-    /// `--suppress-storyboards`: never generate the on-demand storyboard
-    /// sheet (the g² anim atlas the seekbar skimming + chapter chips
-    /// sample). For A/B testing the feature and for machines where the
-    /// nine niced ffmpeg extracts per opened clip aren't worth it.
-    pub suppress_storyboards: bool,
+    /// `--no-storyboards`: never generate the on-demand storyboard sheet
+    /// (the g² anim atlas the seekbar skimming + chapter chips sample).
+    /// For A/B testing the feature and for machines where the nine niced
+    /// ffmpeg extracts per opened clip aren't worth it.
+    pub no_storyboards: bool,
 }
 
 pub struct Switchblade {
@@ -413,10 +413,10 @@ pub struct Switchblade {
     sel_changed_at: Instant,
     hover_changed_at: Instant,
     demo: bool,
-    /// `--suppress-storyboards`: gate every storyboard-sheet request off,
-    /// so no anim atlas is ever generated (seekbar skimming + chapter
-    /// chips fall back to no preview). Startup-only.
-    suppress_storyboards: bool,
+    /// `--no-storyboards`: gate every storyboard-sheet request off, so no
+    /// anim atlas is ever generated (seekbar skimming + chapter chips fall
+    /// back to no preview). Startup-only.
+    no_storyboards: bool,
     /// CLI `--animation` override; beats the config's level when set.
     cli_animation: Option<AnimLevel>,
     /// Window focus state + the runtime toggle for pause-when-unfocused.
@@ -744,7 +744,7 @@ impl Switchblade {
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
-            suppress_storyboards: opts.suppress_storyboards,
+            no_storyboards: opts.no_storyboards,
             cli_animation: opts.animation,
             focused: true,
             focus_pause_on: true,
@@ -2823,10 +2823,10 @@ impl Switchblade {
         // (prewarm_ok): sheet generation is nine niced ffmpeg decodes,
         // and racing them against the interactive cold spawn is exactly
         // the jank the priority tiers exist to prevent.
-        // --suppress-storyboards short-circuits the ONLY sheet-request
-        // site: no anim atlas is ever queued, so the gen sweep and the
-        // interactive cold spawns keep the freed workers.
-        if self.suppress_storyboards {
+        // --no-storyboards short-circuits the ONLY sheet-request site: no
+        // anim atlas is ever queued, so the gen sweep and the interactive
+        // cold spawns keep the freed workers.
+        if self.no_storyboards {
             return;
         }
         let want = ((self.quickview && self.tuning.seekbar_thumb_width >= 8.0) || self.fullview)

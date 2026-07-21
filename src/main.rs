@@ -36,7 +36,6 @@ OPTIONS:
                     none = snap everything, no video; minimal = UI tweens
                     only; normal = + live video for quickview/selected/
                     hovered ('full' is a legacy alias of normal)
-    --no-anim       legacy alias for --animation normal
     --fullscreen    start fullscreen (macOS native: own Space + animation)
     --fast-fullscreen
                     start fullscreen the fast way: a borderless window
@@ -47,7 +46,7 @@ OPTIONS:
     --no-config     ignore every config file: run on the internal
                     defaults, with hot-reload off (tests, triage —
                     behavior can't be steered by a stray config)
-    --suppress-storyboards
+    --no-storyboards
                     never generate the storyboard sheet (the 3x3 anim
                     atlas the seekbar skimming + chapter chips sample) —
                     for perf-constrained machines and A/B testing
@@ -95,12 +94,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            "--no-anim" => opts.animation = Some(sb_app::AnimLevel::Normal),
             "--fullscreen" => opts.fullscreen = Some(false),
             "--fast-fullscreen" => opts.fullscreen = Some(true),
             "--init" => return init_config(),
             "--no-config" => opts.no_config = true,
-            "--suppress-storyboards" => opts.suppress_storyboards = true,
+            "--no-storyboards" => opts.no_storyboards = true,
             "--demo" => opts.demo = true,
             "--clear-cache" => return clear_cache(),
             "--cleanup-cache" => return cleanup_cache(),
