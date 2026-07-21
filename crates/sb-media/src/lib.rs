@@ -63,8 +63,14 @@ impl Recipe {
         }
     }
     fn thumb_file(&self) -> String {
+        // `_kf`: the extract truly lands on the keyframe ≤ the target
+        // (`-copyts` — without it the jpeg mux silently dropped the
+        // rebased-negative keyframe frames and wrote the exact-target
+        // frame, up to a GOP AHEAD of where live playback opens: the
+        // "video skips backward on hover" bug). The suffix regenerates
+        // every stale exact-frame thumb rather than serving it.
         format!(
-            "thumb_fit_{}x{}_q{}{}.jpg",
+            "thumb_fit_{}x{}_q{}{}_kf.jpg",
             self.thumb_w,
             self.thumb_h,
             self.quality,
@@ -73,11 +79,12 @@ impl Recipe {
     }
     fn anim_file(&self) -> String {
         // `_fit`: cells preserve the source aspect (fit into the cell box),
-        // not the legacy 16:9 crop-fill — the suffix regenerates old
-        // cropped sheets rather than serving them.
+        // not the legacy 16:9 crop-fill. `_kf`: cells are true keyframe
+        // grabs (`-copyts`, same mux gotcha as `thumb_file`). Either
+        // suffix change regenerates old sheets rather than serving them.
         let g = self.anim_grid;
         format!(
-            "anim_{g}x{g}_{}x{}_q{}_fit.jpg",
+            "anim_{g}x{g}_{}x{}_q{}_fit_kf.jpg",
             self.thumb_w, self.thumb_h, self.quality
         )
     }
@@ -884,9 +891,13 @@ fn make_anim(
         }
         for k in 0..frames {
             let map = format!("{k}:v:0");
+            // -copyts per output: without it the input -ss rebases pts and
+            // the jpeg mux drops the (negative-pts) landing keyframe,
+            // silently writing the exact-target frame instead — decode-
+            // forward and all (see extract_frame; verified by pixels).
             cmd.args([
-                "-map", map.as_str(), "-frames:v", "1", "-vf", vf.as_str(), "-q:v", q.as_str(),
-                "-strict", "unofficial", "-f", "mjpeg",
+                "-map", map.as_str(), "-copyts", "-frames:v", "1", "-vf", vf.as_str(), "-q:v",
+                q.as_str(), "-strict", "unofficial", "-f", "mjpeg",
             ])
             .arg(frame_tmp(k));
         }
@@ -898,7 +909,7 @@ fn make_anim(
                 continue;
             }
             let ok = media_cmd("ffmpeg")
-                .args(["-y", "-v", "error", "-ss", "0", "-noaccurate_seek"])
+                .args(["-y", "-v", "error", "-ss", "0", "-noaccurate_seek", "-copyts"])
                 .arg("-i")
                 .arg(src)
                 .args([
@@ -1196,10 +1207,16 @@ fn extract_frame(
         // -noaccurate_seek: grab the nearest keyframe ≤ seek, no
         // decode-forward to the exact timestamp. The live stream's initial
         // seek is keyframe too (SeekablePlayer, seekable.rs), so thumb and
-        // first live frame still land on the SAME frame — the no-jolt
-        // handoff holds, now without the per-thumb GOP decode that slowed
-        // the whole gen sweep on sparse-keyframe 4K.
-        .args(["-ss", &format!("{seek:.3}"), "-noaccurate_seek"])
+        // first live frame land on the SAME frame — the no-jolt handoff.
+        // -copyts is LOAD-BEARING: input -ss rebases timestamps so the
+        // landing keyframe comes out NEGATIVE, and the jpeg mux silently
+        // drops negative-pts frames — without -copyts the file written is
+        // the first pts≥0 frame, i.e. the EXACT target (decode-forward
+        // and all), up to a GOP ahead of where live opens. That mismatch
+        // shipped as "video skips backward on hover" and survived pts
+        // logging because showinfo/null sinks DO show the keyframe —
+        // verify this behavior by pixels, never by pts print-outs.
+        .args(["-ss", &format!("{seek:.3}"), "-noaccurate_seek", "-copyts"])
         .arg("-i")
         .arg(src)
         .args([
@@ -1739,8 +1756,8 @@ mod tests {
         };
         assert_eq!(
             base.thumb_file(),
-            "thumb_fit_640x360_q5.jpg",
-            "the default fraction keeps the legacy name"
+            "thumb_fit_640x360_q5_kf.jpg",
+            "the default fraction has no _sNN suffix; _kf = true keyframe grab"
         );
         let start = Recipe {
             seek_fraction: 0.0,
@@ -1748,14 +1765,14 @@ mod tests {
         };
         assert_eq!(
             start.thumb_file(),
-            "thumb_fit_640x360_q5_s0.jpg",
+            "thumb_fit_640x360_q5_s0_kf.jpg",
             "a 0% start gets its own artifact"
         );
         let quarter = Recipe {
             seek_fraction: 0.25,
             ..base
         };
-        assert_eq!(quarter.thumb_file(), "thumb_fit_640x360_q5_s25.jpg");
+        assert_eq!(quarter.thumb_file(), "thumb_fit_640x360_q5_s25_kf.jpg");
     }
 
     /// Two generations of the same artifact must never share a staging
@@ -1933,3 +1950,4 @@ mod tests {
         );
     }
 }
+
