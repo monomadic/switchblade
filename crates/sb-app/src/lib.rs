@@ -361,6 +361,15 @@ pub struct Switchblade {
     /// tile's atlas-slot lane, each started once its target settles.
     live_sel: Option<SelLive>,
     live_hover: Option<LiveState>,
+    /// Continuity handoff (clip index, content position): where the hover
+    /// preview is/was playing, refreshed while the lane lives and kept
+    /// after it dies for as long as the selection stays on that clip. A
+    /// selected-lane open for the clip continues from here instead of
+    /// restarting at the thumb anchor — clicking a tile you watched
+    /// preview for 6s used to jump playback 6s backward (the warm stream
+    /// spawned at the anchor and sat parked; measured in
+    /// benchmarks/scenarios/hover_then_select_handoff.toml).
+    hover_resume: Option<(usize, f64)>,
     /// Pre-warmed decoders for the filmstrip neighbors (quickview only),
     /// spawned ahead of need so h/l shows video the same tick. An
     /// unwatched player's bounded frame queue fills and stalls its
@@ -730,6 +739,7 @@ impl Switchblade {
             slots: vec![None; atlas_cfg.slots()],
             live_sel: None,
             live_hover: None,
+            hover_resume: None,
             warm: Vec::new(),
             hires_frame: None,
             hires_shown: None,
@@ -1360,6 +1370,7 @@ impl Switchblade {
             .collect();
         self.hovered = None;
         self.strip_hover = None;
+        self.hover_resume = None; // index-keyed; hover clears anyway
         if self.quickview {
             self.strip_pos = self.selected as f32;
             self.strip_target = self.strip_pos;
@@ -1948,6 +1959,7 @@ impl Switchblade {
         self.warm.clear();
         self.hovered = None;
         self.strip_hover = None;
+        self.hover_resume = None; // index-keyed; the indices are gone
         self.marked.clear(); // index-keyed; the indices are gone
         self.selected = 0;
         self.pending_reselect = Some(path);
@@ -3235,6 +3247,21 @@ impl Switchblade {
                 self.warm.push(l);
             }
         }
+        // Track the hover preview's position for the continuity handoff:
+        // refreshed every frame while the preview plays, and after the
+        // lane dies (clicking the hovered tile makes hovered == selected,
+        // which reaps it right below) the last position SURVIVES as long
+        // as the selection is on that clip — the selected-lane open may
+        // trail the click by the settle delay, so a frame-local capture
+        // would miss the fresh-spawn path.
+        self.hover_resume = self
+            .live_hover
+            .as_ref()
+            .filter(|h| h.first_frame.is_some())
+            .map(|h| (h.clip, h.player.position()))
+            .or(self
+                .hover_resume
+                .filter(|&(hc, _)| sel_target == Some(hc)));
         if let Some(l) = &self.live_hover
             && hover_target != Some(l.clip)
         {
@@ -3262,12 +3289,32 @@ impl Switchblade {
                     "promoted warm decoder for clip {i} ({} frames buffered)",
                     l.player.buffered()
                 );
+                // Continuity handoff: if this clip's hover preview was
+                // playing (it usually died THIS frame — clicking the
+                // hovered tile makes it the selection, which reaps the
+                // lane above), the user has been watching it advance past
+                // the thumb anchor — but the warm stream spawned at the
+                // anchor and has been parked ever since, so promoting its
+                // queued frames visibly jumped playback backward by
+                // however long the preview ran (measured: ~6s on a 4s-GOP
+                // 4K clip; benchmarks/scenarios/hover_then_select_handoff
+                // .toml). Keyframe-seek the promoted stream to the
+                // preview's position in place (~10-30ms, no respawn):
+                // playback continues from what's on screen, at worst one
+                // GOP behind it.
+                if let Some((hc, hp)) = self.hover_resume
+                    && hc == i
+                    && (hp - l.player.position()).abs() > 0.5
+                {
+                    l.player.seek(hp, false);
+                }
                 let clip: Arc<str> = Arc::from(l.path.to_string_lossy().as_ref());
-                self.probe.mark(
+                self.probe.mark_pts(
                     sb_media::EventKind::Promotion,
                     sb_media::Lane::Selected,
                     l.generation,
                     &clip,
+                    l.player.position(),
                 );
                 self.live_sel = Some(l);
             } else if self.quickview
@@ -3280,7 +3327,11 @@ impl Switchblade {
                     self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
                 }
             {
-                self.live_sel = self.start_sel_live(i, sb_media::Lane::Selected);
+                let resume = self
+                    .hover_resume
+                    .filter(|&(hc, _)| hc == i)
+                    .map(|(_, p)| p);
+                self.live_sel = self.start_sel_live(i, sb_media::Lane::Selected, resume);
             }
         }
         self.warm.retain(|w| warm_targets.contains(&w.clip));
@@ -3309,7 +3360,7 @@ impl Switchblade {
             && let Some(&i) = warm_targets
                 .iter()
                 .find(|&&i| self.warm.iter().all(|w| w.clip != i))
-            && let Some(l) = self.start_sel_live(i, sb_media::Lane::Warm)
+            && let Some(l) = self.start_sel_live(i, sb_media::Lane::Warm, None)
         {
             self.warm.push(l);
         }
@@ -3325,7 +3376,7 @@ impl Switchblade {
             }
         }
 
-        let mut hover_served: Option<(u64, usize)> = None;
+        let mut hover_served: Option<(u64, usize, f64)> = None;
         if let Some(live) = &mut self.live_hover
             && let Some(rgba) = live.player.take_frame()
         {
@@ -3337,7 +3388,7 @@ impl Switchblade {
                     live.clip,
                     live.player.position(),
                 );
-                hover_served = Some((live.generation, live.clip));
+                hover_served = Some((live.generation, live.clip, live.player.position()));
             }
             uploads.push(ThumbUpload {
                 slot: live.slot,
@@ -3346,12 +3397,17 @@ impl Switchblade {
                 rgba,
             });
         }
-        if let Some((generation, ci)) = hover_served
+        if let Some((generation, ci, pos)) = hover_served
             && let Some(path) = self.clips.get(ci).map(|c| c.path.clone())
         {
             let clip: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
-            self.probe
-                .mark(sb_media::EventKind::FrameServed, sb_media::Lane::Hover, generation, &clip);
+            self.probe.mark_pts(
+                sb_media::EventKind::FrameServed,
+                sb_media::Lane::Hover,
+                generation,
+                &clip,
+                pos,
+            );
         }
         // Park the selected stream while its tile is offscreen and no
         // modal shows it (P0.4), or whenever focus-pause is active (the
@@ -3392,7 +3448,7 @@ impl Switchblade {
         {
             l.player.recycle(buf);
         }
-        let mut sel_served: Option<(u64, PathBuf)> = None;
+        let mut sel_served: Option<(u64, PathBuf, f64)> = None;
         if !self.sel_parked
             && let Some(live) = &mut self.live_sel
             && let Some(rgba) = live.player.take_frame()
@@ -3409,7 +3465,7 @@ impl Switchblade {
                     live.spawned.elapsed().as_secs_f32() * 1000.0,
                     live.player.position(),
                 );
-                sel_served = Some((live.generation, live.path.clone()));
+                sel_served = Some((live.generation, live.path.clone(), live.player.position()));
             }
             if self.hires_shown.as_ref() != Some(&live.path) {
                 self.hires_shown = Some(live.path.clone());
@@ -3422,13 +3478,14 @@ impl Switchblade {
                 rgba,
             });
         }
-        if let Some((generation, path)) = sel_served {
+        if let Some((generation, path, pos)) = sel_served {
             let clip: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
-            self.probe.mark(
+            self.probe.mark_pts(
                 sb_media::EventKind::FrameServed,
                 sb_media::Lane::Selected,
                 generation,
                 &clip,
+                pos,
             );
         }
     }
@@ -3500,7 +3557,12 @@ impl Switchblade {
         generation
     }
 
-    fn start_sel_live(&mut self, i: usize, lane: sb_media::Lane) -> Option<SelLive> {
+    fn start_sel_live(
+        &mut self,
+        i: usize,
+        lane: sb_media::Lane,
+        resume: Option<f64>,
+    ) -> Option<SelLive> {
         let clip = self.clips.get(i)?;
         let (tw, th, path) = match clip.thumb {
             Thumb::Ready { tw, th, .. } if clip.readable && !clip.cloud => {
@@ -3531,11 +3593,17 @@ impl Switchblade {
         let scale = (bw / sw).min(bh / sh).min(1.0);
         let (dw, dh) = (((sw * scale) as u32).max(2), ((sh * scale) as u32).max(2));
         // Start where the thumbnail was taken, so video continues from the
-        // frame the tile already shows instead of jolting to 0:00.
+        // frame the tile already shows instead of jolting to 0:00 — UNLESS
+        // the caller passed a resume position: then this clip's hover
+        // preview was just on screen at that position, and opening at the
+        // anchor visibly jumped playback backward by however long the
+        // preview ran (the continuity handoff — see the promotion twin).
         let duration = meta.as_ref().and_then(|m| m.duration);
-        let seek = duration
-            .map(|d| (d * self.seek_fraction).max(0.0))
-            .unwrap_or(0.0);
+        let seek = resume.unwrap_or_else(|| {
+            duration
+                .map(|d| (d * self.seek_fraction).max(0.0))
+                .unwrap_or(0.0)
+        });
         self.heal_meta(meta.as_ref(), &path);
         let player = sb_media::SeekablePlayer::spawn(&path, dw, dh, seek, meta.as_ref())?;
         // Deadline-paced redraws (P1.4): a frame landing in a dry queue
@@ -5434,6 +5502,121 @@ mod tests {
         drop(tx);
         let _ = app.frame(0.016, vp);
         assert!(app.rx.is_none(), "disconnect noticed without a hot loop");
+    }
+
+    /// The continuity handoff: hover-preview a tile, let it play past the
+    /// thumb anchor, then click it. The selected-lane open (warm
+    /// promotion or fresh spawn) must continue from the PREVIEW's
+    /// position, not restart at the anchor — the restart was the reported
+    /// "video skips backward ~a GOP when it starts playing" (measured in
+    /// benchmarks/scenarios/hover_then_select_handoff.toml: a 6s hover
+    /// jumped 6s back on click). Fixture keyframes are 1s apart (-g 30),
+    /// anchor = 10% of 8s = 0.8s → anchor keyframe 0.0; after >1.4s of
+    /// preview the resumed open must land at a keyframe ≥ 1.0. Needs
+    /// ffmpeg — skipped quietly when it's not on PATH.
+    #[test]
+    fn hover_click_continues_from_the_preview_position() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_hover_continuity_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str| {
+            let clip = dir.join(name);
+            if !clip.exists() {
+                let ok = std::process::Command::new("ffmpeg")
+                    .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                    .arg("testsrc2=duration=8:size=320x180:rate=30")
+                    .args([
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g",
+                        "30",
+                    ])
+                    .arg(&clip)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "failed to generate test clip");
+            }
+            clip
+        };
+        let a = mk("cont_a.mp4");
+        let b = mk("cont_b.mp4");
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![a, b],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| a.clips.len() == 2
+                && matches!(a.clips[1].thumb, Thumb::Ready { .. })),
+            "clip 1's thumb never became ready"
+        );
+        // Hover tile 1 (unselected) and skip the settle delay.
+        let lay = app.layout();
+        let (tx, ty, tw, th) = app.tile_rect(&lay, 1);
+        let (cx, cy) = (tx + tw * 0.5, ty + th * 0.5);
+        app.event(InputEvent::CursorMoved { x: cx, y: cy });
+        app.hover_changed_at = Instant::now() - Duration::from_secs(2);
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_hover
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "hover preview never served"
+        );
+        // Let the preview play well past the anchor keyframe (wall time —
+        // the decoder paces on the wall clock).
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let until = Instant::now() + Duration::from_millis(1600);
+        while Instant::now() < until {
+            let _ = app.frame(0.016, vp);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let preview_pos = app.live_hover.as_ref().unwrap().player.position();
+        assert!(
+            preview_pos > 1.2,
+            "preview should have played past 1.2s, at {preview_pos}"
+        );
+
+        // Click the hovered tile: selects it; the selected-lane open
+        // (promotion or spawn) must resume from the preview.
+        app.event(InputEvent::MouseDown {
+            x: cx,
+            y: cy,
+            mods: Mods::default(),
+        });
+        app.event(InputEvent::MouseUp { x: cx, y: cy });
+        assert_eq!(app.selected, 1, "click selects the hovered tile");
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.clip == 1 && l.first_frame.is_some())),
+            "selected stream never served after the click"
+        );
+        let pos = app.live_sel.as_ref().unwrap().position();
+        assert!(
+            pos >= 0.9,
+            "selected open must continue from the preview (~{preview_pos:.1}s, keyframe ≥1.0), \
+             not restart at the anchor keyframe 0.0 — got {pos}"
+        );
+        assert!(
+            pos <= preview_pos + 1.0,
+            "resumed position should be near the preview, got {pos} vs {preview_pos}"
+        );
     }
 
     /// `]` seeks the selected stream in place — the SAME decoder jumps
