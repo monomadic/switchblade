@@ -75,6 +75,12 @@ const SCRIM_PAD: f32 = 3.0;
 /// The scrim's black opacity — shared by the ring and the seekbar so the
 /// two translucent backings always match.
 const SCRIM_ALPHA: f32 = 0.45;
+/// The seekbar's scrim runs thicker than the ring's — a chunky dark cuff
+/// around the line, so the white track/fill read clearly over any video.
+const SEEKBAR_SCRIM_PAD: f32 = 4.0;
+/// Accumulated pinch magnitude (summed trackpad deltas) that steps a modal
+/// view up or down the depth ladder.
+const MODAL_PINCH_STEP: f32 = 0.18;
 
 const DEMO_TILES: usize = 480;
 
@@ -502,6 +508,10 @@ pub struct Switchblade {
     /// Redraw-reason telemetry (debug log level only).
     redraw_stats: RedrawStats,
     last_scroll_event: Instant,
+    /// Accumulated pinch delta while a modal is up — a pinch there steps
+    /// the view-depth ladder (out = shallower, in = deeper) once the
+    /// magnitude crosses `MODAL_PINCH_STEP`, rather than zooming the grid.
+    modal_pinch_accum: f32,
     viewport: Viewport,
     cmds: Vec<WindowCommand>,
     title: String,
@@ -767,6 +777,7 @@ impl Switchblade {
             next_lane_gen: 0,
             redraw_stats: RedrawStats::new(),
             last_scroll_event: Instant::now(),
+            modal_pinch_accum: 0.0,
             viewport: Viewport {
                 width: 1280.0,
                 height: 800.0,
@@ -1473,22 +1484,30 @@ impl Switchblade {
             // nonzero.) The vertical axis is a view-depth ladder between
             // the modals, with dead-ends at each end:
             //   fullview:  left/right step chapters (peeking the bar),
-            //              up → filmstrip quickview, down → nothing (floor)
+            //              down → filmstrip quickview, up → dismiss the
+            //              chapter bar if it's up, else nothing (ceiling)
             //   quickview: left/right move the selection along the strip,
-            //              down → fullview, up → nothing (ceiling; Esc
-            //              returns to the grid)
+            //              up → fullview, down → back to the grid
             //   grid:      every direction moves the selection.
             Action::Move { dx, dy } => {
                 if self.fullview {
                     if dx != 0 {
                         self.chapter_step(dx > 0);
                     } else if dy < 0 {
+                        // Up: swipe the chapter bar back down off screen
+                        // if it's up; otherwise nothing (the ceiling).
+                        if self.chapters.as_ref().is_some_and(|b| b.open) {
+                            self.close_chapter_bar();
+                        }
+                    } else if dy > 0 {
                         self.to_quickview();
                     }
                 } else if self.quickview {
-                    if dy > 0 {
+                    if dy < 0 {
                         self.fullview = true;
-                    } else if dy == 0 {
+                    } else if dy > 0 {
+                        self.quickview = false; // down drops back to the grid
+                    } else {
                         self.move_selection(dx, dy);
                     }
                 } else {
@@ -1708,14 +1727,32 @@ impl Switchblade {
         }
     }
 
+    /// How far the seekbar rides up off the video's bottom edge. Zero in
+    /// quickview; in fullview it lifts with the chapter bar's slide so the
+    /// bar stays visible above the chips instead of fading out under them.
+    /// Centralized here so the draw AND every hit-test (hover storyboard,
+    /// click, scrub) share the lifted position — otherwise the hover thumb
+    /// tracks the old bottom-edge band while the bar is drawn higher.
+    fn seekbar_lift(&self) -> f32 {
+        if self.fullview {
+            let slide = self.chapters.as_ref().map(|b| b.slide).unwrap_or(0.0);
+            if slide > 0.0 {
+                let (_, chh, _) = self.strip_geom();
+                return slide * (chh + 34.0);
+            }
+        }
+        0.0
+    }
+
     /// Seekbar line geometry: (left x, width, bottom y). The bar floats
     /// inset from the video's edges (side padding scales with the frame),
-    /// shared by the quickview modal and fullview.
+    /// shared by the quickview modal and fullview. `bottom y` already
+    /// includes `seekbar_lift`.
     fn seekbar_line(&self) -> Option<(f32, f32, f32)> {
         let (x, y, w, h) = self.active_video_rect()?;
         let pad_x = (w * 0.05).clamp(16.0, 48.0);
         let pad_y = (h * 0.05).clamp(14.0, 32.0);
-        Some((x + pad_x, (w - pad_x * 2.0).max(8.0), y + h - pad_y))
+        Some((x + pad_x, (w - pad_x * 2.0).max(8.0), y + h - pad_y - self.seekbar_lift()))
     }
 
     /// Fraction of the bar under screen-x (unclamped hit — used while
@@ -1745,6 +1782,8 @@ impl Switchblade {
         if bar_a <= 0.005 {
             return;
         }
+        // `bot` already includes seekbar_lift (fullview raises the bar above
+        // the chapter bar), so the hover storyboard/click/scrub bands match.
         let (Some(pos), Some((bx, bw, bot))) = (self.seekbar_pos(), self.seekbar_line()) else {
             return;
         };
@@ -1775,13 +1814,13 @@ impl Switchblade {
         // Scrim first: the same soft dark backing the auto-skip ring wears,
         // so the white track/fill stay legible over bright video.
         tiles.push(Tile {
-            x: bx - SCRIM_PAD,
-            y: bot - bh - SCRIM_PAD,
-            w: bw + SCRIM_PAD * 2.0,
-            h: bh + SCRIM_PAD * 2.0,
+            x: bx - SEEKBAR_SCRIM_PAD,
+            y: bot - bh - SEEKBAR_SCRIM_PAD,
+            w: bw + SEEKBAR_SCRIM_PAD * 2.0,
+            h: bh + SEEKBAR_SCRIM_PAD * 2.0,
             color: [0.0, 0.0, 0.0, SCRIM_ALPHA * bar_a],
             border_color: [0.0; 4],
-            corner_radius: bh * 0.5 + SCRIM_PAD,
+            corner_radius: bh * 0.5 + SEEKBAR_SCRIM_PAD,
             border_width: 0.0,
             uv: [0.0; 4],
             uv2: [0.0; 4],
@@ -4160,13 +4199,13 @@ impl Switchblade {
                         hires,
                         pie: 0.0,
                     });
-                    // The chapter bar owns the bottom edge while up: the
-                    // seekbar fades out as the bar slides in.
-                    let chapter_slide = self.chapters.as_ref().map(|b| b.slide).unwrap_or(0.0);
+                    // The chapter bar claims the bottom edge while up, so
+                    // the seekbar rides up above it (staying visible, via
+                    // seekbar_lift) as the bar slides in instead of fading
+                    // out under it.
                     let bar_a = self
                         .seekbar_alpha()
-                        .max(skip_bar.map(|(_, a)| a).unwrap_or(0.0))
-                        * (1.0 - chapter_slide);
+                        .max(skip_bar.map(|(_, a)| a).unwrap_or(0.0));
                     self.push_seekbar(&mut tiles, rx, rw, clip, bar_a);
                 } else {
                     // Nothing decoded yet: loading dots on the black stage.
@@ -4508,11 +4547,38 @@ impl App for Switchblade {
                 self.chase = self.tuning.snap_strength;
             }
             InputEvent::Pinch { delta } => {
-                // Zooming a frozen/hidden grid is invisible churn — the
-                // gesture belongs to the grid, not the modals.
+                // In a modal the pinch steps the view-depth ladder instead
+                // of zooming the (frozen/hidden) grid: pinch-in (fingers
+                // apart, delta > 0) dives deeper, pinch-out (fingers
+                // together) backs out. Deltas accumulate so a deliberate
+                // gesture crosses MODAL_PINCH_STEP; a reversal resets it.
                 if self.quickview || self.fullview {
+                    if self.modal_pinch_accum != 0.0
+                        && self.modal_pinch_accum.signum() != delta.signum()
+                    {
+                        self.modal_pinch_accum = 0.0;
+                    }
+                    self.modal_pinch_accum += delta;
+                    if self.modal_pinch_accum >= MODAL_PINCH_STEP {
+                        // Pinch-in: quickview → fullview (fullview is the floor).
+                        self.modal_pinch_accum = 0.0;
+                        if self.quickview && !self.fullview {
+                            self.fullview = true;
+                            self.wake(0.3);
+                        }
+                    } else if self.modal_pinch_accum <= -MODAL_PINCH_STEP {
+                        // Pinch-out: fullview → strip, or strip → grid.
+                        self.modal_pinch_accum = 0.0;
+                        if self.fullview {
+                            self.to_quickview();
+                        } else if self.quickview {
+                            self.quickview = false;
+                            self.wake(0.3);
+                        }
+                    }
                     return;
                 }
+                self.modal_pinch_accum = 0.0;
                 let factor = 1.0 + delta * self.tuning.pinch_sensitivity;
                 self.set_zoom(self.zoom_target * factor.max(0.01));
             }
@@ -4564,6 +4630,16 @@ impl App for Switchblade {
                     self.wake(
                         self.tuning.seekbar_hide_s + self.tuning.seekbar_fade_ms / 1000.0 + 0.2,
                     );
+                }
+                // Dock-style reveal: resting the pointer near the bottom
+                // edge in fullview slides the chapter bar up as a peek (it
+                // slides back down once the pointer leaves and the peek
+                // window elapses). Never mid-scrub. A sticky `g`-open bar
+                // is left alone — open_chapter_bar won't downgrade it.
+                let reveal = self.tuning.chapter_dock_reveal_px;
+                if self.fullview && !self.scrubbing && reveal > 0.0 && y >= self.viewport.height - reveal
+                {
+                    self.open_chapter_bar(true);
                 }
             }
             InputEvent::Focus { focused } => {
@@ -6306,12 +6382,11 @@ mod tests {
         );
     }
 
-    /// Vertical keys are a view-depth ladder: down dives quickview →
-    /// fullview (the strip staying live underneath), up steps fullview →
-    /// quickview (bringing the strip up even when fullview was entered
-    /// directly). The ladder's ends are dead-ends: down in fullview and
-    /// up in quickview do nothing (they don't fall through to a selection
-    /// move).
+    /// Vertical keys are a view-depth ladder: up dives quickview →
+    /// fullview (the strip staying live underneath), down steps fullview →
+    /// quickview → grid. The ladder's top is a dead-end: up in fullview
+    /// (with no chapter bar up) does nothing (no fall-through to a
+    /// selection move).
     #[test]
     fn vertical_keys_step_between_quickview_and_fullview() {
         let mut app = Switchblade::with_options(Options {
@@ -6321,43 +6396,121 @@ mod tests {
             ..Options::default()
         });
 
-        // Quickview ("stripview"): down dives into fullview, quickview
+        // Quickview ("stripview"): up dives into fullview, quickview
         // staying true underneath (fullview layers over it).
         app.key(Key::Space);
         assert!(app.quickview && !app.fullview, "space opens quickview");
-        // Up in quickview is a dead-end — no view change, no selection move.
-        app.key(Key::Up);
-        assert!(
-            app.quickview && !app.fullview && app.selected == 0,
-            "up in quickview does nothing"
-        );
+        // Down in quickview drops back to the grid.
         app.key(Key::Down);
-        assert!(app.fullview, "down dives into fullview");
+        assert!(
+            !app.quickview && !app.fullview,
+            "down in quickview returns to the grid"
+        );
+        // Re-open and go up into fullview.
+        app.key(Key::Space);
+        app.key(Key::Up);
+        assert!(app.fullview, "up dives into fullview");
         assert!(app.quickview, "quickview stays under fullview");
 
-        // Down in fullview is a dead-end too (the ladder's floor).
+        // Up in fullview (no chapter bar) is a dead-end too (the ceiling).
         let sel = app.selected;
-        app.key(Key::Down);
+        app.key(Key::Up);
         assert!(
             app.fullview && app.selected == sel,
-            "down in fullview does nothing"
+            "up in fullview does nothing when no chapter bar is up"
         );
 
-        // Up steps back out to the filmstrip quickview.
-        app.key(Key::Up);
-        assert!(!app.fullview, "up leaves fullview");
-        assert!(app.quickview, "up lands on the filmstrip quickview");
+        // Down steps back out to the filmstrip quickview.
+        app.key(Key::Down);
+        assert!(!app.fullview, "down leaves fullview");
+        assert!(app.quickview, "down lands on the filmstrip quickview");
 
-        // Fullview entered directly (no quickview under it): up still
+        // Fullview entered directly (no quickview under it): down still
         // brings the strip up rather than dropping to the grid.
         app.key(Key::Escape);
         assert!(!app.quickview && !app.fullview, "esc returns to the grid");
         app.key(Key::Tab);
         assert!(app.fullview && !app.quickview, "tab enters fullview only");
-        app.key(Key::Up);
+        app.key(Key::Down);
         assert!(
             !app.fullview && app.quickview,
-            "up opens the filmstrip quickview from a direct fullview"
+            "down opens the filmstrip quickview from a direct fullview"
+        );
+    }
+
+    /// In fullview, up dismisses the chapter bar (swiping it down off
+    /// screen) when one is up, instead of hitting the ceiling dead-end.
+    #[test]
+    fn fullview_up_dismisses_the_chapter_bar() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true,
+            ..Options::default()
+        });
+        app.key(Key::Tab);
+        assert!(app.fullview, "tab enters fullview");
+        // Build a sticky (g-style) bar directly — open_chapter_bar bails in
+        // demo mode (no readable file), so mirror the sibling chapter tests.
+        app.chapters = Some(ChapterBar {
+            path: app.clips[app.selected].path.clone(),
+            duration: Some(400.0),
+            times: Some(vec![0.0, 50.0, 100.0]),
+            open: true,
+            slide: 1.0,
+            pos: 0.0,
+            target: 0.0,
+            peek_until: None,
+        });
+        app.key(Key::Up);
+        assert!(
+            app.chapters.as_ref().map(|b| !b.open).unwrap_or(true),
+            "up sends the chapter bar back down"
+        );
+        assert!(app.fullview, "fullview stays — only the bar was dismissed");
+    }
+
+    /// A pinch in a modal steps the view-depth ladder instead of zooming
+    /// the hidden grid: pinch-in (fingers apart) dives deeper, pinch-out
+    /// (fingers together) backs out. Deltas accumulate past MODAL_PINCH_STEP.
+    #[test]
+    fn modal_pinch_steps_the_view_ladder() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true,
+            ..Options::default()
+        });
+        let big = MODAL_PINCH_STEP + 0.01;
+
+        // Quickview: pinch-in → fullview.
+        app.key(Key::Space);
+        assert!(app.quickview && !app.fullview, "space opens quickview");
+        app.event(InputEvent::Pinch { delta: big });
+        assert!(app.fullview, "pinch-in from quickview dives into fullview");
+
+        // Fullview: pinch-out → strip (quickview).
+        app.event(InputEvent::Pinch { delta: -big });
+        assert!(
+            !app.fullview && app.quickview,
+            "pinch-out from fullview backs out to the strip"
+        );
+
+        // Strip: pinch-out → grid.
+        app.event(InputEvent::Pinch { delta: -big });
+        assert!(
+            !app.quickview && !app.fullview,
+            "pinch-out from the strip returns to the grid"
+        );
+
+        // A tiny pinch under the threshold does nothing.
+        app.key(Key::Space);
+        app.event(InputEvent::Pinch {
+            delta: MODAL_PINCH_STEP * 0.3,
+        });
+        assert!(
+            app.quickview && !app.fullview,
+            "a sub-threshold pinch is inert"
         );
     }
 

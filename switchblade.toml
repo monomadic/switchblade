@@ -195,7 +195,7 @@ seekbar_thumb_width = 190.0
 # Opacity (0..1) of the seekbar's background track — the unfilled part
 # behind the played fill. The fill stays solid white; lower this to make
 # the track more transparent over the video.
-seekbar_track_opacity = 0.28
+seekbar_track_opacity = 0.18
 
 # The filmstrip of neighboring clips along the bottom. Chips share this
 # fixed height and take each clip's true aspect for width — portrait
@@ -232,14 +232,20 @@ strip_scroll_selects = true
 # bar down; Esc closes the bar first, then fullview. The bar shares the
 # filmstrip's strip_* tuning above.
 #
-# Vertical keys are a view-depth ladder (dead-ends at each end): in
-# fullview, up (k/↑) steps out to the filmstrip quickview and down does
-# nothing; in quickview, down (j/↓) dives into fullview and up does
-# nothing (Esc returns to the grid). Left/right (h/l) in fullview step
-# chapters and briefly reveal the chapter bar for chapter_peek_s seconds
-# (each step refreshes it; a deliberate g open stays up until dismissed).
-# 0 disables the auto-peek.
+# Vertical keys are a view-depth ladder: in fullview, down (j/↓) steps
+# out to the filmstrip quickview and up (k/↑) swipes the chapter bar back
+# down if it's up (else nothing); in quickview, up (k/↑) dives into
+# fullview and down (j/↓) drops back to the grid. A pinch in a modal
+# rides the same ladder (pinch-in dives deeper, pinch-out backs out).
+# Left/right (h/l) in fullview step chapters and briefly reveal the
+# chapter bar for chapter_peek_s seconds (each step refreshes it; a
+# deliberate g open stays up until dismissed). 0 disables the auto-peek.
 chapter_peek_s = 2.5
+
+# Dock-style reveal: moving the pointer within this many logical pixels
+# of the window's bottom edge in fullview slides the chapter bar up (as a
+# timed peek that slides back down once the pointer leaves). 0 disables.
+chapter_dock_reveal_px = 80.0
 
 # ── Startup settings (restart to apply) ─────────────────────────────────
 # Everything above this line hot-reloads; everything below is read once

@@ -287,6 +287,10 @@ pub struct Tuning {
     /// refreshes the window; a deliberate `g` open ignores this and stays
     /// up until dismissed. 0 disables the peek (the bar only opens via g).
     pub chapter_peek_s: f32,
+    /// Dock-style reveal: moving the pointer within this many logical
+    /// pixels of the window's bottom edge in fullview slides the chapter
+    /// bar up (as a timed peek). 0 disables the edge reveal.
+    pub chapter_dock_reveal_px: f32,
     /// Quickview's backdrop: "blur" (frosted, dimmed gallery — default)
     /// or "flat" (opaque backdrop_color; the gallery is hidden).
     pub quickview_backdrop: BackdropStyle,
@@ -381,11 +385,12 @@ impl Default for Tuning {
             seekbar_fade_ms: 250.0,
             seekbar_height: 6.0,
             seekbar_hover_height: 12.0,
-            seekbar_track_opacity: 0.28,
+            seekbar_track_opacity: 0.18,
             seekbar_thumb_width: 190.0,
             strip_scroll_sensitivity: 1.0,
             strip_scroll_selects: true,
             chapter_peek_s: 2.5,
+            chapter_dock_reveal_px: 80.0,
             quickview_backdrop: BackdropStyle::Blur,
             fullview_backdrop: BackdropStyle::Flat,
             backdrop_color: [0.0, 0.0, 0.0],
