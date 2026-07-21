@@ -219,6 +219,16 @@ pub struct Tuning {
     /// Anim sheet grid (frames = grid², frame size = thumb/grid). 3 = more
     /// motion, 2 = crisper frames. Startup-only.
     pub anim_grid: u32,
+    /// Concurrent background gen-sweep jobs allowed **while the selected
+    /// stream is presenting** (the `MEDIA_UPLOAD_BUDGET_LIVE` condition). The
+    /// sweep's sw-decoded extracts otherwise contend for CPU + the VideoToolbox
+    /// media engine during a stream's cold spawn — benchmarked ~45% slower
+    /// time-to-first-frame uncapped (see benchmarks/reports). `1` (default)
+    /// keeps the sweep inching forward without stealing the spawn; raise it on
+    /// fast local storage to fill the thumbnail/shuffle pool sooner, or set `0`
+    /// to never throttle the sweep. Nothing playing → the full pool always
+    /// runs. Startup-only. Tune per drive; the harness can sweep it.
+    pub gen_live_concurrency: usize,
     /// How cache entries are keyed to source files (startup-only):
     /// "size_mtime" (default) = size + mtime only, so entries survive
     /// renames/moves (rating-star renames, library reshuffles); "path" =
@@ -354,6 +364,7 @@ impl Default for Tuning {
             thumb_height: 360,
             thumb_quality: 7,
             anim_grid: 3,
+            gen_live_concurrency: 1,
             cache_key: CacheKey::SizeMtime,
             atlas_width: 7680,
             atlas_height: 4320,

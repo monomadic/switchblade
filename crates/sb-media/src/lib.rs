@@ -184,18 +184,18 @@ struct Queues {
     anim_owed: HashMap<PathBuf, u32>,
     /// The selected stream is presenting frames right now (mirrors the
     /// app's `MEDIA_UPLOAD_BUDGET_LIVE` condition). While set, the gen
-    /// sweep narrows to `GEN_LIVE_CONCURRENCY` concurrent jobs: three
-    /// workers' worth of seeked 4K extracts saturate a slow drive and
-    /// starve the resident decoder's reads — watching wins.
+    /// sweep narrows to `gen_live_cap` concurrent jobs: several workers'
+    /// worth of seeked 4K extracts contend for CPU + the VT media engine
+    /// during a stream's cold spawn — watching wins.
     live: bool,
     /// Gen-sweep jobs currently running (the counter the live cap gates).
     gen_running: usize,
+    /// Concurrent gen-sweep jobs allowed while `live` (config
+    /// `gen_live_concurrency`, default 1). `0` = unlimited (never throttle
+    /// the sweep). Set from `Tuning` at `MediaService::new`; `Queues::default`
+    /// leaves it 0 so unit tests opt into the cap explicitly.
+    gen_live_cap: usize,
 }
-
-/// Concurrent gen-sweep jobs allowed while the selected stream presents.
-/// One (niced, I/O-throttled via `media_cmd_bg`) keeps the sweep inching
-/// forward; the full worker pool resumes the moment nothing is playing.
-const GEN_LIVE_CONCURRENCY: usize = 1;
 
 impl Queues {
     fn thumb_busy(&self, p: &Path) -> bool {
@@ -265,8 +265,10 @@ impl Queues {
         }
         // Live cap: leave gen work queued rather than racing the
         // presenting stream for the drive. Workers park on the condvar;
-        // `set_live(false)` and each finishing gen job re-notify.
-        if !(self.live && self.gen_running >= GEN_LIVE_CONCURRENCY)
+        // `set_live(false)` and each finishing gen job re-notify. A
+        // `gen_live_cap` of 0 disables the cap (never throttle the sweep).
+        let capped = self.live && self.gen_live_cap != 0 && self.gen_running >= self.gen_live_cap;
+        if !capped
             && let Some(p) = self.r#gen.pop_front()
         {
             self.in_gen.remove(&p);
@@ -351,8 +353,16 @@ pub struct MediaService {
 }
 
 impl MediaService {
-    pub fn new(recipe: Recipe, notify: Notify) -> Self {
-        let queue: SharedQueue = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
+    /// `gen_live_cap` = concurrent gen-sweep jobs allowed while the selected
+    /// stream presents (config `gen_live_concurrency`; 0 = unlimited).
+    pub fn new(recipe: Recipe, notify: Notify, gen_live_cap: usize) -> Self {
+        let queue: SharedQueue = Arc::new((
+            Mutex::new(Queues {
+                gen_live_cap,
+                ..Default::default()
+            }),
+            Condvar::new(),
+        ));
         let (tx_done, rx_done) = mpsc::channel::<ThumbResult>();
 
         let have_ffmpeg = have_binary("ffmpeg") && have_binary("ffprobe");
@@ -381,7 +391,7 @@ impl MediaService {
 
     /// Tell the workers whether the selected stream is presenting frames
     /// (the app's `MEDIA_UPLOAD_BUDGET_LIVE` condition). While true the
-    /// gen sweep narrows to `GEN_LIVE_CONCURRENCY` jobs so its drive
+    /// gen sweep narrows to `gen_live_cap` jobs so its drive
     /// reads can't starve the resident decoder; on the falling edge every
     /// parked worker wakes and the sweep resumes at full width. Cheap to
     /// call every frame — no-ops without a state change.
@@ -1838,14 +1848,15 @@ mod tests {
     }
 
     /// While the selected stream presents, the gen sweep narrows to
-    /// `GEN_LIVE_CONCURRENCY` concurrent jobs — the full pool's seeked
-    /// 4K extracts saturate a slow drive and starve the resident
-    /// decoder's reads (multi-second `live 0` droughts on an external
-    /// volume). Higher tiers are never capped, a finishing job frees its
-    /// slot, and clearing `live` reopens the sweep to every worker.
+    /// `gen_live_cap` concurrent jobs — the full pool's seeked 4K extracts
+    /// contend for CPU + the VT media engine during a stream's cold spawn
+    /// (benchmarked ~45% slower time-to-first-frame uncapped). Higher tiers
+    /// are never capped, a finishing job frees its slot, and clearing `live`
+    /// reopens the sweep to every worker.
     #[test]
     fn live_playback_caps_gen_sweep_concurrency() {
         let mut q = Queues::default();
+        q.gen_live_cap = 1; // config default; Queues::default leaves it 0 (unlimited)
         for i in 0..3 {
             q.push_gen(PathBuf::from(format!("clip{i}.mp4")));
         }

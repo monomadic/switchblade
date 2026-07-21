@@ -268,6 +268,15 @@ thumb_quality = 8
 # opens on a clip — never library-wide.
 anim_grid = 3
 
+# Concurrent background thumbnail-sweep jobs allowed WHILE a clip is playing.
+# The sweep is throttled this narrow so it can't steal CPU / the VideoToolbox
+# media engine from a stream's cold spawn (benchmarked ~45% faster time-to-
+# first-frame vs an unthrottled sweep). 1 = gentle progress while watching;
+# raise it on fast local storage to fill the thumbnail/shuffle pool sooner;
+# 0 = never throttle the sweep. Nothing playing → the full worker pool always
+# runs. Startup-only.
+gen_live_concurrency = 1
+
 # How cached thumbnails are tied to source files (startup-only):
 #   "size_mtime" (default) size + mtime only, so the cache survives
 #                renames and moves — reshuffling a library or renaming

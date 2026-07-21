@@ -700,7 +700,7 @@ impl Switchblade {
             clips: Vec::new(),
             index: HashMap::new(),
             rx,
-            media: MediaService::new(recipe, notify.clone()),
+            media: MediaService::new(recipe, notify.clone(), tuning.gen_live_concurrency),
             slots: vec![None; atlas_cfg.slots()],
             live_sel: None,
             live_hover: None,
