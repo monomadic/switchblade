@@ -1,0 +1,64 @@
+name = "hover_then_select_handoff"
+
+intent = """
+The hover→select continuity handoff. Hover an unselected tile: its
+preview cold-spawns at the thumb anchor and plays FORWARD in real time.
+Hold the hover for several seconds, then click the tile to select it —
+the selected-lane stream opens (warm promotion or fresh spawn).
+
+Watch the pts on the events (frame_served / promotion carry the content
+position): the hover lane's first frame lands on the thumb-anchor
+keyframe; after the click, the selected lane's first frame must land at
+a keyframe near where the PREVIEW had played to — hover first_pts +
+(t_click − t_hover_served) — not back at the anchor. The regression this
+guards: the warm stream spawned at the anchor and sat parked while the
+preview played ahead, so promotion visibly jumped playback backward by
+the whole preview duration (~6s measured on a 4s-GOP 4K clip).
+
+The 4K HEVC fixture's ~5s GOP makes any anchor-restart jump large and
+unambiguous in the event stream.
+"""
+
+[setup]
+fixtures = ["h264_1080p30.mp4", "hevc_2160p60.mp4"]
+animation = "normal"
+viewport = [1280, 800]
+max_wall_s = 90.0
+
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 2
+timeout = 15.0
+
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 20.0
+
+# Hover the 4K tile (clip 1, unselected).
+[[step]]
+action = "hover"
+target = "index:1"
+
+[[step]]
+action = "wait_until"
+cond = "hover_served"
+timeout = 30.0
+
+# Let the hover preview play ahead of the thumb anchor.
+[[step]]
+action = "wait"
+secs = 6.0
+
+# Click it: selects, the selected lane opens for the same clip.
+[[step]]
+action = "click"
+target = "index:1"
+
+[[step]]
+action = "wait"
+secs = 4.0
+
+[validity]
+require = ["library_count", "hover_served"]

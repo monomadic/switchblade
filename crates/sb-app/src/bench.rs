@@ -447,6 +447,13 @@ impl Rig {
                 .live_sel
                 .as_ref()
                 .is_some_and(|l| l.first_frame.is_some()),
+            // The grid/filmstrip hover lane's first frame (its FrameServed
+            // event carries the served pts — the handoff diagnostic).
+            "hover_served" => self
+                .app
+                .live_hover
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some()),
             "grid_settled" => !self.animating,
             "cache_thumbs" => self.probe.snapshot().thumbs_cached >= n as u64,
             // Anim-sheet (storyboard) lifecycle for the SELECTED clip — the

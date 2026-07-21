@@ -87,6 +87,12 @@ pub struct Event {
     /// The clip's path, stable across the index churn that shuffle and
     /// the D-swap inflict on live indices.
     pub clip: Option<Arc<str>>,
+    /// Content-relative playback position for events where "where in the
+    /// clip" matters (FrameServed: the served frame's pts; Promotion: the
+    /// stream's position at handoff). Lets a scenario's event stream
+    /// expose pts regressions — e.g. a re-opened clip restarting at the
+    /// thumb anchor behind where its preview had played to.
+    pub pts: Option<f64>,
 }
 
 /// Monotonic lifetime counters. Cheap enough to update in every run.
@@ -123,6 +129,9 @@ pub struct RelEvent {
     pub lane_gen: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clip: Option<String>,
+    /// Content-relative playback position, when the event carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pts: Option<f64>,
 }
 
 /// The shared instrumentation handle. One is created per app and cloned
@@ -193,6 +202,23 @@ impl Probe {
             lane,
             lane_gen,
             clip: Some(clip.clone()),
+            pts: None,
+        });
+    }
+
+    /// [`mark`] with a content-relative playback position attached —
+    /// FrameServed / Promotion events, where "where in the clip" is the
+    /// measurement (handoff jumps are pts regressions).
+    ///
+    /// [`mark`]: Probe::mark
+    pub fn mark_pts(&self, kind: EventKind, lane: Lane, lane_gen: u64, clip: &Arc<str>, pts: f64) {
+        self.emit(|| Event {
+            at: Instant::now(),
+            kind,
+            lane,
+            lane_gen,
+            clip: Some(clip.clone()),
+            pts: Some(pts),
         });
     }
 
@@ -223,6 +249,7 @@ impl Probe {
                 lane: e.lane.name(),
                 lane_gen: e.lane_gen,
                 clip: e.clip.map(|c| c.to_string()),
+                pts: e.pts,
             })
             .collect();
         (rel, dropped)
@@ -250,6 +277,7 @@ impl LaneProbe {
             lane: self.lane,
             lane_gen: self.generation,
             clip: Some(self.clip.clone()),
+            pts: None,
         });
     }
 }
@@ -266,6 +294,7 @@ mod tests {
             lane: Lane::Selected,
             lane_gen: generation,
             clip: Some(Arc::from("/clips/a.mp4")),
+            pts: None,
         }
     }
 
