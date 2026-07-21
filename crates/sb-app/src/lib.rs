@@ -3331,6 +3331,12 @@ impl Switchblade {
         {
             if live.first_frame.is_none() {
                 live.first_frame = Some(Instant::now());
+                // Handoff diagnostic (see the sel-lane twin below).
+                log::debug!(
+                    "hover live clip {} first frame, pos={:.3}s",
+                    live.clip,
+                    live.player.position(),
+                );
                 hover_served = Some((live.generation, live.clip));
             }
             uploads.push(ThumbUpload {
@@ -3393,10 +3399,15 @@ impl Switchblade {
         {
             if live.first_frame.is_none() {
                 live.first_frame = Some(Instant::now());
+                // pos = the served frame's content-relative pts: the
+                // handoff diagnostic (compare against the spawn's "@Ts"
+                // target — a mismatch beyond one GOP means the thumb and
+                // the live open disagree about where the clip starts).
                 log::debug!(
-                    "sel live clip {} first frame {:.0}ms after spawn",
+                    "sel live clip {} first frame {:.0}ms after spawn, pos={:.3}s",
                     live.clip,
-                    live.spawned.elapsed().as_secs_f32() * 1000.0
+                    live.spawned.elapsed().as_secs_f32() * 1000.0,
+                    live.player.position(),
                 );
                 sel_served = Some((live.generation, live.path.clone()));
             }
@@ -3531,7 +3542,12 @@ impl Switchblade {
         // must nudge the sleeping loop.
         player.set_notify(self.notify.clone());
         let generation = self.instrument_lane(&player, lane, &path);
-        log::debug!("selected live {dw}x{dh} @{seek:.1}s: {}", path.display());
+        log::debug!(
+            "selected live {dw}x{dh} @{seek:.3}s (dur {:?} × frac {:.3}): {}",
+            duration,
+            self.seek_fraction,
+            path.display()
+        );
         Some(SelLive {
             clip: i,
             path,
@@ -3573,7 +3589,7 @@ impl Switchblade {
         };
         player.set_notify(self.notify.clone()); // P1.4 dry-queue wake
         let generation = self.instrument_lane(&player, sb_media::Lane::Hover, &path);
-        log::debug!("hover live: {}", path.display());
+        log::debug!("hover live @{seek:.3}s: {}", path.display());
         self.slots[slot] = Some((i, SlotKind::Live));
         Some(LiveState {
             clip: i,
