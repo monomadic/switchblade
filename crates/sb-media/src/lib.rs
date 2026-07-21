@@ -671,7 +671,10 @@ impl LivePlayer {
             cmd.args(["-hwaccel", "videotoolbox"]);
         }
         if seek > 0.05 {
-            cmd.args(["-ss", &format!("{seek:.3}")]);
+            // Keyframe start (`-noaccurate_seek`), matching the thumbnail
+            // and SeekablePlayer: the first frame is the keyframe ≤ seek,
+            // no decode-forward — same frame the static thumb shows.
+            cmd.args(["-ss", &format!("{seek:.3}"), "-noaccurate_seek"]);
         }
         let fps = if fps.is_finite() {
             fps.clamp(1.0, 240.0)
@@ -1396,7 +1399,13 @@ fn extract_frame(
         cmd.args(["-hwaccel", "videotoolbox"]);
     }
     let out = cmd
-        .args(["-ss", &format!("{seek:.3}")])
+        // -noaccurate_seek: grab the nearest keyframe ≤ seek, no
+        // decode-forward to the exact timestamp. The live stream's initial
+        // seek is keyframe too (seekable.rs / LivePlayer::spawn), so thumb
+        // and first live frame still land on the SAME frame — the no-jolt
+        // handoff holds, now without the per-thumb GOP decode that slowed
+        // the whole gen sweep on sparse-keyframe 4K.
+        .args(["-ss", &format!("{seek:.3}"), "-noaccurate_seek"])
         .arg("-i")
         .arg(src)
         .args([

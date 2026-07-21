@@ -494,10 +494,13 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
             ok
         };
         if cfg.start > 0.05 {
-            // Exact start, like CLI `-ss` before `-i`: land on the
-            // thumbnail's frame, not its GOP's keyframe.
+            // Keyframe start, matching the thumbnail's keyframe grab
+            // (`-noaccurate_seek` in extract_frame): land on the keyframe
+            // ≤ start and play from it — no decode-forward. The static
+            // thumb and this first live frame share that keyframe, so the
+            // handoff stays jolt-free (skip_until = None: don't discard the
+            // pre-target GOP frames, the keyframe IS the target now).
             seek_to(cfg.start);
-            pump.skip_until = Some(cfg.start);
         }
 
         loop {
