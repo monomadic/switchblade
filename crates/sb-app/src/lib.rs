@@ -2774,23 +2774,33 @@ impl Switchblade {
         // thumb bursts trickle in under a much smaller per-frame budget:
         // the full 64-upload batch staged ~80MB of texture writes
         // between two video frames — a visible playback hitch.
-        let live_now = self
+        let presenting = self
             .live_sel
             .as_ref()
             .is_some_and(|l| l.first_frame.is_some())
             && !self.sel_parked
             && !self.paused();
-        // Same condition narrows the gen sweep's worker concurrency (and
-        // its drive reads) while the stream presents — see
-        // `MediaService::set_live`. Deduped internally; free per frame.
-        self.media.set_live(live_now);
-        if live_now {
+        // The gen-sweep throttle engages the moment we're TRYING to watch —
+        // including the watched stream's cold spawn, BEFORE its first frame.
+        // Gating it on `first_frame` (like the upload budget below) created a
+        // feedback loop: the watched 4K stream stalls under the full-width
+        // sweep, never reaches its first frame, so the cap never engages, so
+        // the sweep keeps running 3-wide and stalls it (and the storyboard)
+        // harder — chapter chips took ~a minute to appear
+        // (benchmarks/reports/chapter_sheet_latency.md). Keying the throttle
+        // on "a selected stream exists and we're not parked/paused" holds the
+        // cap across the whole spawn, so the stream reaches first frame fast.
+        let watching = self.live_sel.is_some() && !self.sel_parked && !self.paused();
+        self.media.set_live(watching);
+        // The upload-budget squeeze, unlike the throttle, only matters once
+        // frames are actually arriving to upload — keep it on `presenting`.
+        if presenting {
             self.probe
                 .counters
                 .drain_budget_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let budget = if live_now {
+        let budget = if presenting {
             MEDIA_UPLOAD_BUDGET_LIVE
         } else {
             MEDIA_UPLOAD_BUDGET
@@ -3083,10 +3093,13 @@ impl Switchblade {
             }
         }
 
-        // Pre-warm decoders for the four movement destinations (±1 and
-        // ±row) so a selection move shows video instantly instead of
-        // paying a cold spawn (open + decode to the thumb frame — no
-        // longer the CLI's ~1s floor, but still the visible latency).
+        // Pre-warm decoders for the likely next move so a selection change
+        // shows video instantly instead of paying a cold spawn (open + decode
+        // to the thumb frame — no longer the CLI's ~1s floor, but still
+        // visible latency). Kept deliberately small: every warm lane is a 4K
+        // cold spawn that competes with the watched stream and any in-flight
+        // storyboard for CPU/VT, so we warm only the moves that are actually
+        // common — 'next' everywhere, 'down' in the grid.
         let mut warm_targets: Vec<usize> = Vec::new();
         // Computed while paused too (paused_live): the warm pool rides
         // out a focus loss parked — its players are undrained and
@@ -3112,17 +3125,19 @@ impl Switchblade {
                 }
             };
             // Warm-ups run one at a time, so this order is a priority.
-            // Browsing overwhelmingly flows right (often repeatedly),
-            // then down; 'up' is rare enough to stay cold — its slot
-            // goes to the SECOND clip to the right instead, so a double
-            // right-tap is instant too.
+            // 'next' (right) is the one move common to every view — grid
+            // advance and filmstrip step both flow right — so warm it
+            // everywhere. 'down' is a grid-only clip jump (the modals move by
+            // strip / chapter / view-depth, never a vertical clip hop), so
+            // warm it only in the grid. 'up', second-right, and 'left' stay
+            // cold: rare, and not worth a 4K decoder against the watched
+            // stream / storyboard.
             push(s + 1);
-            push(s + 2);
-            if let Some(d) = down {
+            if !self.quickview
+                && !self.fullview
+                && let Some(d) = down
+            {
                 push(d);
-            }
-            if s > 0 {
-                push(s - 1);
             }
         }
 

@@ -1,6 +1,7 @@
 # Chapter-bar chips take ~a minute to appear after opening fullview
 
-**Status:** diagnosed, fix NOT yet applied (2026-07-21).
+**Status:** diagnosed, partial fix applied + measured (2026-07-21) — 48s → 27s;
+two further levers identified (see "Fix applied" below).
 **Scenario:** [`chapter_sheet_fullview.toml`](../scenarios/chapter_sheet_fullview.toml)
 
 ## Symptom
@@ -75,3 +76,41 @@ the queue-wait disappears, and the watched stream stutters less as a bonus.
 
 Re-run this scenario and `sb-bench compare` the before/after bundles;
 `selected_anim − selected_served` is the headline number.
+
+## Fix applied (2026-07-21) — measured 48s → 27s
+
+Four changes, plus a harness fix that made the measurement possible:
+
+1. **Throttle engages during cold-spawn, not just once presenting**
+   (`drain_media`): the gen throttle now keys on "a selected stream exists and
+   we're not parked/paused", so it holds across the watched stream's cold spawn.
+   This breaks the feedback loop — the stalling stream no longer reads as
+   not-live and disengages its own cap.
+2. **Sweep pauses entirely while a storyboard is in flight** (`Queues::pop`):
+   an `anims_now`-queued or inflight `Art::Anim` pauses the gen tier (independent
+   of `live`); `notify_one` on anim completion resumes it.
+3. **On-demand sheet decodes with VideoToolbox** (`make_anim`): the gen-cap
+   commit (6f82ad9) had switched it to software + background-band I/O — the
+   regression's origin. Restoring VT roughly halved per-cell cost on 4K HEVC
+   (deep cell 5037ms → 1918ms). (VT can be neutral/worse on *short* clips per
+   isolation tests, but wins on the deep-GOP real footage this targets.)
+4. **Warm pool cut to next (all views) + down (grid only)**: fewer concurrent 4K
+   cold spawns competing with the watched stream and the sheet.
+5. **`sb-bench` honors `RUST_LOG`** (`env_logger`): without it the `animgen`
+   timing was silently dropped — this is how the breakdown below was measured.
+
+### What's left (measured breakdown of the remaining ~22s)
+
+Under the 60-clip sweep, `selected_anim − requested` ≈ 22s, of which:
+
+- **~9s generation floor** — the 9 cells are 9 separate ffmpeg processes, each
+  paying its own VideoToolbox init (~1s). `-noaccurate_seek` did NOT help
+  (tested), so it's per-process init, not decode-forward. **Lever A:** extract
+  the cells in far fewer ffmpeg processes to amortize the VT init.
+- **~13s startup queue-wait** — at ingest the sweep grabs all 3 workers with
+  slow software 4K gen extracts before the cap engages; the sheet waits behind
+  them. **Lever B:** reserve a worker for the user-attention tiers / engage the
+  cap from t=0 so the sweep can never take all three.
+
+With a trivial sweep (3 clips) the total collapses to ~9s (just the generation
+floor), confirming the ~13s is sweep contention.

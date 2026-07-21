@@ -1881,6 +1881,7 @@ dependencies = [
 name = "sb-app"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "log",
  "sb-media",
  "sb-window",

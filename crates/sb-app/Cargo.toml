@@ -9,3 +9,4 @@ sb-media = { path = "../sb-media" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 log = { workspace = true }
+env_logger = "0.11"

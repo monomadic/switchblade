@@ -265,9 +265,22 @@ impl Queues {
         }
         // Live cap: leave gen work queued rather than racing the
         // presenting stream for the drive. Workers park on the condvar;
-        // `set_live(false)` and each finishing gen job re-notify. A
+        // `set_live(false)` and each finishing gen/anim job re-notify. A
         // `gen_live_cap` of 0 disables the cap (never throttle the sweep).
-        let capped = self.live && self.gen_live_cap != 0 && self.gen_running >= self.gen_live_cap;
+        //
+        // An on-demand storyboard sheet queued or generating (`anims_now`
+        // tier) is user-attention work the user is actively waiting on — the
+        // chapter bar / seekbar preview won't draw until it lands. Pause the
+        // gen sweep ENTIRELY while one is in flight so the sheet's nine
+        // sw-decoded 4K extracts don't fight a concurrent 4K sweep decode for
+        // CPU/memory bandwidth (benchmarks/reports/chapter_sheet_latency.md:
+        // that contention stretched a ~3s sheet to ~23s). Independent of
+        // `live` — the stalling stream can read as not-live exactly when this
+        // matters most.
+        let anim_in_flight = !self.anims_now.is_empty()
+            || self.inflight.iter().any(|(_, a)| matches!(a, Art::Anim));
+        let capped = anim_in_flight
+            || (self.live && self.gen_live_cap != 0 && self.gen_running >= self.gen_live_cap);
         if !capped
             && let Some(p) = self.r#gen.pop_front()
         {
@@ -885,6 +898,9 @@ fn worker(
             Request::Anim(path) => {
                 let out = make_anim(&path, &root, have_ffmpeg, &recipe);
                 let owed = queue.0.lock().unwrap().complete(&path, Art::Anim);
+                // The sheet is done — gen was paused while it generated, so
+                // wake a parked worker to resume the sweep.
+                queue.1.notify_one();
                 match out {
                     Some((w, h, rgba)) => {
                         for _ in 0..owed.anims {
@@ -989,10 +1005,12 @@ fn make_anim(
             return None;
         }
         std::fs::create_dir_all(&dir).ok()?;
-        // Sampling frames across the clip needs its duration.
-        // The thumb pass usually cached the probe already.
+        // Sampling frames across the clip needs its duration + codec (the
+        // codec gates VideoToolbox below). The thumb pass usually cached the
+        // probe already.
         let m = cached_meta(src).or_else(|| probe(src))?;
         let duration = m.duration.filter(|d| *d > 0.05)?;
+        let codec = m.codec.clone();
         let g = recipe.anim_grid.max(1);
         let frames = (g * g) as usize;
         let (fw, fh) = recipe.anim_frame();
@@ -1039,13 +1057,22 @@ fn make_anim(
             let mut seek = duration * (k as f64 + 0.5) / frames as f64;
             let cell_t0 = std::time::Instant::now();
             let ok = loop {
-                // Software decode + background-band I/O: these g² seeked
-                // extracts race the live stream, so they must take
-                // neither the VT media engine (see `extract_frame`'s `hw`
-                // note) nor drive bandwidth ahead of the resident
-                // decoder's reads (`media_cmd_bg`).
-                let mut cmd = media_cmd_bg("ffmpeg");
+                // The on-demand storyboard is USER-ATTENTION work — the user
+                // opened quickview/fullview and is waiting on it. Decode it
+                // with VideoToolbox (foreground I/O), like any visible thumb:
+                // software decode of 4K HEVC is intrinsically slow (deep seeks
+                // decode-forward most of a GOP on the CPU), so g² sw extracts
+                // stretched the sheet to ~30s while stalling the watched
+                // stream (benchmarks/reports/chapter_sheet_latency.md). The
+                // sweep is paused while this runs (Queues::pop), so the brief
+                // VT sharing with the watched stream is the right trade. (The
+                // sw+background-band treatment dated to the removed bulk anim
+                // sweep — there is no background anim work anymore.)
+                let mut cmd = media_cmd("ffmpeg");
                 cmd.args(["-y", "-v", "error"]);
+                if vt_accel(codec.as_deref()) {
+                    cmd.args(["-hwaccel", "videotoolbox"]);
+                }
                 let out = cmd
                     .args(["-ss", &format!("{seek:.3}")])
                     .arg("-i")
@@ -1655,7 +1682,10 @@ mod tests {
     /// The quickview storyboard's sheet must outrank the library-wide
     /// gen sweep: after a thumb-recipe change the sweep holds thousands
     /// of entries for hours, and the strict tiers starved the on-demand
-    /// sheet below it — hover thumbs silently never arrived.
+    /// sheet below it — hover thumbs silently never arrived. AND while a
+    /// sheet is in flight the gen sweep is paused entirely (user-attention
+    /// work must not fight a concurrent 4K sweep decode), so the sweep only
+    /// resumes once the sheet completes.
     #[test]
     fn quickview_sheet_outranks_gen_sweep_but_not_visible_thumbs() {
         let mut q = Queues::default();
@@ -1664,18 +1694,29 @@ mod tests {
         q.chapters.push_back("chapter-probe".into());
         q.reprobes.push_back("heal".into());
         q.thumbs.push_back("visible".into());
-        let order: Vec<String> = std::iter::from_fn(|| q.pop())
-            .map(|r| {
-                let (kind, p) = match r {
-                    Request::Thumb(p) => ("thumb", p),
-                    Request::Reprobe(p) => ("reprobe", p),
-                    Request::Chapters(p) => ("chapters", p),
-                    Request::Gen(p) => ("gen", p),
-                    Request::Anim(p) => ("anim", p),
-                };
-                format!("{kind}:{}", p.display())
-            })
-            .collect();
+        // Drain, completing each job as a real worker does — crucially the
+        // anim, since the sweep is paused until the in-flight sheet finishes.
+        let mut order = Vec::new();
+        while let Some(r) = q.pop() {
+            let (kind, p) = match &r {
+                Request::Thumb(p) => ("thumb", p.clone()),
+                Request::Reprobe(p) => ("reprobe", p.clone()),
+                Request::Chapters(p) => ("chapters", p.clone()),
+                Request::Gen(p) => ("gen", p.clone()),
+                Request::Anim(p) => ("anim", p.clone()),
+            };
+            order.push(format!("{kind}:{}", p.display()));
+            match &r {
+                Request::Anim(p) => {
+                    q.complete(p, Art::Anim);
+                }
+                Request::Gen(p) => {
+                    q.gen_running -= 1;
+                    q.complete(p, Art::Thumb);
+                }
+                _ => {}
+            }
+        }
         assert_eq!(
             order,
             [
@@ -1685,6 +1726,20 @@ mod tests {
                 "anim:storyboard",
                 "gen:sweep",
             ]
+        );
+
+        // The pause is real: with a sheet queued (not yet completed), the
+        // sweep does NOT run even though a gen job is waiting.
+        let mut q = Queues::default();
+        q.r#gen.push_back("sweep".into());
+        q.anims_now.push_back("storyboard".into());
+        assert!(
+            matches!(q.pop(), Some(Request::Anim(_))),
+            "the sheet is taken first"
+        );
+        assert!(
+            q.pop().is_none(),
+            "gen stays paused while the sheet is in flight"
         );
     }
 

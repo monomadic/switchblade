@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Honor RUST_LOG so diagnostic logs (e.g. `animgen` sheet-gen timing,
+    // "thumb generated") surface during a bench run. Quiet by default.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
