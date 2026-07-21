@@ -325,6 +325,11 @@ pub struct Options {
     /// overrides). When set, no config file is loaded and nothing
     /// hot-reloads — the injected values are exactly what runs.
     pub tuning: Option<Tuning>,
+    /// `--suppress-storyboards`: never generate the on-demand storyboard
+    /// sheet (the g² anim atlas the seekbar skimming + chapter chips
+    /// sample). For A/B testing the feature and for machines where the
+    /// nine niced ffmpeg extracts per opened clip aren't worth it.
+    pub suppress_storyboards: bool,
 }
 
 pub struct Switchblade {
@@ -401,6 +406,10 @@ pub struct Switchblade {
     sel_changed_at: Instant,
     hover_changed_at: Instant,
     demo: bool,
+    /// `--suppress-storyboards`: gate every storyboard-sheet request off,
+    /// so no anim atlas is ever generated (seekbar skimming + chapter
+    /// chips fall back to no preview). Startup-only.
+    suppress_storyboards: bool,
     /// CLI `--animation` override; beats the config's level when set.
     cli_animation: Option<AnimLevel>,
     /// Window focus state + the runtime toggle for pause-when-unfocused.
@@ -728,6 +737,7 @@ impl Switchblade {
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
+            suppress_storyboards: opts.suppress_storyboards,
             cli_animation: opts.animation,
             focused: true,
             focus_pause_on: true,
@@ -1557,8 +1567,10 @@ impl Switchblade {
     /// screen (the hires texture still holds it) until the new position
     /// delivers, so it reads as freeze-then-jump — GOP-bound (~30–600ms)
     /// instead of the old ~1s respawn floor, and chained presses need no
-    /// checkpoint machinery. Exact seeks: honest landings even on
-    /// sparse-keyframe sources. Wraps at the ends — playback loops anyway.
+    /// checkpoint machinery. Keyframe seeks: the landing keyframe shows
+    /// instantly, no GOP decode-forward freeze (mpv-style interactive
+    /// seeking) — the small drift off the exact fraction is invisible for
+    /// a skip. Wraps at the ends — playback loops anyway.
     fn skip(&mut self, forward: bool, amount: Option<f32>) {
         let Some(path) = self.clips.get(self.selected).map(|c| c.path.clone()) else {
             return;
@@ -1574,7 +1586,7 @@ impl Switchblade {
             .unwrap_or(self.tuning.skip_fraction)
             .clamp(0.001, 1.0) as f64;
         let delta = if forward { frac * d } else { -frac * d };
-        l.player.seek((l.position() + delta).rem_euclid(d), true);
+        l.player.seek((l.position() + delta).rem_euclid(d), false);
         self.skip_flash_at = Some(Instant::now());
         self.wake(1.5); // outlive the flash bar's hold + fade
     }
@@ -2125,8 +2137,9 @@ impl Switchblade {
     }
 
     /// Click on a chapter chip: jump the playing stream to that
-    /// timestamp — an exact in-place seek, flashing the position bar
-    /// like a `[`/`]` skip.
+    /// timestamp — a keyframe in-place seek (lands instantly on the
+    /// nearest keyframe, no decode-forward freeze), flashing the position
+    /// bar like a `[`/`]` skip.
     fn chapter_seek(&mut self, i: usize) {
         let Some(b) = &self.chapters else { return };
         let Some(&t) = b.times.as_ref().and_then(|ts| ts.get(i)) else {
@@ -2136,13 +2149,13 @@ impl Switchblade {
         if l.path != b.path {
             return;
         }
-        // Stay a frame short of the end, like scrub_seek: an exact seek
-        // to the tail lands on EOF and loops back to 0:00.
+        // Stay a frame short of the end, like scrub_seek: a seek to the
+        // tail lands on EOF and loops back to 0:00.
         let target = match l.duration.filter(|d| *d > 0.05) {
             Some(d) => t.clamp(0.0, (d - 0.05).max(0.0)),
             None => t.max(0.0),
         };
-        l.player.seek(target, true);
+        l.player.seek(target, false);
         self.skip_flash_at = Some(Instant::now());
         self.wake(1.5);
     }
@@ -2221,13 +2234,13 @@ impl Switchblade {
         } else {
             (cur + n - 1) % n
         };
-        // Stay a frame short of the end, like chapter_seek: an exact
-        // seek to the tail lands on EOF and loops back to 0:00.
+        // Stay a frame short of the end, like chapter_seek: a seek to the
+        // tail lands on EOF and loops back to 0:00.
         let t = match d {
             Some(d) => times[target].clamp(0.0, (d - 0.05).max(0.0)),
             None => times[target].max(0.0),
         };
-        l.player.seek(t, true);
+        l.player.seek(t, false);
         self.skip_flash_at = Some(Instant::now());
         // Reveal the bar as a timed peek so the step shows where it
         // landed (a bar already up via `g` stays sticky), then glide its
@@ -2785,6 +2798,12 @@ impl Switchblade {
         // (prewarm_ok): sheet generation is nine niced ffmpeg decodes,
         // and racing them against the interactive cold spawn is exactly
         // the jank the priority tiers exist to prevent.
+        // --suppress-storyboards short-circuits the ONLY sheet-request
+        // site: no anim atlas is ever queued, so the gen sweep and the
+        // interactive cold spawns keep the freed workers.
+        if self.suppress_storyboards {
+            return;
+        }
         let want = ((self.quickview && self.tuning.seekbar_thumb_width >= 8.0) || self.fullview)
             && self.prewarm_ok()
             && !self.warm_filling();
@@ -5379,7 +5398,14 @@ mod tests {
         }
         let dir = std::env::temp_dir().join("sb_app_skip_test");
         std::fs::create_dir_all(&dir).unwrap();
-        let clip = dir.join("skip.mp4");
+        // `-g 30` = a keyframe every second (30fps): skips are now keyframe
+        // seeks, so a forward jump must have a keyframe to land ON, and the
+        // chained-skip assertion needs the first skip to settle forward.
+        // (ultrafast disables scenecut and defaults keyint to 250 > 240
+        // frames — a single keyframe at t=0 would collapse every keyframe
+        // seek back to 0.) The `_kf` name forces a fresh encode past any
+        // cached single-keyframe `skip.mp4` from before the seek change.
+        let clip = dir.join("skip_kf.mp4");
         if !clip.exists() {
             let ok = std::process::Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
@@ -5391,6 +5417,8 @@ mod tests {
                     "ultrafast",
                     "-pix_fmt",
                     "yuv420p",
+                    "-g",
+                    "30",
                 ])
                 .arg(&clip)
                 .status()
@@ -5427,7 +5455,7 @@ mod tests {
             "expected a forward jump, position {target} from {before}"
         );
         assert!(app.skip_bar().is_some(), "the flash bar arms on skip");
-        // The same stream delivers from the new offset (exact seek).
+        // The same stream delivers from the new offset (keyframe seek).
         assert!(
             pump_until(&mut app, |a| a.live_sel.as_ref().is_some_and(|l| {
                 l.player.buffered() > 0 || (l.position() - target).abs() < 0.5

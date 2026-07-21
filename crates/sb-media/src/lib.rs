@@ -1037,9 +1037,9 @@ fn make_anim(
             format!("scale={fw}:{fh}:force_original_aspect_ratio=decrease:force_divisible_by=2");
 
         // g² individual seeked extracts, then one cheap tile pass over
-        // the tiny jpegs. Each extract is a fast keyframe seek plus a
-        // handful of software-decoded frames (VT is deliberately off — see
-        // the per-extract note below).
+        // the tiny jpegs. Each extract is a keyframe-only grab
+        // (-noaccurate_seek, below) — one decoded frame, no decode-forward
+        // (VT is deliberately off — see the per-extract note below).
         // The old single-command `fps=` filter decoded the ENTIRE clip
         // in software — minutes of multi-core churn per long 4K source,
         // three workers wide, surviving app quit. Never again.
@@ -1054,9 +1054,9 @@ fn make_anim(
             }
         };
         // Anim-gen latency diagnostic (RUST_LOG=sb_media=debug): per-cell
-        // and total extract wall time. A cell's software decode-forward
-        // cost scales with GOP depth, and concurrent gen-sweep 4K decodes
-        // inflate every cell 2-15x under contention — this log is what let
+        // and total extract wall time. With keyframe-only extraction each
+        // cell is a single decoded frame, but concurrent gen-sweep 4K
+        // decodes still inflate every cell under contention — this log is what let
         // us attribute the "chapter chips take ~a minute" delay to sweep
         // starvation rather than disk or the prewarm gates (see
         // benchmarks/reports/chapter_sheet_latency.md).
@@ -1078,7 +1078,12 @@ fn make_anim(
         let mut cmd = media_cmd("ffmpeg");
         cmd.args(["-y", "-v", "error"]);
         for s in &seeks {
-            cmd.args(["-ss", s]).arg("-i").arg(src);
+            // -noaccurate_seek: land on the nearest keyframe and grab IT,
+            // skipping the decode-forward to the exact timestamp. On sparse
+            // -keyframe 4K (multi-second GOPs) accurate seek decoded a whole
+            // GOP per cell in software; the keyframe is plenty precise for a
+            // g² storyboard and costs a single decoded frame.
+            cmd.args(["-ss", s, "-noaccurate_seek"]).arg("-i").arg(src);
         }
         for k in 0..frames {
             let map = format!("{k}:v:0");
@@ -1096,7 +1101,7 @@ fn make_anim(
                 continue;
             }
             let ok = media_cmd("ffmpeg")
-                .args(["-y", "-v", "error", "-ss", "0"])
+                .args(["-y", "-v", "error", "-ss", "0", "-noaccurate_seek"])
                 .arg("-i")
                 .arg(src)
                 .args([

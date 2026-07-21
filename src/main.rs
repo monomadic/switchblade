@@ -47,6 +47,10 @@ OPTIONS:
     --no-config     ignore every config file: run on the internal
                     defaults, with hot-reload off (tests, triage —
                     behavior can't be steered by a stray config)
+    --suppress-storyboards
+                    never generate the storyboard sheet (the 3x3 anim
+                    atlas the seekbar skimming + chapter chips sample) —
+                    for perf-constrained machines and A/B testing
     --demo          fake-tile demo grid (no media needed)
     -h, --help      print this help
     -V, --version   print version
@@ -96,6 +100,7 @@ fn main() -> anyhow::Result<()> {
             "--fast-fullscreen" => opts.fullscreen = Some(true),
             "--init" => return init_config(),
             "--no-config" => opts.no_config = true,
+            "--suppress-storyboards" => opts.suppress_storyboards = true,
             "--demo" => opts.demo = true,
             "--clear-cache" => return clear_cache(),
             "--cleanup-cache" => return cleanup_cache(),
