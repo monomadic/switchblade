@@ -379,6 +379,10 @@ struct Pump<'a> {
     /// for declaring the buffersrc input — frames carry pts in it).
     tb: f64,
     tb_q: ffi::AVRational,
+    /// Absolute stream start_time in seconds (edit-list / start_time
+    /// offset). Subtracted from every frame pts so the queue, `position`,
+    /// and `skip_until` all speak content-relative time — see `reader`.
+    start_off: f64,
     graph: Option<Graph>,
     /// Destination of `av_hwframe_transfer_data` when frames are hw but
     /// no hw filter chain applies (parity with plain `-hwaccel` CLI mode:
@@ -440,6 +444,24 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
         let stream = *(*fmt.0).streams.add(sidx as usize);
         let stream_tb = (*stream).time_base;
         let tb = stream_tb.num as f64 / stream_tb.den as f64;
+        // Content-relative time offset. `avformat_seek_file` and frame pts
+        // are in ABSOLUTE stream timestamps, but sb-app (and the CLI `-ss`
+        // thumbnail seek) work content-relative — 0 = the first frame. On
+        // files with a non-zero start_time / edit list (ubiquitous in
+        // phone/camera/QuickTime footage) the two disagree by `start_time`:
+        // a content-relative seek target hit the wrong absolute keyframe,
+        // so the live stream opened on a DIFFERENT frame than the static
+        // thumb (the broken no-jolt handoff the user hit). Add this when
+        // seeking, subtract it when stamping position, so the whole player
+        // speaks content-relative time and matches the thumb keyframe.
+        let start_off = {
+            let st = (*stream).start_time;
+            if st == ffi::AV_NOPTS_VALUE {
+                0.0
+            } else {
+                st as f64 * tb
+            }
+        };
 
         let dec = DecCtx(ffi::avcodec_alloc_context3(codec));
         if ffi::avcodec_parameters_to_context(dec.0, (*stream).codecpar) < 0 {
@@ -472,6 +494,7 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
             cfg,
             tb,
             tb_q: stream_tb,
+            start_off,
             graph: None,
             transfer: FramePtr(ffi::av_frame_alloc()),
             filtered: FramePtr(ffi::av_frame_alloc()),
@@ -481,7 +504,8 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
         };
 
         let seek_to = |target: f64| -> bool {
-            let ts = (target / tb) as i64;
+            // `target` is content-relative; seek in absolute stream time.
+            let ts = ((target + start_off) / tb) as i64;
             let ok = ffi::avformat_seek_file(
                 fmt.0,
                 sidx,
@@ -567,7 +591,10 @@ impl Pump<'_> {
     unsafe fn frame_in(&mut self, frame: *mut ffi::AVFrame) -> Flow {
         unsafe {
             let pts = (*frame).best_effort_timestamp;
-            let pts_s = pts as f64 * self.tb;
+            // Content-relative: pts are absolute stream timestamps; the
+            // whole player (queue due-stamps, position, skip_until) speaks
+            // content time so it matches sb-app and the CLI thumb seek.
+            let pts_s = pts as f64 * self.tb - self.start_off;
             if let Some(t) = self.skip_until {
                 if pts != ffi::AV_NOPTS_VALUE && pts_s < t - 1e-3 {
                     ffi::av_frame_unref(frame);
@@ -629,7 +656,9 @@ impl Pump<'_> {
                 if r < 0 {
                     return Flow::Continue; // EAGAIN/EOF: need more input
                 }
-                let out_pts = (*self.filtered.0).pts as f64 * g_tb;
+                // Content-relative (subtract start_time), so the queue's
+                // due-stamps and `position` match sb-app / the thumb seek.
+                let out_pts = (*self.filtered.0).pts as f64 * g_tb - self.start_off;
                 let flow = self.push_rgba(out_pts);
                 ffi::av_frame_unref(self.filtered.0);
                 if let Flow::Stop = flow {
@@ -1153,4 +1182,55 @@ mod tests {
         assert!(pos < 2.0, "backward seek should rewind, position {pos}");
         assert!(!p.failed(), "reader reported failure");
     }
+
+    /// Files with a non-zero stream start_time (edit lists — everywhere in
+    /// phone/camera/QuickTime footage) once opened the live stream on a
+    /// DIFFERENT keyframe than the static thumb: the CLI `-ss` thumbnail
+    /// seek is content-relative (relative to start_time) while libav's
+    /// `avformat_seek_file` uses absolute stream timestamps. The player now
+    /// normalizes to content-relative time, so `spawn(seek)` lands on the
+    /// same keyframe the thumb grabbed and `position()` reports 0-based
+    /// time. Fixture: 10s, keyframes every 3s, timestamps shifted +5s.
+    #[test]
+    fn start_time_offset_is_content_relative() {
+        if !crate::have_binary("ffmpeg") {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_media_seekable_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let clip = dir.join("offset_g90.mp4");
+        if !clip.exists() {
+            let ok = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=10:size=320x180:rate=30")
+                .args([
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    // keyframe every 3s, and shift all timestamps by +5s so
+                    // the stream start_time is 5.0 (not 0).
+                    "-g", "90", "-sc_threshold", "0", "-output_ts_offset", "5.0",
+                ])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate offset test clip");
+        }
+
+        // Content-relative seek to 4.0s → nearest keyframe ≤ 4.0 in content
+        // time is 3.0 (absolute 8.0). The old absolute-time seek landed on
+        // content 0 / reported ~5.0 (the start_time) — the visible jump.
+        let p = SeekablePlayer::spawn(&clip, 320, 180, 4.0, Some(&meta(&clip))).expect("spawn");
+        assert!(
+            take_one(&p, Duration::from_secs(3)).is_some(),
+            "no first frame from offset source"
+        );
+        let pos = p.position();
+        assert!(
+            (2.5..=3.5).contains(&pos),
+            "start-time offset must be content-relative: expected ~3.0, got {pos}"
+        );
+        assert!(!p.failed(), "reader reported failure");
+    }
 }
+
