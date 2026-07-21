@@ -227,6 +227,15 @@ struct ChapterBar {
     /// instant passes the bar auto-closes; each chapter step refreshes
     /// it. A peeked bar also doesn't intercept Esc — it's ephemeral.
     peek_until: Option<Instant>,
+    /// The chapter the user last navigated TO (step / chip click) — the
+    /// intent that pins the highlight and the next step's base. Keyframe
+    /// seeks land on the nearest keyframe *before* the chapter start, so
+    /// the decoder position sits in the previous chapter's tail; deriving
+    /// the playing chapter purely from position would jank the highlight
+    /// back to the old chip and make forward stepping stuck. `nav` holds
+    /// the intended chapter until playback carries past it (or a move
+    /// lands elsewhere) — see `resolve_chapter`.
+    nav: Option<usize>,
 }
 
 /// The hovered tile's video playback: tile-sized, into an atlas slot.
@@ -2007,6 +2016,7 @@ impl Switchblade {
             pos: 0.0,
             target: 0.0,
             peek_until,
+            nav: None,
         });
         match self.chapter_probe.get(&path).cloned() {
             // Pre-warmed answer: the plan installs this same tick.
@@ -2156,12 +2166,18 @@ impl Switchblade {
             None => t.max(0.0),
         };
         l.player.seek(target, false);
+        // Pin the clicked chapter so the highlight lands on it despite the
+        // keyframe seek undershooting the boundary (see `resolve_chapter`).
+        if let Some(b) = self.chapters.as_mut() {
+            b.nav = Some(i);
+        }
         self.skip_flash_at = Some(Instant::now());
         self.wake(1.5);
     }
 
-    /// The chapter the stream is currently inside (index of the last
-    /// start ≤ position), for the bar's highlight.
+    /// The chapter the stream is currently inside, for the bar's highlight
+    /// and the step base — the position-derived index (last start ≤ pos)
+    /// reconciled with the navigation intent (`ChapterBar::nav`).
     fn current_chapter(&self, bar: &ChapterBar) -> Option<usize> {
         let times = bar.times.as_ref().filter(|ts| !ts.is_empty())?;
         let l = self.live_sel.as_ref().filter(|l| l.path == bar.path)?;
@@ -2169,7 +2185,8 @@ impl Switchblade {
             Some(d) => l.position().rem_euclid(d),
             None => l.position(),
         };
-        Some(times.partition_point(|&t0| t0 <= p).saturating_sub(1))
+        let pos_idx = times.partition_point(|&t0| t0 <= p).saturating_sub(1);
+        Some(resolve_chapter(pos_idx, bar.nav))
     }
 
     /// The clip's chapter plan whether or not the bar is up: an open
@@ -2226,7 +2243,17 @@ impl Switchblade {
             None => l.position(),
         };
         let n = times.len();
-        let cur = times.partition_point(|&t| t <= pos).saturating_sub(1);
+        // Base the step on the navigation intent, not the raw decoder
+        // position: a prior keyframe step landed just *before* its target
+        // start, so position alone reports the previous chapter and every
+        // forward press would restep to the same place (stuck).
+        let nav = self
+            .chapters
+            .as_ref()
+            .filter(|b| b.path == path)
+            .and_then(|b| b.nav);
+        let pos_idx = times.partition_point(|&t| t <= pos).saturating_sub(1);
+        let cur = resolve_chapter(pos_idx, nav);
         let target = if forward {
             (cur + 1) % n
         } else if pos - times[cur] > CHAPTER_RESTART_S {
@@ -2246,14 +2273,14 @@ impl Switchblade {
         // landed (a bar already up via `g` stays sticky), then glide its
         // strip to center the landed-on chapter.
         self.open_chapter_bar(true);
-        if self
-            .chapters
-            .as_ref()
-            .is_some_and(|b| b.open && b.path == path && b.times.is_some())
-        {
-            let (lo, hi) = self.chapter_pos_bounds(n);
-            let b = self.chapters.as_mut().unwrap();
-            b.target = (target as f32).clamp(lo, hi);
+        let (lo, hi) = self.chapter_pos_bounds(n);
+        if let Some(b) = self.chapters.as_mut().filter(|b| b.path == path) {
+            // Pin the intent so the highlight lands on `target` despite the
+            // keyframe undershoot, and the next step advances from it.
+            b.nav = Some(target);
+            if b.open && b.times.is_some() {
+                b.target = (target as f32).clamp(lo, hi);
+            }
         }
         self.wake(1.5); // outlive the flash bar's hold + fade
     }
@@ -5095,6 +5122,22 @@ fn checkpoint_count(d: f64) -> usize {
     }
 }
 
+/// Reconcile the position-derived chapter index with a navigation intent
+/// (`ChapterBar::nav`). Chapter seeks are keyframe seeks (no decode-forward
+/// freeze), so a jump to chapter `k` lands on the nearest keyframe *before*
+/// `times[k]` — the decoder sits in chapter `k-1`'s tail. Deriving the
+/// playing chapter purely from position would then report `k-1`: the
+/// highlight janks back and forward stepping recomputes the same base
+/// forever (stuck). So while position is at `k` or its keyframe-undershoot
+/// lead-in (`k-1`), the intent wins; once playback carries past into a
+/// later chapter (or a move lands well before), the raw index takes over.
+fn resolve_chapter(pos_idx: usize, nav: Option<usize>) -> usize {
+    match nav {
+        Some(k) if pos_idx == k || pos_idx + 1 == k => k,
+        _ => pos_idx,
+    }
+}
+
 /// The synthesized checkpoint starts themselves — k/n of the duration
 /// for each of `checkpoint_count` chapters (empty under a minute).
 /// Shared by the chapter bar's plan install and fullview's left/right
@@ -6304,6 +6347,7 @@ mod tests {
                 pos: last * 0.5,
                 target: last * 0.5,
                 peek_until: None,
+                nav: None,
             });
         };
 
@@ -6389,6 +6433,7 @@ mod tests {
             pos: 0.0,
             target: 0.0,
             peek_until,
+            nav: None,
         };
 
         // An already-elapsed peek starts closing on the next frame, then
@@ -6489,6 +6534,7 @@ mod tests {
             pos: 0.0,
             target: 0.0,
             peek_until: None,
+            nav: None,
         });
         app.key(Key::Up);
         assert!(
@@ -7387,6 +7433,143 @@ mod tests {
         assert!(
             (p - before).abs() < 0.5,
             "grid movement never seeks the stream: {before} -> {p}"
+        );
+    }
+
+    /// The keyframe-seek fix: a chapter jump lands just *before* its start
+    /// (nearest keyframe), so the raw position-derived index reports the
+    /// PREVIOUS chapter. `resolve_chapter` lets the navigation intent win
+    /// through that undershoot lead-in, then releases it once playback
+    /// carries into a later chapter — without it the highlight janks back
+    /// and forward stepping is stuck (the reported bug).
+    #[test]
+    fn resolve_chapter_pins_nav_through_keyframe_undershoot() {
+        // No intent: pure position-derived index passes through.
+        assert_eq!(resolve_chapter(0, None), 0);
+        assert_eq!(resolve_chapter(2, None), 2);
+        // Stepped to chapter 2, landed in its keyframe-undershoot tail
+        // (position still reads chapter 1): the intent wins, so the
+        // highlight is chapter 2 and the next step advances from 2.
+        assert_eq!(resolve_chapter(1, Some(2)), 2);
+        // Landed a touch INTO chapter 2 (keyframe on/after the boundary):
+        // still chapter 2.
+        assert_eq!(resolve_chapter(2, Some(2)), 2);
+        // Playback carried past into chapter 3: the raw index takes over,
+        // stale intent released.
+        assert_eq!(resolve_chapter(3, Some(2)), 3);
+        // Seeked/looped well before the intent's lead-in: raw index wins.
+        assert_eq!(resolve_chapter(0, Some(2)), 0);
+    }
+
+    /// End-to-end guard for the reported regression: with keyframe chapter
+    /// seeks, stepping to a chapter start lands on the nearest keyframe
+    /// *before* it, so after the frame settles the decoder sits in the
+    /// previous chapter. A second forward step must still ADVANCE (not
+    /// restep to the same place) and the highlight must track the chapter
+    /// stepped to. Chapters are deliberately off the 1s keyframe grid
+    /// (`-g 30`) so the undershoot is real. Needs ffmpeg; skipped quietly.
+    #[test]
+    fn chapter_steps_advance_after_keyframe_undershoot_settles() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_chapter_undershoot_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain_g30.mp4");
+        let clip = dir.join("chaptered_g30.mp4");
+        if !clip.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=8:size=320x180:rate=30")
+                .args([
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30",
+                ])
+                .arg(&plain)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+            // Chapter starts at 0 / 2.7 / 5.3s — NOT on the 1s keyframe
+            // grid, so a keyframe seek to 2.7 lands at 2.0 (chapter 0's
+            // tail) and to 5.3 lands at 5.0 (chapter 1).
+            let metafile = dir.join("chapters_g30.txt");
+            std::fs::write(
+                &metafile,
+                ";FFMETADATA1\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2700\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=2700\nEND=5300\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=5300\nEND=8000\n",
+            )
+            .unwrap();
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error"])
+                .arg("-i")
+                .arg(&plain)
+                .arg("-i")
+                .arg(&metafile)
+                .args(["-map_metadata", "1", "-codec", "copy"])
+                .arg(&clip)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to mux chapters");
+        }
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Normal),
+            inputs: vec![clip.clone()],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.first_frame.is_some())),
+            "selected live stream never started"
+        );
+        app.key(Key::Tab);
+        assert!(app.fullview, "tab enters fullview");
+        assert!(
+            pump_until(&mut app, |a| a
+                .chapter_probe
+                .get(&clip)
+                .is_some_and(|p| p.is_some())),
+            "chapter probe never answered"
+        );
+
+        // Step to chapter 2 (start 2.7s) and let the keyframe landing
+        // SETTLE below the boundary — this is what made the old math stuck.
+        app.key(Key::Right);
+        assert!(
+            pump_until(&mut app, |a| a
+                .live_sel
+                .as_ref()
+                .is_some_and(|l| l.position() < 2.6 && l.position() > 1.0)),
+            "keyframe seek never settled in chapter 0's tail (undershoot)"
+        );
+        let bar = app.chapters.as_ref().expect("bar peeked open").clone();
+        assert_eq!(
+            app.current_chapter(&bar),
+            Some(1),
+            "highlight tracks the chapter stepped to, not the undershot position"
+        );
+
+        // Second forward step: it must ADVANCE to chapter 3 (start 5.3s),
+        // not restep chapter 2. Read the in-flight target immediately.
+        app.key(Key::Right);
+        let p = app.live_sel.as_ref().unwrap().position();
+        assert!(
+            (5.2..=5.4).contains(&p),
+            "second step must advance to chapter 3, got {p} (regressed: stuck at chapter 2)"
         );
     }
 
