@@ -340,19 +340,29 @@ quickview_max_height = 1440
 # between chapters (real chapters, or the synthesized checkpoints the
 # chapter bar shows) instead. The plain `next`/`prev` actions remain for
 # bindings that should always move the selection (auto-skip fires `next`).
-# Built-in defaults: enter/o = open · space = quickview · tab = fullview ·
-# c = copy_path · q = quit · f = fullscreen · p = toggle_focus_pause ·
-# r = reveal · -/=/0 = zoom · [ / ] = skip back/fwd through the playing
-# clip · D = browse the selected clip's parent dir. Entries here
-# override them.
+# Built-in defaults: enter/o = exec (play in mpv) · space = quickview ·
+# tab = fullview · c = copy_path · q = quit · f = fullscreen ·
+# p = toggle_focus_pause · r = reveal · -/=/0 = zoom · [ / ] = skip
+# back/fwd through the playing clip · D = browse the selected clip's
+# parent dir. Entries here override them.
 #
 # A key can name an internal action (quit, fullscreen, fast_fullscreen,
 # copy_path, quickview, fullview, chapter_mode,
 # toggle_focus_pause, zoom_in, zoom_out, zoom_reset, move_left,
 # move_right, move_up, move_down, next, prev, skip_forward, skip_back,
-# open_parent, jump_random, shuffle_library, toggle_auto_skip) or any
-# [commands.*] entry below. In command args, {path}, {dir} and {name}
-# expand against the selected clip.
+# open_parent, open (swap the library, needs a path), jump_random,
+# shuffle_library, toggle_auto_skip) or any [commands.*] entry below. In
+# command args, {path}, {dir} and {name} expand against the selected clip.
+#
+# Several keys may share one action — the arrows ship bound to the same
+# move_* actions as hjkl, and you can point more keys at anything.
+#
+# `open` swaps the whole library to a directory named inline (a leading ~
+# expands, quote paths with spaces); it walks subfolders when `recurse`
+# is on, just like passing the dir on the command line. Handy for one-key
+# "library" switches ("open_library"/"open_dir"/"library" alias it):
+#   "1" = "open '~/Movies/Prawns/'"
+#   "2" = "open '/Volumes/Prawns/Movies/'"
 #
 # fullscreen = macOS native (the window animates into its own Space);
 # fast_fullscreen = mpv-style: a borderless window covering the screen —
@@ -362,7 +372,7 @@ quickview_max_height = 1440
 # The --fullscreen / --fast-fullscreen CLI flags start the app that way.
 
 [keys]
-enter = "open"
+enter = "exec"  # play the selected clip in mpv ("launch" aliases it)
 space = "quickview"  # internal preview; Esc or Space closes, arrows browse
 tab = "fullview"  # selected clip fills the window on black; Esc or Tab exits
 "[" = "skip_back"  # jump by skip_fraction; wraps at the ends
@@ -375,17 +385,24 @@ h = "move_left"  # context-sensitive: selection back, or previous chapter in ful
 j = "move_down"  # selection down one row
 k = "move_up"  # selection up one row
 l = "move_right"  # context-sensitive: selection forward, or next chapter in fullview
-o = "open"
+o = "exec"
 p = "toggle_focus_pause"  # pause-when-unfocused on/off
 r = "reveal"  # reveal in Finder (open -R)
 s = "shuffle_library"  # shuffle cached clips to the front ("shuffle" also works)
 t = "toggle_auto_skip"  # auto-advance after auto_skip_s of modal playback
 x = "jump_random"  # random clip with a cached thumbnail ("jump_to_random" too)
+# Arrows already ride the move_* actions alongside hjkl; rebind freely:
+# up = "move_up"
+# down = "move_down"
+# One-key library switches (inline path; ~ expands, quote if spaces):
+# "1" = "open '~/Movies/Prawns/'"
+# "2" = "open '/Volumes/Prawns/Movies/'"
 # n = "rename_script"    # any key -> any launched program; example below
 
-# "open" is just a command like any other — swap mpv for whatever you
-# like, or add more commands and bind keys to them.
-[commands.open]
+# "exec" is just a command like any other — swap mpv for whatever you
+# like, or add more commands and bind keys to them. (`launch` is a
+# built-in alias for the same mpv launcher.)
+[commands.exec]
 type = "launch"
 program = "mpv"
 args = ["{path}"]
