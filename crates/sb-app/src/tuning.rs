@@ -155,6 +155,26 @@ pub struct Tuning {
     /// 0..1, how fast a non-wrapping tile glides to its re-justified slot
     /// during a zoom reflow (per 60fps frame, like `scale_smoothing`).
     pub zoom_reflow_smoothing: f32,
+    /// Flexible grid only: drive a PINCH as a gripped ribbon — the library
+    /// is one strip of chips wrapped at the window width, held at the chip
+    /// under the fingers, so that chip stays put while neighbours expand
+    /// outward and edge chips clip against the sides (iOS Photos feel).
+    /// Off falls back to `zoom_wrap`. Keyboard zoom always uses the wrap.
+    pub zoom_ribbon: bool,
+    /// How fast a released ribbon settles onto the nearest safe layout
+    /// (per 60fps frame, like `scale_smoothing`). Higher = snappier. The
+    /// default is the prototype's preferred 25/s: k = 1 - e^(-speed/60).
+    pub zoom_ribbon_settle: f32,
+    /// How quickly rows abandon their justified heights for the ribbon's
+    /// uniform height, in blend per unit of |ln(zoom / zoom-at-grip)|. The
+    /// grid "loosens" into a strip as the pinch travels; reversing scrubs
+    /// it back, and at zero travel the layout is untouched. The default
+    /// completes the loosening within ~5% of zoom travel — the grid commits
+    /// to being a ribbon almost as soon as the fingers move.
+    pub zoom_ribbon_blend: f32,
+    /// Quiet time after the last pinch event that ends the gesture and
+    /// starts the settle (trackpads deliver no explicit gesture end here).
+    pub zoom_ribbon_release_ms: f32,
     /// Pause live playback and sheet animation while the window is
     /// unfocused (the grid stays visible, just still — big CPU saver).
     pub pause_unfocused: bool,
@@ -349,6 +369,10 @@ impl Default for Tuning {
             zoom_wrap: true,
             zoom_wrap_ms: 220.0,
             zoom_wrap_stagger_ms: 0.0,
+            zoom_ribbon: true,
+            zoom_ribbon_settle: 0.34,
+            zoom_ribbon_blend: 21.5,
+            zoom_ribbon_release_ms: 150.0,
             zoom_reflow_smoothing: 0.25,
             pause_unfocused: true,
             recurse: true,

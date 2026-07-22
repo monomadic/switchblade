@@ -76,17 +76,27 @@ scale_smoothing = 0.35  # tiles growing/shrinking (hover, selection)
 fade_in_ms = 20.0  # newly appearing tiles fade in over this long
 
 # ── Feel: zoom ──────────────────────────────────────────────────────────
-# Pinch-to-zoom (also the -/=/0 keys). Zoom scales the ideal tile width, so
-# rows reflow. In the flexible grid the reflow WRAPS: a tile crossing a row
-# boundary slides off one window edge and re-enters on the next row from the
-# opposite edge (no fade), while tiles that just re-justify glide to their new
-# slot. zoom_fade_ms is the crossfade used by the fixed grid and by shuffle/
+# A PINCH in the flexible grid grips the grid like paper: the library is one
+# strip of chips wrapped at the window width, held at the chip under your
+# fingers, so that chip stays put while its neighbours expand outward, chips
+# at a row edge clip against the window, and a chip pushed past one edge is
+# already entering the next row. Let go and it settles onto the nearest SAFE
+# layout — every chip whole, rows keeping whatever slack the gesture left
+# them, nothing slung sideways to re-align. The -/=/0 keys have no grip to
+# hold by, so they return the grid to the plain justified packing, animated
+# by the older row WRAP: a tile crossing a boundary slides off one edge and
+# re-enters on the next row, while tiles that just re-justify glide.
+# zoom_fade_ms is the crossfade used by the fixed grid and by shuffle/
 # library-swap rearranges (and by the flexible grid when zoom_wrap = false).
 pinch_sensitivity = 1.0
 zoom_min = 0.35
 zoom_max = 3.0
 zoom_smoothing = 0.35       # fixed grid only; with zoom_wrap the layout snaps and the tile tweens ARE the zoom animation
 zoom_fade_ms = 180.0
+zoom_ribbon = true          # flexible grid: pinch grips the strip (off = pinch uses zoom_wrap too)
+zoom_ribbon_settle = 0.34   # how snappily a released ribbon settles; k = 1 - e^(-speed/60), so this is 25/s
+zoom_ribbon_blend = 21.5    # how fast rows loosen from justified into one uniform strip, per unit of |ln(zoom change)|
+zoom_ribbon_release_ms = 150.0  # quiet time after the last pinch event that ends the gesture
 zoom_wrap = true            # flexible grid: wrap the zoom reflow (off = crossfade)
 zoom_wrap_ms = 220.0        # duration of one tile's row-wrap slide
 zoom_wrap_stagger_ms = 0.0  # per-row delay (0 = all rows wrap in lockstep)

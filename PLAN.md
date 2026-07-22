@@ -79,7 +79,7 @@ Like `fzf`, but for visual clip selection instead of lines of text.
 
 ### Pointer / trackpad
 - Drag/pan moves the grid.
-- Pinch zooms the grid: tile size scales and columns reflow, anchored on the viewport center. Also on `-` / `=` / `0` keys.
+- Pinch zooms the grid. In the flexible grid it is a **gripped ribbon** (`zoom_ribbon`, settled 2026-07-22): the library is one strip of true-aspect chips wrapped at the window width, held at a point ON the chip under the fingers — that chip stays pinned while neighbours expand outward, row-edge chips clip against the window, and a chip pushed past one edge is simultaneously entering the adjacent row, so wrapping is continuous with no discrete pop. Rows walk outward from the grip row and each is laid as ONE joined strip at its own height, which makes the invariants structural rather than animated: chips in a row are gap-joined (never overlapping, never leaving a hole), a chip visiting a row is a full member of it, and rows sit exactly one gap apart. Release quantizes to the **nearest safe state** — each straddler joins whichever row shows more of it (unless that squeezes the row past `row_height_min`), full rows re-justify, and the strip's first/last rows keep their slack. Rows are allowed to rest indented: nothing is slung sideways to re-align, because that sling was the jank. The resting packing (row start indices) overrides the justified layout until a keyboard zoom, resize or index remap drops it. `-` / `=` / `0` have no grip to hold by, so they return to the justified packing animated by the older row wrap (`zoom_wrap`), which the fixed grid also keeps.
 - Hover may highlight.
 - Click selects.
 - Double-click or configured action opens.

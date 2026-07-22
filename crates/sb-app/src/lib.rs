@@ -46,6 +46,15 @@ const MEDIA_UPLOAD_BUDGET: usize = 64;
 /// trickles in over a few frames instead (still ~700/s at 60fps); the
 /// full budget returns the moment nothing is playing.
 const MEDIA_UPLOAD_BUDGET_LIVE: usize = 12;
+/// Tighter still while a pinch is in flight. A gesture holds the render
+/// loop at full rate for its whole duration (it IS the animation), so the
+/// full budget becomes ~3800 thumb uploads a second — gigabytes of RGBA
+/// staged while the user is dragging the grid around, which ground the
+/// machine to a halt whenever a gen sweep was delivering. A small library
+/// (nothing to deliver) never showed it. The backlog is a channel; it
+/// drains the moment the gesture settles, and the sweep is background
+/// work by definition — the gesture in the user's fingers is not.
+const MEDIA_UPLOAD_BUDGET_GESTURE: usize = 4;
 /// Background prewarms (fullview's chapter probe + anim sheet) normally
 /// wait for the selected stream's first frame; a stream that never
 /// delivers (failed decode, retry cooldown) releases them after this
@@ -151,6 +160,87 @@ struct WrapEvent {
     /// True = crossing to a later row (zoom-in): exit right, enter from left.
     /// False = earlier row (zoom-out): exit left, enter from right.
     forward: bool,
+}
+
+/// A live pinch in the flexible grid (`zoom_ribbon`). The library is one
+/// long strip of true-aspect chips wrapped at the window width, gripped at
+/// a point ON the chip under the fingers: zoom scales the strip about that
+/// grip, so the gripped chip stays put, neighbours expand outward, chips at
+/// a row edge clip against the window, and a chip pushed past one edge is
+/// simultaneously entering the adjacent row — wrapping is continuous, with
+/// no discrete pop. Rows walk outward from the grip row and each is laid as
+/// ONE joined strip at its own height, so a chip visiting a row is a full
+/// member of it (same height, gap-joined) and can never overlap its
+/// rowmates or leave a hole. Released, it settles onto the nearest SAFE
+/// layout (`ribbon_quantize`) rather than being slung back to a justified
+/// packing — see `RibbonPack`.
+struct RibbonGrip {
+    /// The gripped clip and where on it the fingers landed (0..1 of its rect).
+    clip: usize,
+    fx: f32,
+    fy: f32,
+    /// The grip point in viewport coords — the chip is pinned here.
+    cx: f32,
+    cy: f32,
+    /// Zoom when the grip was taken; drives both the scale and the blend.
+    z0: f32,
+    /// Row the grip started in, and the resting row heights at that moment:
+    /// rows blend from these toward the ribbon's uniform height, so a
+    /// gesture that has barely moved leaves the grid exactly as it was.
+    grip_row: usize,
+    rest_h: Vec<f32>,
+    /// Last pinch event — the gesture ends `zoom_ribbon_release_ms` after it
+    /// (trackpad pinches arrive as a stream of deltas with no end event).
+    last: Instant,
+}
+
+/// One chip copy inside a ribbon row. A chip straddling a row boundary
+/// appears in both rows (two copies, complementary clipping).
+#[derive(Clone, Copy)]
+struct RibbonItem {
+    clip: usize,
+    x: f32,
+    w: f32,
+}
+
+/// A ribbon row: viewport-space top edge, shared height, and its members
+/// laid left to right exactly one gap apart.
+#[derive(Clone)]
+struct RibbonRow {
+    y: f32,
+    h: f32,
+    items: Vec<RibbonItem>,
+}
+
+/// The resting packing a ribbon gesture settled into: row START indices
+/// only. Geometry is rebuilt from them (`build_ribbon_flex`) so a thumb or
+/// aspect arrival re-justifies in place instead of drifting from what the
+/// user settled on; if the membership stops fitting, the pack is dropped
+/// and the plain justified grid takes over. Encoding membership as starts
+/// also makes rows a partition by construction — no clip can end up in two
+/// rows at rest.
+#[derive(Clone)]
+struct RibbonPack {
+    starts: Vec<usize>,
+    /// The viewport width and zoom it was packed for; either changing
+    /// invalidates it (a resize or keyboard zoom returns to justified).
+    vw: f32,
+    zoom: f32,
+}
+
+/// The release morph: every row glides from where the gesture left it to
+/// its quantized resting slot. Both ends are gap-joined strips and the
+/// interpolation is linear, so every intermediate frame is a gap-joined
+/// strip too — joins, uniform row heights and row spacing hold for free
+/// instead of being animated toward.
+struct RibbonSettle {
+    from: Vec<RibbonRow>,
+    to: Vec<RibbonRow>,
+    /// 0..1 progress.
+    t: f32,
+    /// Installed when the morph lands, together with `scroll`.
+    pack: RibbonPack,
+    scroll: f32,
 }
 
 /// Cache key for the flexible layout — every input that shapes it.
@@ -523,6 +613,21 @@ pub struct Switchblade {
     /// on `grid_rev` (thumb arrivals bump it constantly); the index-remap
     /// sites (shuffle, D swap) clear it explicitly instead.
     reflow: Vec<TileReflow>,
+    /// Ribbon pinch state (flexible grid + `zoom_ribbon`): the live grip,
+    /// the release morph, and the resting packing a settled gesture left
+    /// behind (which overrides the justified layout until a keyboard zoom,
+    /// resize or index remap drops it).
+    ribbon: Option<RibbonGrip>,
+    ribbon_settle: Option<RibbonSettle>,
+    ribbon_pack: Option<RibbonPack>,
+    /// Scratch for the ribbon draw table (clip → its rect, plus a second
+    /// copy while it straddles a row boundary), REUSED across frames and
+    /// cleared only where it was written. Allocating these per frame cost
+    /// two library-sized vectors every frame of a gesture — on a large
+    /// library that is hundreds of MB/s of churn, which is what the app
+    /// eventually choked on.
+    ribbon_main: Vec<Option<[f32; 4]>>,
+    ribbon_second: Vec<Option<[f32; 4]>>,
     /// App start, the time base for looping micro-animations (loading dots).
     t0: Instant,
     /// Springs still in flight this frame (drives idle throttling).
@@ -801,6 +906,11 @@ impl Switchblade {
             last_tiles: Vec::new(),
             transition: None,
             reflow: Vec::new(),
+            ribbon: None,
+            ribbon_settle: None,
+            ribbon_pack: None,
+            ribbon_main: Vec::new(),
+            ribbon_second: Vec::new(),
             t0: Instant::now(),
             motion: true,
             wake_until: Instant::now() + Duration::from_secs(1),
@@ -825,9 +935,16 @@ impl Switchblade {
             app.cmds.push(WindowCommand::ToggleFullscreen { fast });
         }
         if demo {
-            log::info!("stdin is a tty — demo mode with {DEMO_TILES} fake tiles");
+            // `SB_DEMO_TILES` scales the fake library — the only way to
+            // measure layout/gesture cost against library size headlessly
+            // (sb-bench has no 10k-file corpus).
+            let tiles = std::env::var("SB_DEMO_TILES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEMO_TILES);
+            log::info!("stdin is a tty — demo mode with {tiles} fake tiles");
             let now = Instant::now();
-            for i in 0..DEMO_TILES {
+            for i in 0..tiles {
                 app.clips.push(Clip {
                     path: PathBuf::from(format!("demo/clip_{i:04}.mp4")),
                     readable: true,
@@ -864,8 +981,20 @@ impl Switchblade {
     /// × zoom is the *ideal* width used to choose the column count; tiles
     /// then stretch so the columns exactly fill the viewport and the
     /// background barely shows.
+    /// The grid layout. While a ribbon pinch is live it is FROZEN at the
+    /// zoom the grip was taken at: the gesture draws its own rows, so the
+    /// layout underneath only feeds hit-tests, atlas budgets and warm
+    /// neighbours — and letting those follow the mid-gesture zoom repacked
+    /// the whole library every frame (an O(library) rebuild per pinch
+    /// event, every one a `FlexKey` miss) and churned every decision they
+    /// drive: a warm decoder dropped and respawned per frame, the hover
+    /// lane likewise, atlas slots evicted and reloaded. That is what
+    /// ground the machine down mid-gesture — the app-side layout cost is
+    /// only the visible half. The settle runs at the final zoom, so it
+    /// rebuilds once and then stays cached.
     fn layout(&self) -> Layout {
-        self.layout_with(self.zoom)
+        let zoom = self.ribbon.as_ref().map_or(self.zoom, |g| g.z0);
+        self.layout_with(zoom)
     }
 
     fn layout_with(&self, zoom: f32) -> Layout {
@@ -907,9 +1036,27 @@ impl Switchblade {
         {
             return grid.clone();
         }
-        let grid = Rc::new(self.build_flex(zoom));
+        // A settled ribbon gesture owns the resting packing: rebuild its
+        // rows from their membership (so an aspect arrival re-justifies in
+        // place) and only fall back to the justified packing if that
+        // membership no longer fits the window.
+        let grid = self
+            .ribbon_pack
+            .as_ref()
+            .filter(|p| p.vw == self.viewport.width && p.zoom == zoom)
+            .and_then(|p| self.build_ribbon_flex(&p.starts, zoom))
+            .unwrap_or_else(|| self.build_flex(zoom));
+        let grid = Rc::new(grid);
         *cache = Some((key, grid.clone()));
         grid
+    }
+
+    /// Tile height a row would have at this zoom before any justification —
+    /// the ribbon's uniform strip height, and the flexible grid's nominal.
+    fn nominal_h(&self, zoom: f32) -> f32 {
+        let t = &self.tuning;
+        let ideal_w = (t.tile_width * zoom).max(40.0);
+        (ideal_w * t.tile_height / t.tile_width.max(1.0)).max(24.0)
     }
 
     /// Justified layout: rows fill greedily with true-aspect tiles at
@@ -921,8 +1068,7 @@ impl Switchblade {
         let t = &self.tuning;
         let g = t.gap;
         let vw = self.viewport.width;
-        let ideal_w = (t.tile_width * zoom).max(40.0);
-        let nominal_h = (ideal_w * t.tile_height / t.tile_width.max(1.0)).max(24.0);
+        let nominal_h = self.nominal_h(zoom);
         let rmin = t.row_height_min.clamp(0.1, 1.0);
         let rmax = t.row_height_max.clamp(1.0, 4.0);
         // Width available to `cnt` tiles (side margins + inner gaps).
@@ -1184,6 +1330,572 @@ impl Switchblade {
         }
     }
 
+    // --- ribbon pinch (flexible grid) ---
+
+    /// Texture uploads to accept from the media queue this frame. User
+    /// attention outranks the background sweep: a playing stream squeezes
+    /// it, and a pinch — which pins the loop at full rate for as long as
+    /// the fingers are down — squeezes it hardest.
+    fn media_upload_budget(&self, presenting: bool) -> usize {
+        if self.ribbon.is_some() || self.ribbon_settle.is_some() {
+            MEDIA_UPLOAD_BUDGET_GESTURE
+        } else if presenting {
+            MEDIA_UPLOAD_BUDGET_LIVE
+        } else {
+            MEDIA_UPLOAD_BUDGET
+        }
+    }
+
+    /// Whether a pinch drives the gripped-ribbon model rather than the
+    /// wrap reflow (flexible grid, `zoom_ribbon`, no modal, UI tweens on).
+    fn ribbon_on(&self) -> bool {
+        self.tuning.zoom_ribbon
+            && self.tuning.grid_layout == GridStyle::Flexible
+            && !(self.quickview || self.fullview)
+            && self.level().ui()
+            && !self.clips.is_empty()
+    }
+
+    /// Grab the strip at the cursor: the chip under it (or the nearest one
+    /// in that row band), held at the nearest point ON that chip. Clamping
+    /// the POINT rather than the fractions is load-bearing — clamping the
+    /// fractions while keeping the raw pointer x makes grip and offset
+    /// disagree, and the grip row jerks sideways on the gesture's first
+    /// frame, splitting a chip that should not have moved at all.
+    fn ribbon_grip(&self, lay: &Layout) -> Option<RibbonGrip> {
+        let flex = lay.flex.as_ref()?;
+        let (cx, cy) = self.cursor;
+        let cyc = cy + self.scroll;
+        let clip = self.tile_at(lay, cx, cy).or_else(|| {
+            let row = self.row_at_y(lay, cyc.max(0.0));
+            self.nearest_in_row(lay, row, cx)
+        })?;
+        let (x, y, w, h) = self.tile_rect(lay, clip);
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let gx = cx.clamp(x, x + w);
+        let gy = cyc.clamp(y, y + h);
+        Some(RibbonGrip {
+            clip,
+            fx: (gx - x) / w,
+            fy: (gy - y) / h,
+            cx: gx,
+            cy: gy - self.scroll,
+            z0: self.zoom.max(0.01),
+            grip_row: self.row_of(lay, clip),
+            rest_h: flex.rows.iter().map(|r| r.h).collect(),
+            last: Instant::now(),
+        })
+    }
+
+    /// Lay the ribbon at `zoom`: rows walk outward from the grip row, each
+    /// one joined strip at its own height, splits carried across boundaries
+    /// as the same clip appearing in both rows. `all` walks the whole
+    /// library (release, to quantize); otherwise it stops once the rows
+    /// leave the viewport. Returns the rows and the grip row's index.
+    fn ribbon_walk(&self, grip: &RibbonGrip, zoom: f32, all: bool) -> (Vec<RibbonRow>, usize) {
+        let t = &self.tuning;
+        let g = t.gap;
+        let (edge_l, edge_r) = (g, (self.viewport.width - g).max(g + 1.0));
+        let n = self.clips.len();
+        let nominal = self.nominal_h(zoom);
+        let k = zoom / grip.z0;
+        // Rows start at their resting heights (so a gesture that hasn't
+        // moved changes nothing) and blend to the ribbon's uniform height.
+        let blend = ((zoom / grip.z0).ln().abs() * t.zoom_ribbon_blend).clamp(0.0, 1.0);
+        let row_h = |off: i64| -> f32 {
+            let ix = grip.grip_row as i64 + off;
+            let base = usize::try_from(ix)
+                .ok()
+                .and_then(|i| grip.rest_h.get(i).copied())
+                .unwrap_or(nominal / k.max(0.01));
+            let scaled = base * k;
+            scaled + (nominal - scaled) * blend
+        };
+        let on_screen = |y: f32, h: f32| y < self.viewport.height && y + h > 0.0;
+        // A row can be off screen in the walk yet on screen in the settled
+        // target it morphs to, so "safe to shed the middle of" needs a
+        // viewport of slack on each side.
+        let vh = self.viewport.height;
+        let far = |y: f32, h: f32| y + h < -vh || y > 2.0 * vh;
+        let visible = |y: f32, h: f32| all || on_screen(y, h);
+
+        // The grip row: the held chip is pinned under the fingers and its
+        // neighbours lay outward from it until they run past either edge.
+        let h0 = row_h(0);
+        let w0 = self.chip_aspect(grip.clip) * h0;
+        let mut items = vec![RibbonItem {
+            clip: grip.clip,
+            x: grip.cx - grip.fx * w0,
+            w: w0,
+        }];
+        let mut x = items[0].x + w0 + g;
+        let mut j = grip.clip + 1;
+        while j < n && x < edge_r {
+            let w = self.chip_aspect(j) * h0;
+            items.push(RibbonItem { clip: j, x, w });
+            x += w + g;
+            j += 1;
+        }
+        let mut xe = items[0].x;
+        let mut jl = grip.clip;
+        let mut left = Vec::new();
+        while jl > 0 {
+            jl -= 1;
+            let w = self.chip_aspect(jl) * h0;
+            let x2 = xe - g - w;
+            if x2 + w <= edge_l {
+                break;
+            }
+            left.push(RibbonItem { clip: jl, x: x2, w });
+            xe = x2;
+        }
+        left.reverse();
+        left.extend(items);
+        let mut rows = vec![RibbonRow {
+            y: grip.cy - grip.fy * h0,
+            h: h0,
+            items: left,
+        }];
+        // Rows above the grip are collected in their own list and spliced
+        // on at the end (see the up-walk below) — prepending is quadratic.
+        let mut above: Vec<RibbonRow> = Vec::new();
+
+        // Downward: each row opens with the previous row's right straddler,
+        // entering from the left at the same split fraction.
+        for off in 1..=(n as i64) {
+            let prev = rows.last().expect("grip row");
+            let last = *prev.items.last().expect("non-empty row");
+            let straddles = last.x + last.w > edge_r + 1e-3;
+            let frac = if straddles {
+                ((edge_r - last.x) / last.w).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let start = if straddles { last.clip } else { last.clip + 1 };
+            if start >= n {
+                break;
+            }
+            let h = row_h(off);
+            let y = prev.y + prev.h + g;
+            if !visible(y, h) {
+                break;
+            }
+            let mut x = if straddles {
+                edge_l - frac * (self.chip_aspect(start) * h)
+            } else {
+                edge_l
+            };
+            let mut items: Vec<RibbonItem> = Vec::new();
+            for clip in start..n {
+                if !items.is_empty() && x >= edge_r {
+                    break;
+                }
+                let w = self.chip_aspect(clip) * h;
+                items.push(RibbonItem { clip, x, w });
+                x += w + g;
+            }
+            let done = items
+                .last()
+                .is_some_and(|l| l.clip + 1 >= n && l.x + l.w <= edge_r + 1e-3);
+            // A row nobody can see is only read for its boundary chips
+            // (quantization looks at first and last), so don't carry the
+            // middle of it — a full walk of a big library is otherwise
+            // one Vec per row of chips that will never be drawn.
+            if far(y, h) && items.len() > 2 {
+                let last = items[items.len() - 1];
+                items.truncate(1);
+                items.push(last);
+            }
+            rows.push(RibbonRow { y, h, items });
+            if done {
+                break;
+            }
+        }
+
+        // Upward: each row closes with the next row's left straddler, its
+        // hidden part showing at this row's right edge.
+        for off in 1..=(n as i64) {
+            // The row below this one: the last one walked up, or the grip
+            // row on the first pass.
+            let (head, below_y) = {
+                let next = above.last().unwrap_or_else(|| rows.first().expect("grip row"));
+                (next.items[0], next.y)
+            };
+            let straddles = head.x < edge_l - 1e-3;
+            let hidden = if straddles {
+                ((edge_l - head.x) / head.w).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let end = if straddles {
+                head.clip
+            } else if head.clip == 0 {
+                break;
+            } else {
+                head.clip - 1
+            };
+            let h = row_h(-off);
+            let y = below_y - h - g;
+            if !visible(y, h) {
+                break;
+            }
+            let w = self.chip_aspect(end) * h;
+            // Laid right to left, then reversed — prepending each chip (and
+            // each row) into a growing Vec is quadratic, which on a large
+            // library froze the main thread for seconds at every release.
+            let mut items = vec![RibbonItem {
+                clip: end,
+                x: if straddles {
+                    edge_r - hidden * w
+                } else {
+                    edge_r - w
+                },
+                w,
+            }];
+            let mut xe = items[0].x;
+            let mut clip = end;
+            while clip > 0 {
+                clip -= 1;
+                let w = self.chip_aspect(clip) * h;
+                let x2 = xe - g - w;
+                if x2 + w <= edge_l {
+                    break;
+                }
+                items.push(RibbonItem { clip, x: x2, w });
+                xe = x2;
+            }
+            items.reverse();
+            let done = items[0].clip == 0 && items[0].x >= edge_l - 1e-3;
+            if far(y, h) && items.len() > 2 {
+                let last = items[items.len() - 1];
+                items.truncate(1);
+                items.push(last);
+            }
+            above.push(RibbonRow { y, h, items });
+            if done {
+                break;
+            }
+        }
+        let grip_ix = above.len();
+        above.reverse();
+        above.extend(rows);
+        (above, grip_ix)
+    }
+
+    /// How much a row of `start..end` must scale from nominal to span the
+    /// width — the flexible grid's row scale, shared by the packing rebuild
+    /// and by quantization so the two can't disagree about what fits.
+    fn ribbon_row_scale(&self, start: usize, end: usize, zoom: f32) -> f32 {
+        let g = self.tuning.gap;
+        let cnt = (end - start) as f32;
+        let sum: f32 = (start..end).map(|i| self.chip_aspect(i)).sum();
+        let usable = (self.viewport.width - g * (cnt + 1.0)).max(1.0);
+        usable / sum.max(0.01) / self.nominal_h(zoom)
+    }
+
+    /// Quantize a walked ribbon to the nearest SAFE packing: every chip
+    /// straddling a row boundary joins whichever row shows more of it —
+    /// unless keeping it would squeeze that row past `row_height_min`, in
+    /// which case it goes down (the direction that always fits). The
+    /// result is row START indices, which makes the packing a partition by
+    /// construction: no chip can land in two rows, and nothing is dragged
+    /// sideways to left-align a row the gesture left indented.
+    fn ribbon_quantize(&self, rows: &[RibbonRow], zoom: f32) -> Vec<usize> {
+        let n = self.clips.len();
+        let edge_r = (self.viewport.width - self.tuning.gap).max(1.0);
+        let rmin = self.tuning.row_height_min.clamp(0.1, 1.0);
+        let mut starts = vec![0usize];
+        let mut cur = 0usize;
+        for (i, row) in rows.iter().enumerate() {
+            let Some(next) = rows.get(i + 1) else { break };
+            let last = *row.items.last().expect("non-empty row");
+            let shared = next.items.first().map(|it| it.clip) == Some(last.clip);
+            let keep_up = !shared
+                || ((edge_r - last.x) / last.w >= 0.5
+                    && self.ribbon_row_scale(cur, last.clip + 1, zoom) >= rmin);
+            let start = if keep_up { last.clip + 1 } else { last.clip };
+            // Rows must stay a strictly ascending partition, and the tail
+            // of the library has to remain reachable.
+            let start = start.clamp(cur + 1, n.saturating_sub(1));
+            if start <= cur {
+                break;
+            }
+            starts.push(start);
+            cur = start;
+        }
+        starts
+    }
+
+    /// Rebuild a packing's geometry at `zoom`. Full rows justify (their
+    /// height scaled so members exactly span the width); the strip's first
+    /// and last rows keep their slack when justifying would stretch them —
+    /// the first row right-aligned (an indentation on the left is fine),
+    /// the last row left-aligned.
+    ///
+    /// The starts are a SEED, not a contract: a thumb landing changes a
+    /// clip's aspect, and a row that no longer fits simply hands its
+    /// trailing chip down to the next row (the direction that always
+    /// fits) rather than invalidating the whole packing. Dropping the
+    /// packing instead re-justified the entire grid on the next arrival —
+    /// which read as the settled grid snapping chip 0 back to the left
+    /// margin a moment after it came to rest.
+    fn build_ribbon_flex(&self, starts: &[usize], zoom: f32) -> Option<FlexGrid> {
+        let t = &self.tuning;
+        let g = t.gap;
+        let vw = self.viewport.width;
+        let n = self.clips.len();
+        if starts.first() != Some(&0) || starts.last().is_some_and(|&s| s >= n) {
+            return None;
+        }
+        let nominal = self.nominal_h(zoom);
+        let rmin = t.row_height_min.clamp(0.1, 1.0);
+        let rmax = t.row_height_max.clamp(1.0, 4.0);
+        let mut rows = Vec::with_capacity(starts.len());
+        let mut y = g;
+        let mut start = 0usize;
+        let mut seed = 1usize;
+        while start < n {
+            let seed_end = starts.get(seed).copied().unwrap_or(n);
+            let mut end = seed_end.clamp(start + 1, n);
+            // Heal an overfull row by handing chips down, one at a time.
+            while end > start + 1 && self.ribbon_row_scale(start, end, zoom) < rmin {
+                end -= 1;
+            }
+            if end >= seed_end {
+                seed += 1;
+            }
+            let r = rows.len();
+            let last_row = end >= n;
+            let scale = self.ribbon_row_scale(start, end, zoom);
+            let (h, align_right) = if scale <= 1.0 {
+                (nominal * scale.max(rmin), false)
+            } else if last_row {
+                (nominal, false) // never grows; slack on the right
+            } else if r == 0 && scale >= 1.35 {
+                (nominal, true) // keeps its indentation on the left
+            } else {
+                (nominal * scale.min(rmax), false)
+            };
+            let mut x = Vec::with_capacity(end - start);
+            let mut w = Vec::with_capacity(end - start);
+            let mut cx = g;
+            for i in start..end {
+                let tw = self.chip_aspect(i) * h;
+                x.push(cx);
+                w.push(tw);
+                cx += tw + g;
+            }
+            if align_right {
+                let shift = (vw - g - (cx - g)).max(0.0);
+                for v in &mut x {
+                    *v += shift;
+                }
+            }
+            rows.push(FlexRow {
+                start,
+                end,
+                y,
+                h,
+                x,
+                w,
+            });
+            y += h + g;
+            start = end;
+        }
+        Some(FlexGrid { rows, height: y })
+    }
+
+    /// End of gesture: quantize what the ribbon is showing, then morph
+    /// every row onto its resting slot. The target is built from the SAME
+    /// geometry the layout will use afterwards, so the handoff at the end
+    /// of the morph is exact — no snap.
+    fn ribbon_release(&mut self) {
+        let Some(grip) = self.ribbon.take() else {
+            return;
+        };
+        let zoom = self.zoom;
+        let (from, grip_ix) = self.ribbon_walk(&grip, zoom, true);
+        let starts = self.ribbon_quantize(&from, zoom);
+        // A collapsed row would break the row-to-row correspondence the
+        // morph relies on; install the packing directly in that rare case.
+        let Some(grid) = self
+            .build_ribbon_flex(&starts, zoom)
+            .filter(|g| g.rows.len() == from.len())
+        else {
+            self.ribbon_install(starts, zoom, None);
+            return;
+        };
+        // Keep the grip row where it sits: that fixes the scroll.
+        let scroll = (grid.rows[grip_ix].y - from[grip_ix].y)
+            .clamp(0.0, (grid.height - self.viewport.height).max(0.0));
+        let g = self.tuning.gap;
+        // Only the rows the morph will actually draw get built: it never
+        // shows anything off screen, and materialising a second copy of
+        // the whole library per gesture is exactly the kind of churn that
+        // made a long session degrade.
+        let vw = self.viewport.width;
+        let vh = self.viewport.height;
+        let keep: Vec<usize> = (0..from.len())
+            .filter(|&r| {
+                let (a, b) = (&from[r], &grid.rows[r]);
+                let (top, bot) = (
+                    a.y.min(b.y - scroll),
+                    (a.y + a.h).max(b.y - scroll + b.h),
+                );
+                top < vh && bot > 0.0
+            })
+            .collect();
+        let to: Vec<RibbonRow> = keep
+            .iter()
+            .map(|&r| {
+                let (wrow, grow) = (&from[r], &grid.rows[r]);
+                let items = wrow
+                    .items
+                    .iter()
+                    .map(|it| {
+                        let w = self.chip_aspect(it.clip) * grow.h;
+                        // A chip that left this row keeps a copy continuing
+                        // the strip, so shedding it never has to break the
+                        // row's joins — it just slides out. It has to leave
+                        // through the WINDOW edge, not merely one gap past
+                        // the row: a row resting indented (or short) would
+                        // otherwise strand the departing copy in view, and
+                        // installing the packing popped it away — the snap
+                        // that put chip 0 back against the left margin.
+                        // Clamped exactly to the edge, so a row resting hard
+                        // against the margin keeps the strip rigid (the
+                        // clamp is a no-op there) and only an indented or
+                        // short row lets the gap open — which is that row's
+                        // slack appearing behind the departing chip.
+                        let x = if it.clip < grow.start {
+                            (grow.x[0] - g - w).min(-w)
+                        } else if it.clip >= grow.end {
+                            let k = grow.x.len() - 1;
+                            (grow.x[k] + grow.w[k] + g).max(vw)
+                        } else {
+                            grow.x[it.clip - grow.start]
+                        };
+                        RibbonItem { clip: it.clip, x, w }
+                    })
+                    .collect();
+                RibbonRow {
+                    y: grow.y - scroll,
+                    h: grow.h,
+                    items,
+                }
+            })
+            .collect();
+        let mut from = from;
+        let mut kept = keep.iter().copied().peekable();
+        let mut r = 0usize;
+        from.retain(|_| {
+            let hit = kept.peek() == Some(&r);
+            if hit {
+                kept.next();
+            }
+            r += 1;
+            hit
+        });
+        self.ribbon_settle = Some(RibbonSettle {
+            from,
+            to,
+            t: 0.0,
+            pack: RibbonPack {
+                starts,
+                vw: self.viewport.width,
+                zoom,
+            },
+            scroll,
+        });
+        self.motion = true;
+    }
+
+    /// Adopt a packing as the resting layout (and the scroll that keeps the
+    /// view where the gesture left it).
+    fn ribbon_install(&mut self, starts: Vec<usize>, zoom: f32, scroll: Option<f32>) {
+        self.ribbon_pack = Some(RibbonPack {
+            starts,
+            vw: self.viewport.width,
+            zoom,
+        });
+        self.flex_cache.borrow_mut().take();
+        if let Some(s) = scroll {
+            self.scroll = s;
+            self.scroll_target = s;
+        }
+        let lay = self.layout();
+        let max = self.max_scroll(&lay);
+        self.scroll = self.scroll.clamp(0.0, max);
+        self.scroll_target = self.scroll_target.clamp(0.0, max);
+        // The wrap table's rects belong to the pre-gesture layout.
+        self.reflow.clear();
+    }
+
+    /// Drop every ribbon state — a keyboard zoom, resize or index remap
+    /// returns the grid to its plain justified packing.
+    fn ribbon_reset(&mut self) {
+        let had = self.ribbon_pack.is_some();
+        self.ribbon = None;
+        self.ribbon_settle = None;
+        self.ribbon_pack = None;
+        if had {
+            self.flex_cache.borrow_mut().take();
+        }
+    }
+
+    /// Rows to draw this frame while a ribbon gesture or its settle is up.
+    fn ribbon_rows(&self) -> Option<Vec<RibbonRow>> {
+        if let Some(s) = &self.ribbon_settle {
+            let t = s.t.clamp(0.0, 1.0);
+            let lerp = |a: f32, b: f32| a + (b - a) * t;
+            return Some(
+                s.from
+                    .iter()
+                    .zip(&s.to)
+                    .map(|(f, to)| RibbonRow {
+                        y: lerp(f.y, to.y),
+                        h: lerp(f.h, to.h),
+                        items: f
+                            .items
+                            .iter()
+                            .zip(&to.items)
+                            .map(|(a, b)| RibbonItem {
+                                clip: a.clip,
+                                x: lerp(a.x, b.x),
+                                w: lerp(a.w, b.w),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            );
+        }
+        let grip = self.ribbon.as_ref()?;
+        Some(self.ribbon_walk(grip, self.zoom, false).0)
+    }
+
+    /// Advance the release morph and end a gesture that has gone quiet.
+    fn step_ribbon(&mut self, dt: f32) {
+        if let Some(grip) = &self.ribbon {
+            let quiet = grip.last.elapsed().as_secs_f32() * 1000.0;
+            if quiet >= self.tuning.zoom_ribbon_release_ms.max(1.0) {
+                self.ribbon_release();
+            } else {
+                self.motion = true;
+            }
+        }
+        if let Some(s) = &mut self.ribbon_settle {
+            s.t += (1.0 - s.t) * alpha(self.tuning.zoom_ribbon_settle, dt);
+            if s.t >= 0.995 {
+                let s = self.ribbon_settle.take().expect("settle in flight");
+                self.ribbon_install(s.pack.starts, s.pack.zoom, Some(s.scroll));
+            } else {
+                self.motion = true;
+            }
+        }
+    }
+
     fn max_scroll(&self, lay: &Layout) -> f32 {
         (self.content_height(lay) - self.viewport.height).max(0.0)
     }
@@ -1349,6 +2061,7 @@ impl Switchblade {
         // reflow[i] now names a different clip — drop it so the wrap table
         // reseeds cleanly (the shuffle rides the crossfade, not the wrap).
         self.reflow.clear();
+        self.ribbon_reset(); // the ribbon packing is index-keyed too
         let remap = |i: &mut usize| {
             if let Some(&ni) = new_of_old.get(*i) {
                 *i = ni;
@@ -1958,6 +2671,7 @@ impl Switchblade {
         self.chapters = None; // the bar's clip context is gone
         self.clips.clear();
         self.reflow.clear(); // index-keyed wrap state; the siblings restream
+        self.ribbon_reset(); // ditto for the ribbon packing
         self.grid_rev = self.grid_rev.wrapping_add(1);
         self.index.clear();
         self.slots.fill(None);
@@ -2351,9 +3065,13 @@ impl Switchblade {
             .max(Instant::now() + Duration::from_secs_f32(secs));
     }
 
+    /// Keyboard/programmatic zoom. It has no grip to hold the grid by, so
+    /// it also returns the layout to the plain justified packing — the way
+    /// back to a clean grid after any amount of ribbon browsing.
     fn set_zoom(&mut self, target: f32) {
         let t = &self.tuning;
         self.zoom_target = target.clamp(t.zoom_min, t.zoom_max);
+        self.ribbon_reset();
     }
 
     // --- per-frame ---
@@ -2469,13 +3187,18 @@ impl Switchblade {
         // tail. The fixed grid keeps the spring + crossfade.
         let old_zoom = self.zoom;
         let wrap_mode = ui && t.zoom_wrap && t.grid_layout == GridStyle::Flexible;
-        if wrap_mode {
+        // A live ribbon owns the zoom outright (the pinch sets it) and its
+        // grip — not the camera — is what holds the view still.
+        let ribboning = self.ribbon.is_some() || self.ribbon_settle.is_some();
+        if ribboning {
+            // leave zoom where the gesture put it
+        } else if wrap_mode {
             self.zoom = self.zoom_target;
         } else {
             self.zoom += (self.zoom_target - self.zoom) * a_of(t.zoom_smoothing);
         }
         let zoomed = (self.zoom - old_zoom).abs() > 1e-5;
-        if zoomed {
+        if zoomed && !ribboning {
             let old_h = self.content_height(&self.layout_with(old_zoom));
             let new_h = self.content_height(&self.layout_with(self.zoom));
             if old_h > 0.0 {
@@ -2485,6 +3208,14 @@ impl Switchblade {
             }
         }
 
+        // Ribbon pinch: end a gesture that has gone quiet and advance its
+        // release morph BEFORE the layout is captured — installing the
+        // packing changes the layout, and a frame that captured the old
+        // one would seed the wrap table with stale rects and then glide
+        // the whole grid to the new ones (a visible slide after the
+        // gesture had already come to rest).
+        self.step_ribbon(dt);
+
         let lay = self.layout();
 
         // Optional extra inertia (off by default; macOS supplies momentum).
@@ -2493,9 +3224,15 @@ impl Switchblade {
             self.scroll_vel *= t.pan_inertia.powf(dt * 60.0);
         }
 
-        // Rubber-band the target back into bounds.
+        // Rubber-band the target back into bounds. A ribbon gesture pins
+        // the view by its grip instead: the content height changes under
+        // every pinch frame, and letting the clamp chase it would slide
+        // the whole grid out from under the fingers.
         let max = self.max_scroll(&lay);
-        if self.scroll_target < 0.0 {
+        if ribboning {
+            self.scroll_target = self.scroll;
+            self.scroll_vel = 0.0;
+        } else if self.scroll_target < 0.0 {
             self.scroll_target *= 1.0 - alpha(t.rubber_band, dt);
             if self.scroll_target > -0.5 {
                 self.scroll_target = 0.0;
@@ -2519,7 +3256,10 @@ impl Switchblade {
         // cold-spawned a hover decoder for a clip nobody can see,
         // stealing CPU and the media engine from the video being watched.
         let modal = self.quickview || self.fullview;
-        let hover_now = if modal || self.chapters.is_some() {
+        // No hover while pinching: the fingers are driving a gesture, not
+        // resting on a tile, and the tile under them changes as the grid
+        // moves — which cold-spawned a hover decoder per frame.
+        let hover_now = if modal || self.chapters.is_some() || self.ribbon.is_some() {
             None
         } else {
             self.tile_at(&lay, self.cursor.0, self.cursor.1)
@@ -2582,7 +3322,12 @@ impl Switchblade {
         self.motion = motion;
 
         // Per-clip zoom-reflow: smooth re-justify glides + row-wrap events.
-        self.step_reflow(dt, &lay, zoomed);
+        // Suppressed while a ribbon is in flight — the ribbon rows ARE the
+        // animation, and a glide chasing the justified layout underneath
+        // would fight them.
+        if self.ribbon.is_none() && self.ribbon_settle.is_none() {
+            self.step_reflow(dt, &lay, zoomed);
+        }
 
         // Quickview filmstrip slides with the same curve as keyboard moves.
         // While a scroll/scrub gesture is live the strip eases toward the
@@ -2901,11 +3646,7 @@ impl Switchblade {
                 .drain_budget_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let budget = if presenting {
-            MEDIA_UPLOAD_BUDGET_LIVE
-        } else {
-            MEDIA_UPLOAD_BUDGET
-        };
+        let budget = self.media_upload_budget(presenting);
         while uploads.len() < budget {
             let Some(result) = self.media.try_recv() else {
                 break;
@@ -3121,6 +3862,9 @@ impl Switchblade {
         // behavior) made every refocus pay a cold respawn that visibly
         // jumped the video back to the thumbnail's frame.
         let paused_live = paused && !self.demo && self.level().live();
+        // The grid is mid-gesture (ribbon pinch or its settle): every frame
+        // repacks it, so any neighbour derived from the layout is noise.
+        let ribboning = self.ribbon.is_some() || self.ribbon_settle.is_some();
         let delay_ms = self.tuning.live_delay_ms;
         // Attention mode (PLAN.md §15 spike): the hires lane follows
         // attention — the hovered tile while mousing, the selection while
@@ -3207,7 +3951,7 @@ impl Switchblade {
         // stalled by design, so keeping them costs nothing and refocus
         // finds every movement destination still warm. Fresh spawns
         // stay gated on `live_on` below.
-        if (live_on || paused_live) && !pending {
+        if (live_on || paused_live) && !pending && !ribboning {
             let s = self.selected;
             let n = self.clips.len();
             // The "down" destination: the horizontally nearest tile in
@@ -3340,7 +4084,17 @@ impl Switchblade {
                 self.live_sel = self.start_sel_live(i, sb_media::Lane::Selected, resume);
             }
         }
-        self.warm.retain(|w| warm_targets.contains(&w.clip));
+        // A ribbon pinch moves the zoom EVERY frame, so the layout — and
+        // with it the "down" neighbour — is different on every one. Left
+        // alone, the pool dropped and respawned a decoder per frame for
+        // the whole gesture (a VT session and its thread each time), which
+        // is what ground the machine down mid-pinch. The targets are also
+        // computed from the justified layout, which isn't even what the
+        // ribbon is drawing. So hold the pool exactly as it is until the
+        // grid settles, like the D-swap shield above.
+        if !ribboning {
+            self.warm.retain(|w| warm_targets.contains(&w.clip));
+        }
         // New warm decoders spawn only once the selection has settled AND
         // the selected stream has its first frame on screen — the clip
         // being watched owns the CPU until then (user attention first).
@@ -3766,8 +4520,48 @@ impl Switchblade {
         if let Some((_, _, frozen)) = &self.frozen_grid {
             tiles = frozen.clone();
         } else if backdrop_grid {
-            for row in first_row..=last_row {
-                for i in self.row_range(&lay, row) {
+            // While a ribbon pinch (or its release morph) is up, the rows it
+            // lays out ARE the frame — a clip straddling a row boundary
+            // appears in both rows, and its second copy rides the same slot
+            // the wrap's exit copy uses. Otherwise: the visible layout rows.
+            let ribbon_rows = self.ribbon_rows();
+            // Borrowed out of self so the draw loop can read them freely,
+            // and handed back below — the point is that they keep their
+            // allocation instead of being rebuilt every frame.
+            let mut ribbon_main = std::mem::take(&mut self.ribbon_main);
+            let mut ribbon_second = std::mem::take(&mut self.ribbon_second);
+            let draw: Vec<usize> = match &ribbon_rows {
+                Some(rows) => {
+                    if ribbon_main.len() != self.clips.len() {
+                        ribbon_main.clear();
+                        ribbon_second.clear();
+                        ribbon_main.resize(self.clips.len(), None);
+                        ribbon_second.resize(self.clips.len(), None);
+                    }
+                    let mut order = Vec::new();
+                    for row in rows {
+                        for it in &row.items {
+                            let rect = [it.x, row.y + self.scroll, it.w, row.h];
+                            let Some(slot) = ribbon_main.get_mut(it.clip) else {
+                                continue;
+                            };
+                            match slot {
+                                None => {
+                                    *slot = Some(rect);
+                                    order.push(it.clip);
+                                }
+                                Some(_) => ribbon_second[it.clip] = Some(rect),
+                            }
+                        }
+                    }
+                    order
+                }
+                None => (first_row..=last_row)
+                    .flat_map(|r| self.row_range(&lay, r))
+                    .collect(),
+            };
+            {
+                for &i in &draw {
                     // Displayed rect: the smoothed reflow rect (so a zoom
                     // re-justify glides) when active, else the raw layout.
                     // A wrapping clip draws its enter copy here, slid in from
@@ -3780,7 +4574,15 @@ impl Switchblade {
                         .filter(|_| reflow_on)
                         .filter(|r| r.init);
                     let mut wrap_exit: Option<[f32; 4]> = None;
-                    let (tx, ty, tw_g, th_g) = match rf {
+                    let (tx, ty, tw_g, th_g) = if let Some(r) =
+                        ribbon_main.get(i).copied().flatten()
+                    {
+                        // Ribbon frame: this row's slot, plus the second
+                        // copy when the clip straddles a row boundary.
+                        wrap_exit = ribbon_second.get(i).copied().flatten();
+                        (r[0], r[1], r[2], r[3])
+                    } else {
+                        match rf {
                         Some(r) => {
                             let vw = self.viewport.width;
                             let gp = t.gap;
@@ -3809,6 +4611,7 @@ impl Switchblade {
                             }
                         }
                         None => self.tile_rect(&lay, i),
+                        }
                     };
                     let clip = &self.clips[i];
 
@@ -4049,6 +4852,19 @@ impl Switchblade {
                     }
                 }
             }
+            // Reset only what this frame wrote, then hand the buffers
+            // back: clearing the whole table would be O(library) again.
+            for &i in &draw {
+                if let Some(slot) = ribbon_main.get_mut(i) {
+                    *slot = None;
+                }
+                if let Some(slot) = ribbon_second.get_mut(i) {
+                    *slot = None;
+                }
+            }
+            self.ribbon_main = ribbon_main;
+            self.ribbon_second = ribbon_second;
+            drop(ribbon_rows);
             tiles.extend(hovered_group);
             tiles.extend(selected_group);
             if modal {
@@ -4746,6 +5562,43 @@ impl App for Switchblade {
                 }
                 self.modal_pinch_accum = 0.0;
                 let factor = 1.0 + delta * self.tuning.pinch_sensitivity;
+                // Ribbon mode: the pinch grips the strip and drives the
+                // zoom directly — no spring, no scroll re-anchor. The
+                // gripped chip stays under the fingers, so there is
+                // nothing left for a camera anchor to correct.
+                if self.ribbon_on() {
+                    if self.ribbon.is_none() {
+                        // A pinch arriving mid-settle takes over from where
+                        // the morph got to, rather than fighting it.
+                        if let Some(s) = self.ribbon_settle.take() {
+                            self.ribbon_install(s.pack.starts, s.pack.zoom, Some(s.scroll));
+                        }
+                        // Only the grip needs a layout, and only once per
+                        // gesture: every pinch event moves the zoom, so a
+                        // layout() here is a guaranteed O(library) rebuild.
+                        let lay = self.layout();
+                        self.ribbon = self.ribbon_grip(&lay);
+                    }
+                    if self.ribbon.is_some() {
+                        let t = &self.tuning;
+                        let z = (self.zoom * factor.max(0.01)).clamp(t.zoom_min, t.zoom_max);
+                        // Only a pinch that actually MOVES the zoom keeps
+                        // the gesture alive. macOS delivers zero-delta
+                        // magnification events around a gesture (and at the
+                        // zoom clamps every event is a no-op), and letting
+                        // those refresh the timer left the gesture — and
+                        // the ribbon layout it draws — live indefinitely.
+                        if (z - self.zoom).abs() > 1e-6 {
+                            self.zoom = z;
+                            self.zoom_target = z;
+                            if let Some(g) = &mut self.ribbon {
+                                g.last = Instant::now();
+                            }
+                        }
+                        self.motion = true;
+                        return;
+                    }
+                }
                 self.set_zoom(self.zoom_target * factor.max(0.01));
             }
             InputEvent::CursorMoved { x, y } => {
@@ -4810,6 +5663,13 @@ impl App for Switchblade {
             }
             InputEvent::Focus { focused } => {
                 self.focused = focused;
+                // Losing focus ends a pinch: the fingers are gone, and a
+                // gesture left live would hold the grid in its mid-flight
+                // ribbon form (and keep the loop hot) for as long as the
+                // user is away — an occluded window still runs frames.
+                if !focused && self.ribbon.is_some() {
+                    self.ribbon_release();
+                }
             }
             InputEvent::MouseDown { x, y, mods } => {
                 // In fullview: an open chapter bar grabs first — a chip
@@ -7313,6 +8173,772 @@ mod tests {
         let lay = app.layout();
         assert_eq!(app.row_of(&lay, app.selected), 0, "moved back to row 0");
         assert_eq!(Some(app.selected), app.nearest_in_row(&lay, 0, cx));
+    }
+
+    /// Build an app with a demo library, fully spawned, ready to pinch.
+    #[cfg(test)]
+    fn ribbon_app(vp: Viewport) -> Switchblade {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::Minimal), // ui() true, so the ribbon runs
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let past = Instant::now() - Duration::from_secs(5);
+        for c in &mut app.clips {
+            c.spawned = past;
+        }
+        let _ = app.frame(0.016, vp);
+        app
+    }
+
+    /// Rows the viewport can show at the current layout (a loose bound for
+    /// "the morph didn't carry the whole library").
+    #[cfg(test)]
+    fn flex_rows_on_screen(app: &Switchblade) -> usize {
+        let lay = app.layout();
+        let (first, last) = app.visible_rows(&lay, 0);
+        last - first + 1
+    }
+
+    /// The rules a ribbon frame must never break, at ANY point of a pinch
+    /// or its release morph: chips in a row are joined to their neighbours
+    /// by exactly one gap (so they never overlap and never leave a hole),
+    /// every chip in a row is a full member of it (the row's height, its
+    /// own aspect), and consecutive rows are one gap apart. A chip may
+    /// appear twice — and only twice — while it straddles a boundary.
+    #[cfg(test)]
+    fn assert_ribbon_invariants(app: &Switchblade, rows: &[RibbonRow], what: &str) {
+        let g = app.tuning.gap;
+        let vw = app.viewport.width;
+        for (r, row) in rows.iter().enumerate() {
+            assert!(!row.items.is_empty(), "{what}: row {r} is empty");
+            for w in row.items.windows(2) {
+                // A copy that has left the row exits through the window
+                // edge, so it is allowed to part company with its old
+                // neighbour — but only once it is fully out of sight.
+                let gone = |it: &RibbonItem| it.x + it.w <= 0.01 || it.x >= vw - 0.01;
+                if gone(&w[0]) || gone(&w[1]) {
+                    continue;
+                }
+                let join = w[1].x - (w[0].x + w[0].w);
+                assert!(
+                    (join - g).abs() < 0.05,
+                    "{what}: row {r} join {join} between clips {} and {}",
+                    w[0].clip,
+                    w[1].clip,
+                );
+            }
+            for it in &row.items {
+                let want = app.chip_aspect(it.clip) * row.h;
+                assert!(
+                    (it.w - want).abs() < 0.05,
+                    "{what}: row {r} clip {} is {} wide, not its aspect at the row height {want}",
+                    it.clip,
+                    it.w,
+                );
+            }
+            if r > 0 {
+                let vgap = row.y - (rows[r - 1].y + rows[r - 1].h);
+                assert!(
+                    vgap > -0.05 && vgap < g + 0.05,
+                    "{what}: rows {}/{r} are {vgap} apart (overlap or dead band)",
+                    r - 1,
+                );
+            }
+        }
+        let mut seen = std::collections::HashMap::new();
+        for row in rows {
+            for it in &row.items {
+                *seen.entry(it.clip).or_insert(0) += 1;
+            }
+        }
+        for (clip, n) in seen {
+            assert!(n <= 2, "{what}: clip {clip} drawn {n}× (more than a split)");
+        }
+    }
+
+    /// A pinch grips the strip at the chip under the cursor and holds it
+    /// there: through a long zoom the gripped chip stays pinned under the
+    /// fingers, and every frame of the gesture obeys the row rules.
+    #[test]
+    fn ribbon_pinch_holds_the_gripped_chip_under_the_cursor() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        assert!(app.ribbon_on(), "flexible + minimal animation pinches ribbon");
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 360.0 });
+        let gripped = {
+            let lay = app.layout();
+            app.tile_at(&lay, 640.0, 360.0).expect("a chip at the cursor")
+        };
+
+        for k in 0..40 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+            let grip = app.ribbon.as_ref().expect("the gesture holds its grip");
+            assert_eq!(grip.clip, gripped, "the grip stays on the chip it took");
+            let (rows, _) = app.ribbon_walk(grip, app.zoom, false);
+            assert_ribbon_invariants(&app, &rows, &format!("pinch step {k}"));
+            // The gripped chip is exactly where the fingers are.
+            let held = rows
+                .iter()
+                .find_map(|r| {
+                    r.items
+                        .iter()
+                        .find(|it| it.clip == gripped)
+                        .map(|it| (it.x + grip.fx * it.w, r.y + grip.fy * r.h))
+                })
+                .expect("the gripped chip is drawn");
+            assert!(
+                (held.0 - grip.cx).abs() < 0.05 && (held.1 - grip.cy).abs() < 0.05,
+                "step {k}: gripped chip drifted to {held:?}, grip is at ({}, {})",
+                grip.cx,
+                grip.cy,
+            );
+        }
+        assert!(app.zoom > 1.5, "the pinch actually zoomed: {}", app.zoom);
+    }
+
+    /// Releasing settles onto the NEAREST SAFE layout instead of slinging
+    /// rows back to a justified packing: the morph obeys the row rules at
+    /// every step, and at rest every clip sits in exactly one row with no
+    /// chip clipped by either window edge. Rows may keep slack — that is
+    /// the point: nothing is dragged sideways to left-align them.
+    #[test]
+    fn ribbon_release_settles_on_a_safe_layout() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 500.0, y: 300.0 });
+        for _ in 0..30 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+        }
+        // The gesture goes quiet: the next frame past the release window
+        // ends it and starts the morph.
+        if let Some(g) = &mut app.ribbon {
+            g.last = Instant::now() - Duration::from_millis(400);
+        }
+        let _ = app.frame(0.016, vp);
+        assert!(app.ribbon.is_none(), "the quiet gesture ended");
+        let settle = app.ribbon_settle.as_ref().expect("a release morph runs");
+        assert_eq!(
+            settle.from.len(),
+            settle.to.len(),
+            "the morph maps rows one to one"
+        );
+        assert!(
+            settle.from.len() <= flex_rows_on_screen(&app) + 2,
+            "the morph only carries the rows on screen"
+        );
+        for step in 0..60 {
+            let rows = app.ribbon_rows().expect("morph rows");
+            assert_ribbon_invariants(&app, &rows, &format!("settle step {step}"));
+            let _ = app.frame(0.016, vp);
+            if app.ribbon_settle.is_none() {
+                break;
+            }
+        }
+        assert!(app.ribbon_settle.is_none(), "the morph landed");
+        let pack = app.ribbon_pack.as_ref().expect("its packing was installed");
+        assert_eq!(pack.starts.first(), Some(&0), "the packing covers clip 0");
+        assert!(
+            pack.starts.windows(2).all(|w| w[0] < w[1]),
+            "rows partition the library in order"
+        );
+
+        // At rest: one row each, nothing clipped, rows still joined.
+        let lay = app.layout();
+        let flex = lay.flex.clone().expect("the packing is the layout now");
+        let g = app.tuning.gap;
+        let mut count = vec![0u32; app.clips.len()];
+        for row in &flex.rows {
+            for i in row.start..row.end {
+                count[i] += 1;
+                let (x, _, w, _) = app.tile_rect(&lay, i);
+                assert!(
+                    x >= g - 0.05 && x + w <= vp.width - g + 0.05,
+                    "clip {i} is clipped by a window edge at rest (x={x} w={w})"
+                );
+            }
+            for j in 1..row.x.len() {
+                let join = row.x[j] - (row.x[j - 1] + row.w[j - 1]);
+                assert!((join - g).abs() < 0.05, "resting row join {join}");
+            }
+        }
+        assert!(
+            count.iter().all(|&n| n == 1),
+            "every clip rests in exactly one row"
+        );
+    }
+
+    /// The settled packing is a FIXED POINT: taking a fresh grip on it and
+    /// walking the ribbon at the same zoom reproduces the resting layout
+    /// exactly, so a new pinch starts without a jump. (The mockup's early
+    /// versions failed here — a ragged resting row made the walk pull the
+    /// next chip up on the gesture's first frame.)
+    #[test]
+    fn ribbon_settled_layout_is_a_fixed_point() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 700.0, y: 420.0 });
+        for _ in 0..25 {
+            app.event(InputEvent::Pinch { delta: -0.02 }); // zoom out
+            let _ = app.frame(0.016, vp);
+        }
+        if let Some(g) = &mut app.ribbon {
+            g.last = Instant::now() - Duration::from_millis(400);
+        }
+        for _ in 0..80 {
+            let _ = app.frame(0.016, vp);
+            if app.ribbon_settle.is_none() && app.ribbon.is_none() {
+                break;
+            }
+        }
+        assert!(app.ribbon_pack.is_some(), "a packing settled");
+
+        // A fresh grip anywhere must reproduce the layout it grips.
+        for &(cx, cy) in &[(300.0, 200.0), (900.0, 500.0), (1270.0, 90.0)] {
+            app.event(InputEvent::CursorMoved { x: cx, y: cy });
+            let lay = app.layout();
+            let grip = app.ribbon_grip(&lay).expect("a grip");
+            let (rows, _) = app.ribbon_walk(&grip, app.zoom, false);
+            assert_ribbon_invariants(&app, &rows, "fresh grip");
+            for row in &rows {
+                for it in &row.items {
+                    let (x, y, w, _) = app.tile_rect(&lay, it.clip);
+                    assert!(
+                        (it.x - x).abs() < 0.05
+                            && (it.w - w).abs() < 0.05
+                            && (row.y + app.scroll - y).abs() < 0.05,
+                        "grip at ({cx}, {cy}) moved clip {} on its first frame",
+                        it.clip,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Many pinches in a row, gripped all over the window and pulled both
+    /// ways, never break the row rules and never leave a clip clipped,
+    /// duplicated or lost at rest — and every settled layout stays a fixed
+    /// point for the next grip. This is the shape of test that caught both
+    /// real bugs in the prototype (a stale grip jerking the row sideways,
+    /// and a row emptying into a dead band), so it runs the app the way a
+    /// user actually browses rather than one clean gesture.
+    #[test]
+    fn ribbon_survives_a_long_run_of_pinches() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        let mut seed: u32 = 0x9e37_79b9;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        for g in 0..24 {
+            app.event(InputEvent::CursorMoved {
+                x: 20.0 + rnd() * (vp.width - 40.0),
+                y: 20.0 + rnd() * (vp.height - 40.0),
+            });
+            let dir = if rnd() < 0.5 { 0.02 } else { -0.02 };
+            let steps = 3 + (rnd() * 20.0) as usize;
+            for k in 0..steps {
+                app.event(InputEvent::Pinch { delta: dir });
+                let _ = app.frame(0.016, vp);
+                if let Some(grip) = &app.ribbon {
+                    let (rows, _) = app.ribbon_walk(grip, app.zoom, false);
+                    assert_ribbon_invariants(&app, &rows, &format!("run {g} pinch {k}"));
+                }
+            }
+            // Let go and let it settle.
+            if let Some(grip) = &mut app.ribbon {
+                grip.last = Instant::now() - Duration::from_millis(400);
+            }
+            for _ in 0..120 {
+                let _ = app.frame(0.016, vp);
+                if let Some(rows) = app.ribbon_rows() {
+                    assert_ribbon_invariants(&app, &rows, &format!("run {g} settle"));
+                } else {
+                    break;
+                }
+            }
+            assert!(app.ribbon.is_none() && app.ribbon_settle.is_none());
+
+            // At rest: a partition of the library, nothing clipped.
+            let lay = app.layout();
+            let flex = lay.flex.clone().expect("flexible rows");
+            let gap = app.tuning.gap;
+            let mut count = vec![0u32; app.clips.len()];
+            for row in &flex.rows {
+                for i in row.start..row.end {
+                    count[i] += 1;
+                }
+                for (j, (&x, &w)) in row.x.iter().zip(&row.w).enumerate() {
+                    assert!(
+                        x >= gap - 0.05 && x + w <= vp.width - gap + 0.05,
+                        "run {g}: clip {} is clipped at rest",
+                        row.start + j
+                    );
+                }
+            }
+            assert!(
+                count.iter().all(|&n| n == 1),
+                "run {g}: every clip rests in exactly one row"
+            );
+
+            // ...and a fresh grip on it moves nothing.
+            app.event(InputEvent::CursorMoved {
+                x: 20.0 + rnd() * (vp.width - 40.0),
+                y: 20.0 + rnd() * (vp.height - 40.0),
+            });
+            let lay = app.layout();
+            if let Some(grip) = app.ribbon_grip(&lay) {
+                let (rows, _) = app.ribbon_walk(&grip, app.zoom, false);
+                for row in &rows {
+                    for it in &row.items {
+                        let (x, y, w, _) = app.tile_rect(&lay, it.clip);
+                        assert!(
+                            (it.x - x).abs() < 0.05
+                                && (it.w - w).abs() < 0.05
+                                && (row.y + app.scroll - y).abs() < 0.05,
+                            "run {g}: a fresh grip moved clip {}",
+                            it.clip
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The last frame of the release morph and the first frame after it
+    /// must draw the same grid. Any difference is a snap at the handoff —
+    /// the class of bug that put chip 0 back against the left margin the
+    /// moment the grid came to rest.
+    #[test]
+    fn ribbon_handoff_does_not_move_the_grid() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 360.0 });
+        for _ in 0..30 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+        }
+        if let Some(g) = &mut app.ribbon {
+            g.last = Instant::now() - Duration::from_millis(400);
+        }
+        let _ = app.frame(0.016, vp);
+        // Last frame the morph drew, keeping each chip's ON-SCREEN copy
+        // (a straddler's other copy is deliberately parked past the edge).
+        let mut last: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
+        for _ in 0..200 {
+            let Some(rows) = app.ribbon_rows() else { break };
+            last.clear();
+            let mut vis: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+            for row in &rows {
+                for it in &row.items {
+                    // How much of this copy the window actually shows; a
+                    // departing copy is a sliver at the edge, so the copy
+                    // that landed always wins.
+                    let seen = (it.x + it.w).min(vp.width) - it.x.max(0.0);
+                    if seen > 2.0 && seen > *vis.get(&it.clip).unwrap_or(&0.0) {
+                        vis.insert(it.clip, seen);
+                        // Viewport space: installing the packing also
+                        // rebases the scroll, so content coords are not
+                        // comparable across the handoff — what must not
+                        // move is where the chip sits on screen.
+                        last.insert(it.clip, (it.x, row.y));
+                    }
+                }
+            }
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(!last.is_empty(), "the morph drew something");
+        assert!(app.ribbon_pack.is_some(), "and installed its packing");
+        let lay = app.layout();
+        for (&clip, &(x, y)) in &last {
+            let (tx, ty_content, _, _) = app.tile_rect(&lay, clip);
+            let ty = ty_content - app.scroll;
+            assert!(
+                (tx - x).abs() < 1.5 && (ty - y).abs() < 1.5,
+                "handoff moved clip {clip} from ({x}, {y}) to ({tx}, {ty})"
+            );
+        }
+    }
+
+    /// A thumb landing changes a clip's aspect and bumps `grid_rev`. The
+    /// settled packing must absorb that in place — a row that no longer
+    /// fits hands a chip down — and NOT collapse back to the justified
+    /// packing, which would re-align every row and fling chip 0 to the
+    /// left margin a moment after the grid settled. (The demo library
+    /// never streams thumbs, so only an explicit arrival catches this.)
+    #[test]
+    fn ribbon_packing_survives_a_thumb_arrival() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 900.0, y: 300.0 });
+        for _ in 0..30 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+        }
+        if let Some(g) = &mut app.ribbon {
+            g.last = Instant::now() - Duration::from_millis(400);
+        }
+        for _ in 0..200 {
+            let _ = app.frame(0.016, vp);
+            if app.ribbon_settle.is_none() {
+                break;
+            }
+        }
+        let starts = app
+            .ribbon_pack
+            .as_ref()
+            .expect("a packing settled")
+            .starts
+            .clone();
+        let indent_before = {
+            let lay = app.layout();
+            let flex = lay.flex.clone().expect("flexible rows");
+            flex.rows[0].x[0]
+        };
+
+        // Thumbs land: aspects change, grid_rev bumps, layout rebuilds.
+        for i in [3usize, 9, 17, 40] {
+            app.clips[i].aspect = Some(2.35);
+        }
+        app.grid_rev = app.grid_rev.wrapping_add(1);
+        app.flex_cache.borrow_mut().take();
+        let _ = app.frame(0.016, vp);
+
+        assert!(
+            app.ribbon_pack.is_some(),
+            "the packing survives an arrival instead of being dropped"
+        );
+        let lay = app.layout();
+        let flex = lay.flex.clone().expect("flexible rows");
+        // Still the ribbon packing (healed, not re-justified): the rows it
+        // settled with are still there, and nothing is clipped.
+        assert_eq!(
+            flex.rows[0].start, starts[0],
+            "row 0 keeps the membership the gesture left it"
+        );
+        let g = app.tuning.gap;
+        for row in &flex.rows {
+            for (j, (&x, &w)) in row.x.iter().zip(&row.w).enumerate() {
+                assert!(
+                    x >= g - 0.05 && x + w <= vp.width - g + 0.05,
+                    "clip {} is clipped after the arrival",
+                    row.start + j
+                );
+            }
+        }
+        // The symptom to catch is HORIZONTAL: a re-justify slams row 0
+        // back against the left margin. Rows changing height (and so the
+        // rows below shifting down) is the reflow an arrival always
+        // caused and is not what the user is seeing.
+        let indent_after = flex.rows[0].x[0];
+        assert!(
+            (indent_after - indent_before).abs() < 1.0,
+            "row 0 slid from an indent of {indent_before} to {indent_after} on an arrival"
+        );
+    }
+
+    /// A pinch on a BIG library must stay interactive. The release walks
+    /// the whole strip to quantize it, so anything quadratic in there
+    /// freezes the main thread for seconds at every gesture — which is
+    /// what prepending rows one at a time into a growing Vec did (and it
+    /// read as the app hanging, since an occluded window still runs the
+    /// frame loop). The demo library is far too small to expose it.
+    #[test]
+    fn ribbon_release_stays_linear_on_a_big_library() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        // ~12k clips, the scale of a real scraped library.
+        let now = Instant::now() - Duration::from_secs(5);
+        for i in app.clips.len()..12_000 {
+            app.clips.push(Clip {
+                path: PathBuf::from(format!("big/clip_{i:05}.mp4")),
+                readable: true,
+                cloud: false,
+                cached: true,
+                spawned: now,
+                scale: 1.0,
+                emph: 0.0,
+                thumb: Thumb::Failed,
+                anim: Thumb::Failed,
+                aspect: Some([16.0 / 9.0, 9.0 / 16.0, 1.0, 2.35, 4.0 / 3.0][i % 5]),
+            });
+        }
+        app.grid_rev = app.grid_rev.wrapping_add(1);
+        app.flex_cache.borrow_mut().take();
+        let _ = app.frame(0.016, vp);
+
+        // Grip well down the library so the walk has to climb thousands of
+        // rows back to clip 0 — the quadratic's worst case.
+        app.scroll = 40_000.0;
+        app.scroll_target = app.scroll;
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 400.0 });
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+        }
+        let per_frame = t0.elapsed().as_secs_f32() / 20.0;
+        if let Some(g) = &mut app.ribbon {
+            g.last = Instant::now() - Duration::from_millis(400);
+        }
+        let t1 = Instant::now();
+        let _ = app.frame(0.016, vp); // the release frame: full walk + quantize
+        let release = t1.elapsed();
+        let mut frames = 0;
+        while app.ribbon_settle.is_some() && frames < 300 {
+            let _ = app.frame(0.016, vp);
+            frames += 1;
+        }
+        // The packing must be a clean partition with nothing clipped, at
+        // the scale where a degenerate row is easy to miss by eye.
+        {
+            let lay = app.layout();
+            let flex = lay.flex.clone().expect("flexible rows");
+            let gap = app.tuning.gap;
+            let mut covered = 0usize;
+            let mut over = 0usize;
+            for row in &flex.rows {
+                assert!(row.end > row.start, "empty row");
+                assert_eq!(row.start, covered, "rows must partition the library in order");
+                covered = row.end;
+                let right = row.x.last().unwrap() + row.w.last().unwrap();
+                if right > vp.width - gap + 0.5 || row.x[0] < gap - 0.5 { over += 1; }
+            }
+            assert_eq!(covered, app.clips.len(), "the packing covers every clip once");
+            assert_eq!(over, 0, "{over} rows overflow the window at rest");
+        }
+        assert!(app.ribbon_settle.is_none(), "the settle finished");
+        assert!(
+            app.ribbon_pack.is_some(),
+            "and installed a packing for 12k clips"
+        );
+        // Generous bounds: the point is catching an O(n²) blowup (which
+        // took SECONDS here), not policing exact timings.
+        assert!(
+            release < Duration::from_millis(400),
+            "the release frame took {release:?} on 12k clips"
+        );
+        assert!(
+            per_frame < 0.05,
+            "gesture frames averaged {per_frame}s on 12k clips"
+        );
+    }
+
+    /// A gesture must always end on its own, and the grid must come back
+    /// to its plain layout. A ribbon left live keeps drawing its mid-flight
+    /// form (rows carrying different edge offsets — the "brick" look) and
+    /// keeps the frame loop hot, which on an unfocused window burns a core
+    /// with nothing on screen. Three ways it could stick, all covered here:
+    /// the release timer never firing, zero-delta pinches (macOS sends them
+    /// around a gesture, and every event is a no-op at the zoom clamps)
+    /// refreshing it forever, and losing focus mid-pinch.
+    #[test]
+    fn ribbon_gesture_always_ends() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        // 1. Real timing: stop pinching and let the wall clock do the work.
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 360.0 });
+        for _ in 0..15 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(app.ribbon.is_some(), "the pinch took a grip");
+        std::thread::sleep(Duration::from_millis(220));
+        for _ in 0..200 {
+            let _ = app.frame(0.016, vp);
+            if app.ribbon.is_none() && app.ribbon_settle.is_none() {
+                break;
+            }
+        }
+        assert!(
+            app.ribbon_rows().is_none(),
+            "the gesture ended and the grid is back to its layout"
+        );
+        {
+            let lay = app.layout();
+            let mut worst = 0.0f32; let mut who = 0;
+            for (i, r) in app.reflow.iter().enumerate().filter(|(_, r)| r.init) {
+                let (x, y, w, h) = app.tile_rect(&lay, i);
+                for (c, t) in r.rect.iter().zip([x, y, w, h]) {
+                    if (t - c).abs() > worst { worst = (t - c).abs(); who = i; }
+                }
+            }
+            eprintln!("DBG motion={} zoom_d={} scroll_d={} reflow_init={} worst={worst} clip={who} wraps={}",
+                app.motion, (app.zoom_target-app.zoom).abs(), (app.scroll_target-app.scroll).abs(),
+                app.reflow.iter().filter(|r| r.init).count(),
+                app.reflow.iter().filter(|r| r.wrap.is_some()).count());
+        }
+        // The zoom changed, so the selection's scale spring legitimately
+        // re-targets; what matters is that the loop returns to idle. Wake
+        // deadlines are wall-clock, so a tight frame loop has to let real
+        // time pass or it measures its own compression.
+        let mut settled = false;
+        for _ in 0..140 {
+            std::thread::sleep(Duration::from_millis(16));
+            let f = app.frame(0.016, vp);
+            if !f.animating {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the loop went back to idle after the gesture");
+
+        // 2. Zero-delta pinches must not hold the gesture open. (Same at
+        // the zoom clamps, where every event computes the same zoom.)
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 360.0 });
+        app.event(InputEvent::Pinch { delta: 0.05 });
+        let _ = app.frame(0.016, vp);
+        let held = app.ribbon.as_ref().map(|g| g.last).expect("a grip");
+        std::thread::sleep(Duration::from_millis(20));
+        app.event(InputEvent::Pinch { delta: 0.0 });
+        assert_eq!(
+            app.ribbon.as_ref().map(|g| g.last),
+            Some(held),
+            "a zero-delta pinch does not refresh the release timer"
+        );
+
+        // 3. Losing focus mid-pinch ends it immediately.
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 360.0 });
+        for _ in 0..10 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+        }
+        assert!(app.ribbon.is_some(), "pinching");
+        app.event(InputEvent::Focus { focused: false });
+        assert!(app.ribbon.is_none(), "defocus ended the gesture");
+        for _ in 0..200 {
+            let _ = app.frame(0.016, vp);
+            if app.ribbon_settle.is_none() {
+                break;
+            }
+        }
+        assert!(
+            app.ribbon_rows().is_none(),
+            "and it settled instead of holding the ribbon layout while away"
+        );
+    }
+
+    /// A pinch pins the render loop at full rate for as long as the
+    /// fingers are down, so the media queue's per-frame upload budget has
+    /// to be squeezed while one is in flight — at the full budget that is
+    /// thousands of thumb uploads a second staged mid-gesture, which is
+    /// what locked the app up whenever the background sweep had results to
+    /// deliver (a small library, with nothing in flight, never showed it).
+    #[test]
+    fn a_pinch_squeezes_the_media_upload_budget() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        assert_eq!(
+            app.media_upload_budget(false),
+            MEDIA_UPLOAD_BUDGET,
+            "a settled grid drains the queue at full rate"
+        );
+        assert_eq!(
+            app.media_upload_budget(true),
+            MEDIA_UPLOAD_BUDGET_LIVE,
+            "a playing stream already squeezes it"
+        );
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 360.0 });
+        app.event(InputEvent::Pinch { delta: 0.02 });
+        assert!(app.ribbon.is_some(), "pinching");
+        assert_eq!(
+            app.media_upload_budget(false),
+            MEDIA_UPLOAD_BUDGET_GESTURE,
+            "a gesture squeezes it hardest"
+        );
+        // ...and through the settle, which is still the gesture's motion.
+        if let Some(g) = &mut app.ribbon {
+            g.last = Instant::now() - Duration::from_millis(400);
+        }
+        let _ = app.frame(0.016, vp);
+        assert!(app.ribbon_settle.is_some(), "settling");
+        assert_eq!(app.media_upload_budget(false), MEDIA_UPLOAD_BUDGET_GESTURE);
+        // Back to full once the grid is at rest.
+        for _ in 0..200 {
+            let _ = app.frame(0.016, vp);
+            if app.ribbon_settle.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            app.media_upload_budget(false),
+            MEDIA_UPLOAD_BUDGET,
+            "and the sweep gets its throughput back the moment it settles"
+        );
+    }
+
+    /// A keyboard zoom has no grip to hold the grid by, so it drops the
+    /// ribbon packing and returns to the justified layout (and its wrap
+    /// reflow) — the way back to a clean grid after any amount of pinching.
+    #[test]
+    fn keyboard_zoom_returns_to_the_justified_grid() {
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let mut app = ribbon_app(vp);
+        app.event(InputEvent::CursorMoved { x: 640.0, y: 360.0 });
+        for _ in 0..20 {
+            app.event(InputEvent::Pinch { delta: 0.02 });
+            let _ = app.frame(0.016, vp);
+        }
+        if let Some(g) = &mut app.ribbon {
+            g.last = Instant::now() - Duration::from_millis(400);
+        }
+        for _ in 0..80 {
+            let _ = app.frame(0.016, vp);
+            if app.ribbon_settle.is_none() {
+                break;
+            }
+        }
+        assert!(app.ribbon_pack.is_some(), "pinching left a packing");
+        app.set_zoom(1.4);
+        assert!(app.ribbon_pack.is_none(), "a keyboard zoom drops it");
+        let _ = app.frame(0.016, vp);
+        let lay = app.layout();
+        let flex = lay.flex.clone().expect("flexible rows");
+        // Justified again: every full row starts hard against the margin.
+        for row in flex.rows.iter().take(flex.rows.len().saturating_sub(1)) {
+            assert!(
+                (row.x[0] - app.tuning.gap).abs() < 0.05,
+                "the justified packing left-aligns its rows"
+            );
+        }
     }
 
     /// A zoom reflow in the flexible grid wraps the tiles that cross a row

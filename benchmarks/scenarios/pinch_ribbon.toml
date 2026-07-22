@@ -1,0 +1,67 @@
+name = "pinch_ribbon"
+
+intent = """
+Cost of a trackpad pinch in the flexible grid (the gripped-ribbon zoom).
+A real pinch is a stream of small magnification deltas, one per frame:
+each one re-lays the ribbon from the grip, and the release walks the
+WHOLE library to quantize a resting packing. So the per-frame cost of
+the gesture, and the one-off cost of the release frame, both scale with
+library size in ways a 480-tile demo never shows.
+
+Drive it at a realistic library size (`SB_DEMO_TILES=…`, default 480):
+zoom in over ~40 events, sit still long enough for the release timer to
+fire and the settle to land, then zoom back out and settle again.
+
+Read `frame_ms` (p50/p95/max) from the summary. The gesture itself has
+to stay well inside a frame budget, and the release must not show up as
+a lone multi-hundred-millisecond max — that spike is the shape of an
+O(library²) walk, which froze the main thread on a real library and
+read as the app hanging. Compare runs at two SB_DEMO_TILES values: the
+per-frame numbers should scale sub-linearly, the release roughly
+linearly.
+
+Animation is `minimal`: the ribbon needs UI tweens but no decoders, so
+what's measured is layout and frame building, not video.
+"""
+
+[setup]
+demo = true
+animation = "minimal"
+viewport = [1600, 1000]
+max_wall_s = 60.0
+
+[[step]]
+action = "wait_until"
+cond = "grid_settled"
+timeout = 10.0
+
+# Park the pointer over a chip well inside the grid: the grip needs a
+# chip, and the walk then has rows to climb in both directions.
+[[step]]
+action = "hover"
+target = "index:40"
+
+# The pinch itself: ~40 events of a plausible per-event magnification.
+[[step]]
+action = "pinch"
+delta = 0.02
+n = 40
+
+# Quiet: the release timer fires (zoom_ribbon_release_ms) and the settle
+# morph runs to completion.
+[[step]]
+action = "wait"
+secs = 1.5
+
+# ...and back out, so the run covers both directions.
+[[step]]
+action = "pinch"
+delta = -0.02
+n = 40
+
+[[step]]
+action = "wait"
+secs = 1.5
+
+[validity]
+require = ["grid_settled"]

@@ -112,6 +112,11 @@ pub struct Step {
     pub target: String,
     #[serde(default)]
     pub dy: f32,
+    /// `pinch`: magnification delta per event (winit's units; positive =
+    /// fingers apart). Repeated `n` times, one frame each, so a scenario
+    /// can drive a real gesture rather than a single jump.
+    #[serde(default)]
+    pub delta: f32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -424,6 +429,16 @@ impl Rig {
                     dy: step.dy,
                 });
                 self.tick();
+                Ok(())
+            }
+            "pinch" => {
+                // A trackpad pinch is a STREAM of small deltas, one per
+                // frame — the shape that matters for the ribbon, since
+                // each event re-lays the gesture.
+                for _ in 0..step.n.max(1) {
+                    self.app.event(InputEvent::Pinch { delta: step.delta });
+                    self.tick();
+                }
                 Ok(())
             }
             other => Err(format!("unknown action: {other}")),
