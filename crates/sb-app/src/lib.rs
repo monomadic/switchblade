@@ -1549,6 +1549,7 @@ impl Switchblade {
                 }
             }
             Action::OpenParent => self.open_parent(),
+            Action::OpenLibrary { dir } => self.open_library(dir),
             Action::JumpRandom => self.jump_random(),
             Action::ShuffleLibrary => self.shuffle_library(),
             Action::ToggleAutoSkip => {
@@ -1949,15 +1950,40 @@ impl Switchblade {
             return;
         };
         log::info!("browsing siblings of {}", path.display());
-        self.rx = Some(ingest::spawn_dir_reader(
-            dir.to_path_buf(),
-            self.notify.clone(),
-        ));
+        // Siblings: this directory's own videos, non-recursive.
+        let rx = ingest::spawn_dir_reader(dir.to_path_buf(), self.notify.clone());
+        self.swap_library(rx, Some(path));
+    }
+
+    /// `open_library` (a `[keys]` binding with an inline path): swap the
+    /// whole library to an explicit directory, streamed like a CLI path arg
+    /// — so it honours the ingest `recurse` flag (a real library dir usually
+    /// has subfolders, unlike the flat siblings view). No clip to preserve,
+    /// so the first streamed clip becomes the selection.
+    fn open_library(&mut self, dir: PathBuf) {
+        if self.demo || self.pending_reselect.is_some() {
+            return;
+        }
+        log::info!("opening library {}", dir.display());
+        let rx = ingest::spawn_args_reader(vec![dir], self.tuning.recurse, self.notify.clone());
+        self.swap_library(rx, None);
+    }
+
+    /// Tear down all index-keyed per-clip state and stream a fresh listing
+    /// in from `rx` (shared by `open_parent` and `open_library`). `reselect`
+    /// shields a clip's live stream across the churn until its path streams
+    /// back in (siblings view); `None` starts clean at the first clip.
+    fn swap_library(
+        &mut self,
+        rx: Receiver<ingest::Ingested>,
+        reselect: Option<PathBuf>,
+    ) {
+        self.rx = Some(rx);
         // All per-clip state is index-keyed; drop it and let the new
         // listing stream in (thumbs re-serve from the disk cache).
         self.chapters = None; // the bar's clip context is gone
         self.clips.clear();
-        self.reflow.clear(); // index-keyed wrap state; the siblings restream
+        self.reflow.clear(); // index-keyed wrap state; the new listing restreams
         self.grid_rev = self.grid_rev.wrapping_add(1);
         self.index.clear();
         self.slots.fill(None);
@@ -1968,7 +1994,7 @@ impl Switchblade {
         self.hover_resume = None; // index-keyed; the indices are gone
         self.marked.clear(); // index-keyed; the indices are gone
         self.selected = 0;
-        self.pending_reselect = Some(path);
+        self.pending_reselect = reselect;
         // Fade the old grid out over the new one, like the zoom reflow.
         if !self.last_tiles.is_empty() {
             self.transition = Some((std::mem::take(&mut self.last_tiles), Instant::now()));

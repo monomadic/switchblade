@@ -10,7 +10,7 @@
 //! entries overlay the built-in defaults.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
@@ -87,6 +87,12 @@ pub enum Action {
     },
     /// Re-ingest from the selected clip's parent directory (siblings view).
     OpenParent,
+    /// Swap the library to an explicit directory. Bound with an inline
+    /// path argument in `[keys]`, e.g. `"1" = "open '~/Movies'"` —
+    /// honours the ingest `recurse` flag like a CLI path arg.
+    OpenLibrary {
+        dir: PathBuf,
+    },
     /// Select a uniformly random other clip in the library.
     JumpRandom,
     /// Shuffle the whole grid in place (Fisher–Yates over the clip order).
@@ -107,8 +113,8 @@ impl Default for KeyMap {
     fn default() -> Self {
         let mut keys = HashMap::new();
         for (k, v) in [
-            ("enter", "open"),
-            ("o", "open"),
+            ("enter", "exec"),
+            ("o", "exec"),
             ("space", "quickview"),
             ("tab", "fullview"),
             ("c", "copy_path"),
@@ -139,13 +145,19 @@ impl Default for KeyMap {
             keys.insert(k.to_string(), v.to_string());
         }
         let mut commands = HashMap::new();
-        commands.insert(
-            "open".to_string(),
-            CommandSpec::Launch {
-                program: "mpv".to_string(),
-                args: vec!["{path}".to_string()],
-            },
-        );
+        // The default "play in mpv" launcher. Bound to enter/o; `exec` is the
+        // canonical name, `launch` an alias (both are just command entries a
+        // user config can override). `open` is NOT this — it's the library
+        // swap (see internal_action) so `"1" = "open '~/Movies'"` reads well.
+        for name in ["exec", "launch"] {
+            commands.insert(
+                name.to_string(),
+                CommandSpec::Launch {
+                    program: "mpv".to_string(),
+                    args: vec!["{path}".to_string()],
+                },
+            );
+        }
         // Preview is deliberately distinct from open: a macOS-Quick-Look-ish
         // peek — windowed, floating on top, looping, sized sensibly.
         commands.insert(
@@ -191,16 +203,39 @@ impl KeyMap {
     }
 
     pub fn action_for(&self, key: &Key) -> Option<Action> {
-        let name = self.keys.get(&key_name(key)?)?;
+        // A binding value is a command name optionally followed by an inline
+        // argument: `"1" = "open_library '~/Movies'"`. Only internal actions
+        // that take a path read the argument today.
+        let (name, arg) = split_binding(self.keys.get(&key_name(key)?)?);
         match self.commands.get(name) {
             Some(CommandSpec::Launch { program, args }) => Some(Action::Spawn {
                 program: program.clone(),
                 args: args.clone(),
             }),
-            Some(CommandSpec::Internal { action, amount }) => internal_action(action, *amount),
+            Some(CommandSpec::Internal { action, amount }) => internal_action(action, *amount, arg),
             // A command name with no [commands] entry is an internal action.
-            None => internal_action(name, None),
+            None => internal_action(name, None, arg),
         }
+    }
+}
+
+/// Split a binding value into its command name and an optional inline
+/// argument. The first whitespace-delimited token is the name; the trimmed
+/// remainder is the argument, with a single wrapping pair of `'`/`"` quotes
+/// stripped so paths with spaces can be quoted.
+fn split_binding(value: &str) -> (&str, Option<&str>) {
+    match value.trim().split_once(char::is_whitespace) {
+        Some((name, rest)) => (name, Some(unquote(rest.trim()))),
+        None => (value.trim(), None),
+    }
+}
+
+fn unquote(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
     }
 }
 
@@ -220,7 +255,7 @@ fn key_name(key: &Key) -> Option<String> {
     })
 }
 
-fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
+fn internal_action(name: &str, amount: Option<f32>, arg: Option<&str>) -> Option<Action> {
     Some(match name {
         "quit" => Action::Quit,
         "fullscreen" | "toggle_fullscreen" => Action::ToggleFullscreen { fast: false },
@@ -248,6 +283,19 @@ fn internal_action(name: &str, amount: Option<f32>) -> Option<Action> {
         "move_up" => Action::Move { dx: 0, dy: -1 },
         "move_down" => Action::Move { dx: 0, dy: 1 },
         "open_parent" | "browse_parent" => Action::OpenParent,
+        // Swap the library to an inline path: `"1" = "open '~/Movies'"`. The
+        // mpv launcher is `exec`/`launch` now, so `open` reads naturally here.
+        "open" | "open_library" | "open_dir" | "library" => match arg {
+            Some(a) => Action::OpenLibrary {
+                dir: PathBuf::from(expand_tilde(a)),
+            },
+            None => {
+                log::warn!(
+                    "'{name}' needs a path argument, e.g. \"1\" = \"open_library '~/Movies'\""
+                );
+                return None;
+            }
+        },
         "jump_random" | "jump_to_random" => Action::JumpRandom,
         "shuffle_library" | "shuffle" => Action::ShuffleLibrary,
         // The old "skip timer" spellings stay as config aliases.
@@ -457,17 +505,17 @@ mod tests {
         ));
         // The alias spellings resolve too.
         assert!(matches!(
-            internal_action("jump_to_random", None),
+            internal_action("jump_to_random", None, None),
             Some(Action::JumpRandom)
         ));
         assert!(matches!(
-            internal_action("shuffle", None),
+            internal_action("shuffle", None, None),
             Some(Action::ShuffleLibrary)
         ));
         // Configs written before the auto-skip rename keep working.
         for legacy in ["toggle_skip_timer", "skip_timer", "auto_skip"] {
             assert!(matches!(
-                internal_action(legacy, None),
+                internal_action(legacy, None, None),
                 Some(Action::ToggleAutoSkip)
             ));
         }
@@ -488,7 +536,7 @@ mod tests {
         ));
         // Alias spelling resolves too.
         assert!(matches!(
-            internal_action("chapters", None),
+            internal_action("chapters", None, None),
             Some(Action::ChapterMode)
         ));
     }
@@ -522,6 +570,57 @@ mod tests {
                 amount: Some(a),
             }) => assert!((a - 0.25).abs() < 1e-6),
             other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_library_binding_parses_an_inline_path() {
+        // A key value can carry an inline argument: name + quoted path.
+        let keys = HashMap::from([
+            ("1".to_string(), "open '~/Movies/Prawns/'".to_string()),
+            ("2".to_string(), "library /Volumes/Prawns/Movies".to_string()),
+        ]);
+        let map = KeyMap::merged(keys, HashMap::new());
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        // `open` is the library swap now (the mpv launcher is `exec`).
+        match map.action_for(&Key::Char('1')) {
+            Some(Action::OpenLibrary { dir }) => {
+                if let Some(home) = home {
+                    assert_eq!(dir, home.join("Movies/Prawns/"));
+                }
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+        // The `library` alias resolves, and an unquoted absolute path works.
+        assert!(matches!(
+            map.action_for(&Key::Char('2')),
+            Some(Action::OpenLibrary { ref dir }) if dir == Path::new("/Volumes/Prawns/Movies")
+        ));
+        // Without a path argument the binding is ignored (warns), not a panic.
+        assert!(internal_action("open", None, None).is_none());
+    }
+
+    #[test]
+    fn several_keys_can_share_one_action() {
+        // Arrows ship bound to move_* alongside hjkl by default, and a user
+        // can point extra keys at the same action.
+        let map = KeyMap::default();
+        for key in [Key::Up, Key::Char('k')] {
+            assert!(matches!(
+                map.action_for(&key),
+                Some(Action::Move { dx: 0, dy: -1 })
+            ));
+        }
+        let keys = HashMap::from([
+            ("w".to_string(), "move_up".to_string()),
+            ("up".to_string(), "move_up".to_string()),
+        ]);
+        let map = KeyMap::merged(keys, HashMap::new());
+        for key in [Key::Char('w'), Key::Up, Key::Char('k')] {
+            assert!(
+                matches!(map.action_for(&key), Some(Action::Move { dx: 0, dy: -1 })),
+                "wrong action for {key:?}"
+            );
         }
     }
 
