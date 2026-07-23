@@ -46,6 +46,43 @@ Filesystem calls currently happen in the CursorMoved handler when a drag
 matures. Stash the ghost path in `Press` at mouse-down. Full statement:
 [perf review 02 § P1.7](docs/perf-reviews/02-efficiency-review.md).
 
+### 3. Gen throttle engages permanently, costing ~40–45% of sweep throughput
+
+`gen_live_concurrency` is meant to narrow the sweep "while the selected stream
+presents", but its trigger (`live_sel.is_some()`) is true whenever the grid has
+a selection — measured `gen_running` never exceeded 1 over a 177 s run, with
+two of three workers idle 91% of the time. Uncapping gave **1.6–1.8× the sweep
+throughput with indistinguishable playback** (frame-gap p95 33.6 ms either
+way) on a 1080p corpus. Needs a condition that means "the user is watching
+this", not "a tile has a lane" — and a 4K re-measurement before the cap's
+*value* is touched (the original justification was a 4K cold spawn). Full
+statement: [perf review 03 §2](docs/perf-reviews/03-slow-disk-scheduler.md).
+
+### 4. Tier B run of the slow-disk gesture + sweep scenarios
+
+The reported UI stall did not reproduce in Tier A — worst frame 44.5 ms over
+six runs on a real 8,571-clip library. Upload stalls and present-to-present
+gaps are Tier B by design (HARNESS.md §0.5), and the gesture run evicted 209
+atlas slots, so the GPU half is the remaining in-house suspect. Full
+statement: [perf review 03 §6](docs/perf-reviews/03-slow-disk-scheduler.md).
+
+### 5. Gatekeeper header sniff costs ~107 s of head movement on a cold HDD library
+
+One 16-byte read per candidate file is one ~12 ms seek on a spinning disk:
+8,586 files → 106.9 s of ingest-thread I/O on a cold open, to reject 15 files
+(0.17%). Not a render-thread stall, but it is the whole cold-start trickle.
+Options: per-volume opt-out, defer to the first gen job (which opens the file
+anyway), or accept it. Product call. Full statement:
+[perf review 03 §3](docs/perf-reviews/03-slow-disk-scheduler.md).
+
+### 6. Long-run soak with the process canary armed
+
+The reported crash did not reproduce in 2–3 minute windows; a full sweep of a
+big library needs ~1–2 hours. `pending_bytes_peak` stayed at 1.8 MB and threads
+plateaued at ~122, so neither the result-channel backlog nor a thread leak is
+the mechanism — but nothing has run long enough to see what is. Full
+statement: [perf review 03 §6](docs/perf-reviews/03-slow-disk-scheduler.md).
+
 ---
 
 ## Epics (priority order)

@@ -1,0 +1,102 @@
+name = "slow_disk_gesture_under_sweep"
+
+intent = """
+The UI-thread half of the slow-disk complaint. `slow_disk_big_library`
+shows the render thread idle-clean while the sweep grinds, but sitting
+still is not what the user does — they fly the grid. This drives the
+gesture path (pan, then a real pinch stream, then the release) over a
+REAL library of thousands of tiles while the background sweep is loose
+on the drive and live lanes are up.
+
+`pinch_ribbon` covers the same gesture against `--demo` tiles: no
+decoders, no workers, no disk. That isolates layout cost, which is the
+right control. THIS scenario is the contended version — same gesture,
+but everything else in the app is also running. If the two disagree, the
+gesture is not what costs; the contention is.
+
+What to read:
+  - Render-thread stalls: any non-zero count over 50/100ms is a visible
+    hitch, and over 250ms is the "app hung" report. `pinch_ribbon`'s
+    prose already names the shape to fear — a lone multi-hundred-ms max
+    on the release frame, which is an O(library²) walk.
+  - Phase attribution during the gesture. The gesture phases (layout,
+    ribbon walk) are deliberately NOT in the attributed set, so if the
+    stall tail is real and `ingest_install`/`drain_media`/`live` are all
+    small, the time is in layout — exactly where the invariant says a
+    regression would land.
+  - Served-frame gaps: whether the live lanes keep delivering while the
+    main thread is busy laying out. These are separate threads, so a gap
+    here during a gesture means contention, not blocking.
+
+Tier A caveat, and it is a big one for this scenario: there is no GPU
+and no present. Upload stalls and present-to-present gaps — a plausible
+home for a gesture hitch on a real library — are Tier B only. A clean
+run here does NOT clear the gesture; it narrows the suspect to the half
+Tier A cannot see.
+"""
+
+[setup]
+inputs = ["/Volumes/Tower/Movies/Porn/Downloads"]
+animation = "normal"
+viewport = [1600.0, 1000.0]
+max_wall_s = 300.0
+
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 4000
+timeout = 240.0
+
+# Let the sweep get properly loose on the drive first.
+[[step]]
+action = "wait"
+secs = 15.0
+
+# Pan deep into the library — scrolling is the cheap gesture, and it also
+# moves the visible window so the thumb tier keeps requesting.
+[[step]]
+action = "scroll"
+dy = -4000.0
+
+[[step]]
+action = "wait"
+secs = 2.0
+
+[[step]]
+action = "scroll"
+dy = -12000.0
+
+[[step]]
+action = "wait"
+secs = 3.0
+
+# The pinch: a stream of small deltas, one per frame, as a real trackpad
+# delivers them. Zoom out (fingers together) so the tile count on screen
+# — and the ribbon walk — grows.
+[[step]]
+action = "hover"
+target = "selected"
+
+[[step]]
+action = "pinch"
+delta = -0.02
+n = 40
+
+# Sit through the release timer and the settle: the release frame is the
+# one that walks the whole library.
+[[step]]
+action = "wait"
+secs = 6.0
+
+# And back in, then settle again.
+[[step]]
+action = "pinch"
+delta = 0.02
+n = 40
+
+[[step]]
+action = "wait"
+secs = 6.0
+
+[validity]
+require = ["library_count"]

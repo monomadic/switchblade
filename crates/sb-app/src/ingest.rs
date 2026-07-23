@@ -1,8 +1,10 @@
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{self, Receiver, SendError, SyncSender};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 /// Ingest channels are bounded (P0.3): a fast directory walk during GPU
 /// init used to queue every entry in memory at once. A full channel now
@@ -93,13 +95,30 @@ struct Tx {
     /// The gatekeeper's header check (`gatekeeper` config); off = the
     /// pre-gatekeeper extension-and-exists test only.
     check: bool,
+    /// Instrumentation: how many paths this thread saw / admitted /
+    /// rejected, and how long its `stat` + `read_dir` + header reads
+    /// took. On a slow disk that I/O time is the whole cost of getting a
+    /// library on screen, and no latency metric elsewhere exposes it.
+    probe: Arc<sb_media::Probe>,
 }
 
 impl Tx {
     fn send(&self, item: Ingested) -> Result<(), SendError<Ingested>> {
+        self.probe.counters.ingest_admitted.fetch_add(1, Relaxed);
         self.tx.send(item)?;
         (self.notify)();
         Ok(())
+    }
+
+    /// Time a filesystem call into `ingest_io_us`.
+    fn io<T>(&self, f: impl FnOnce() -> T) -> T {
+        let t0 = Instant::now();
+        let out = f();
+        self.probe
+            .counters
+            .ingest_io_us
+            .fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+        out
     }
 }
 
@@ -111,12 +130,18 @@ pub fn spawn_stdin_reader(
     recurse: bool,
     check: bool,
     notify: Notify,
+    probe: Arc<sb_media::Probe>,
 ) -> Option<Receiver<Ingested>> {
     if io::stdin().is_terminal() {
         return None;
     }
     let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
-    let tx = Tx { tx, notify, check };
+    let tx = Tx {
+        tx,
+        notify,
+        check,
+        probe,
+    };
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut pending: Vec<u8> = Vec::new();
@@ -157,9 +182,15 @@ pub fn spawn_args_reader(
     recurse: bool,
     check: bool,
     notify: Notify,
+    probe: Arc<sb_media::Probe>,
 ) -> Receiver<Ingested> {
     let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
-    let tx = Tx { tx, notify, check };
+    let tx = Tx {
+        tx,
+        notify,
+        check,
+        probe,
+    };
     thread::spawn(move || {
         for p in paths {
             if handle_path(&tx, p, recurse).is_err() {
@@ -174,9 +205,19 @@ pub fn spawn_args_reader(
 /// One directory's own video files, no recursion — the "browse parent
 /// dir" (siblings) view. Streams like every other source; iCloud stubs
 /// in the directory still resolve to placeholders.
-pub fn spawn_dir_reader(dir: PathBuf, check: bool, notify: Notify) -> Receiver<Ingested> {
+pub fn spawn_dir_reader(
+    dir: PathBuf,
+    check: bool,
+    notify: Notify,
+    probe: Arc<sb_media::Probe>,
+) -> Receiver<Ingested> {
     let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
-    let tx = Tx { tx, notify, check };
+    let tx = Tx {
+        tx,
+        notify,
+        check,
+        probe,
+    };
     thread::spawn(move || {
         let _ = walk_dir(&tx, &dir, 0, 0);
         finish(tx);
@@ -215,7 +256,7 @@ fn send_path(tx: &Tx, mut bytes: &[u8], recurse: bool) -> Result<(), SendError<I
 /// is on) or vanish, everything else vanishes. All stat calls happen
 /// here, off the main thread, so the UI never blocks on slow disks.
 fn handle_path(tx: &Tx, path: PathBuf, recurse: bool) -> Result<(), SendError<Ingested>> {
-    let meta = std::fs::metadata(&path);
+    let meta = tx.io(|| std::fs::metadata(&path));
     if meta.as_ref().is_ok_and(|m| m.is_dir()) {
         if recurse {
             walk_dir(tx, &path, 0, 24)?;
@@ -225,12 +266,19 @@ fn handle_path(tx: &Tx, path: PathBuf, recurse: bool) -> Result<(), SendError<In
     if !is_video(&path) {
         return Ok(());
     }
+    // Counted from here: a non-video path was never a candidate, so
+    // folding it into `ingest_seen` would dilute the admit/reject ratio.
+    tx.probe.counters.ingest_seen.fetch_add(1, Relaxed);
+    let reject = |tx: &Tx| {
+        tx.probe.counters.ingest_rejected.fetch_add(1, Relaxed);
+    };
     let cloud = is_cloud_placeholder(&path, meta.as_ref().ok());
     // A valid extension is not enough: a path that doesn't exist (never
     // existed, or moved away) would otherwise claim a chip and pose as a
     // playable clip. Skip it unless it's a cloud placeholder (whose real
     // file is legitimately absent until downloaded).
     if meta.is_err() && !cloud {
+        reject(tx);
         return Ok(());
     }
     // Gatekeeper content check — never on cloud placeholders (reading one
@@ -238,9 +286,10 @@ fn handle_path(tx: &Tx, path: PathBuf, recurse: bool) -> Result<(), SendError<In
     if tx.check
         && let Ok(m) = &meta
         && !cloud
-        && !plausible_video(&path, m.len())
+        && !tx.io(|| plausible_video(&path, m.len()))
     {
         log::info!("gatekeeper: rejecting non-video content {}", path.display());
+        reject(tx);
         return Ok(());
     }
     tx.send(Ingested {
@@ -270,10 +319,10 @@ fn walk_dir(
     if depth > max_depth {
         return Ok(());
     }
-    let Ok(rd) = std::fs::read_dir(dir) else {
+    let Ok(rd) = tx.io(|| std::fs::read_dir(dir)) else {
         return Ok(());
     };
-    let mut entries: Vec<_> = rd.flatten().collect();
+    let mut entries: Vec<_> = tx.io(|| rd.flatten().collect());
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let name = e.file_name();
@@ -307,14 +356,20 @@ fn walk_dir(
             walk_dir(tx, &e.path(), depth + 1, max_depth)?;
         } else if ft.is_file() && is_video(&e.path()) {
             let p = e.path();
-            let meta = std::fs::metadata(&p);
+            // The recursive walk is where a real library actually enters
+            // (a directory argument, not per-file paths), so it carries
+            // the same instrumentation as `handle_path` — counting only
+            // that one reported an empty ingest for every dir-based run.
+            tx.probe.counters.ingest_seen.fetch_add(1, Relaxed);
+            let meta = tx.io(|| std::fs::metadata(&p));
             let cloud = is_cloud_placeholder(&p, meta.as_ref().ok());
             if tx.check
                 && let Ok(m) = &meta
                 && !cloud
-                && !plausible_video(&p, m.len())
+                && !tx.io(|| plausible_video(&p, m.len()))
             {
                 log::info!("gatekeeper: rejecting non-video content {}", p.display());
+                tx.probe.counters.ingest_rejected.fetch_add(1, Relaxed);
                 continue;
             }
             tx.send(Ingested {
@@ -377,7 +432,12 @@ mod tests {
         }
         std::fs::write(sub.join("c.mp4"), fake_mp4_bytes()).unwrap();
 
-        let rx = spawn_dir_reader(dir.clone(), true, std::sync::Arc::new(|| {}));
+        let rx = spawn_dir_reader(
+            dir.clone(),
+            true,
+            std::sync::Arc::new(|| {}),
+            sb_media::Probe::new(),
+        );
         let mut names: Vec<String> = rx
             .iter()
             .map(|i| i.path.file_name().unwrap().to_string_lossy().into_owned())
@@ -403,6 +463,7 @@ mod tests {
             tx: raw,
             notify: std::sync::Arc::new(|| {}),
             check: true,
+            probe: sb_media::Probe::new(),
         };
         send_path(&tx, real.to_string_lossy().as_bytes(), false).unwrap();
         send_path(&tx, ghost.to_string_lossy().as_bytes(), false).unwrap();
@@ -432,6 +493,7 @@ mod tests {
             tx: raw,
             notify: std::sync::Arc::new(|| {}),
             check: true,
+            probe: sb_media::Probe::new(),
         };
         for f in ["good.mp4", "html.mp4", "empty.mp4", "text.mkv"] {
             send_path(&tx, dir.join(f).to_string_lossy().as_bytes(), false).unwrap();

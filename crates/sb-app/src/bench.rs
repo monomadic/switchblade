@@ -151,6 +151,70 @@ pub struct Summary {
     pub events: usize,
     pub events_dropped: u64,
     pub conditions: Vec<CondResult>,
+
+    // ── slow-disk / big-library instruments (perf-review 03) ──────────
+    /// How many `frame()` calls blew past each stall threshold. A p95 of
+    /// 3ms hides the four 900ms frames that are the entire complaint, so
+    /// the tail gets counted explicitly rather than summarized away.
+    #[serde(default)]
+    pub tick_over: Vec<TickOver>,
+    /// Per-phase render-thread cost, ms per tick (from the phase
+    /// counters): which part of `frame()` a stall belongs to.
+    #[serde(default)]
+    pub phase_ms: Vec<PhaseStat>,
+    /// Scheduler state sampled per tick, compacted to changes:
+    /// [t, thumbs, gen, anims, inflight, gen_running, pending_results].
+    #[serde(default)]
+    pub queue_curve: Vec<[f64; 7]>,
+    /// Per-tier worker-job cost from the JobStart/JobEnd pairs, split by
+    /// outcome (a cache hit never touched the source drive).
+    #[serde(default)]
+    pub jobs: Vec<JobStat>,
+    /// Fraction of wall time × WORKERS that workers spent inside jobs.
+    /// Low utilisation with a deep queue = the pool is parked on a
+    /// throttle; ~1.0 = saturated.
+    #[serde(default)]
+    pub worker_utilisation: f64,
+    /// Process-tree resident memory + thread count, sampled off the
+    /// render thread (see `sample_process`): [t, rss_mb, threads,
+    /// children]. The crash canary — an unbounded backlog or a thread
+    /// leak shows here before anything else notices.
+    #[serde(default)]
+    pub proc_curve: Vec<[f64; 4]>,
+    /// Longest gap between consecutive served frames per live lane, ms —
+    /// the video-thread stall metric. A decoder starved by drive
+    /// contention shows up here as a multi-second gap while the app's own
+    /// tick times stay fine.
+    #[serde(default)]
+    pub frame_gap_ms: Vec<LatencyStat>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TickOver {
+    pub over_ms: f64,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PhaseStat {
+    pub phase: String,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+    /// Share of total measured render-thread time this phase accounts for.
+    pub share: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JobStat {
+    pub tier: String,
+    pub outcome: String,
+    pub count: usize,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+    /// Total worker-seconds this (tier, outcome) population consumed.
+    pub total_s: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,6 +271,27 @@ pub fn run(scenario_path: &Path, out_dir: &Path, sets: &[String]) -> Result<Summ
         height: scenario.setup.viewport[1],
     };
 
+    // Process-tree canary, off the render thread (see `sample_process`).
+    // 1Hz: the numbers it watches (RSS growth, thread leaks) move over
+    // seconds, and forking `ps` more often would itself be load.
+    let proc_curve = std::sync::Arc::new(std::sync::Mutex::new(Vec::<[f64; 4]>::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (curve, stop, pid) = (proc_curve.clone(), stop.clone(), std::process::id());
+        let t0 = Instant::now();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some([rss, threads, kids]) = sample_process(pid) {
+                    curve
+                        .lock()
+                        .unwrap()
+                        .push([t0.elapsed().as_secs_f64(), rss, threads, kids]);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
     let mut rig = Rig::new(Switchblade::with_options(opts), viewport, &scenario.setup);
     rig.probe.record_events();
     rig.tick(); // boot one frame so layout/ingest exist
@@ -220,6 +305,7 @@ pub fn run(scenario_path: &Path, out_dir: &Path, sets: &[String]) -> Result<Summ
     }
 
     let wall_s = rig.anchor.elapsed().as_secs_f64();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let (events, dropped) = rig.probe.drain(rig.anchor);
     write_events_jsonl(out_dir, &events)?;
 
@@ -268,6 +354,22 @@ pub fn run(scenario_path: &Path, out_dir: &Path, sets: &[String]) -> Result<Summ
         events: events.len(),
         events_dropped: dropped,
         conditions,
+        tick_over: [16.0, 50.0, 100.0, 250.0, 1000.0]
+            .iter()
+            .map(|&over_ms| TickOver {
+                over_ms,
+                count: rig.tick_ms.iter().filter(|&&t| t > over_ms).count(),
+            })
+            .collect(),
+        phase_ms: compute_phases(&rig.phase_ms),
+        queue_curve: rig.queue_curve.clone(),
+        jobs: compute_jobs(&events),
+        worker_utilisation: {
+            let busy_s = rig.probe.snapshot().worker_busy_us as f64 / 1e6;
+            busy_s / (wall_s.max(1e-9) * MEDIA_WORKERS as f64)
+        },
+        proc_curve: proc_curve.lock().unwrap().clone(),
+        frame_gap_ms: compute_frame_gaps(&events),
     };
 
     let json = sb_media::serde_json::to_string_pretty(&summary)
@@ -293,8 +395,65 @@ struct Rig {
     last_thumbs: u64,
     /// Per-frame `frame()` wall cost in ms.
     tick_ms: Vec<f64>,
+    /// Per-frame per-phase cost in ms, from the phase counters' deltas.
+    phase_ms: Vec<(&'static str, Vec<f64>)>,
+    /// Previous tick's phase counter reads, for those deltas.
+    last_phase: [u64; 3],
+    /// Scheduler state, compacted to changes (see `Summary::queue_curve`).
+    queue_curve: Vec<[f64; 7]>,
+    last_depths: Option<sb_media::QueueDepths>,
     /// First time each named condition became true (name, t_seconds).
     conds: Vec<(String, f64)>,
+}
+
+/// Process-tree resident memory + thread count, sampled from a helper
+/// thread so the render thread never pays for it. Uses `ps` rather than a
+/// new libc dependency: the ffmpeg workers are separate processes, so the
+/// number that matters is the whole tree's, and one fork per second off
+/// the measured thread is cheaper than the alternative is worth.
+fn sample_process(pid: u32) -> Option<[f64; 3]> {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let rss_kb: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    // macOS `ps` has no `thcount`/`nlwp` keyword — `-M` lists one row per
+    // thread under a header, so the count is rows-minus-one. The thread
+    // canary matters here: a stalled reader that never gets dropped leaks
+    // a thread pinning ~30MB (docs/architecture/live-playback.md).
+    let threads = Command::new("ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .count()
+                .saturating_sub(1) as f64
+        })
+        .unwrap_or(0.0);
+    // ffmpeg workers are children; their RSS is real memory this run is
+    // responsible for even though it isn't ours.
+    let kids = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .ok();
+    let mut child_rss = 0.0;
+    let mut child_n = 0.0;
+    if let Some(k) = kids {
+        for p in String::from_utf8_lossy(&k.stdout).split_whitespace() {
+            child_n += 1.0;
+            if let Some(o) = Command::new("ps")
+                .args(["-o", "rss=", "-p", p])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+            {
+                child_rss += o;
+            }
+        }
+    }
+    Some([(rss_kb + child_rss) / 1024.0, threads, child_n])
 }
 
 impl Rig {
@@ -314,6 +473,14 @@ impl Rig {
             thumbs_curve: Vec::new(),
             last_thumbs: u64::MAX,
             tick_ms: Vec::new(),
+            phase_ms: vec![
+                ("ingest_install", Vec::new()),
+                ("drain_media", Vec::new()),
+                ("live", Vec::new()),
+            ],
+            last_phase: [0; 3],
+            queue_curve: Vec::new(),
+            last_depths: None,
             conds: Vec::new(),
         }
     }
@@ -330,12 +497,34 @@ impl Rig {
         self.animating = frame.animating;
         self.redraw_at = frame.redraw_at;
         let _ = self.app.commands(); // drain window commands (title, etc.)
+        let snap = self.probe.snapshot();
         // Compact thumbs-cached curve: a point only when it changes.
-        let tc = self.probe.snapshot().thumbs_cached;
-        if tc != self.last_thumbs {
-            self.last_thumbs = tc;
+        if snap.thumbs_cached != self.last_thumbs {
+            self.last_thumbs = snap.thumbs_cached;
             self.thumbs_curve
-                .push([self.anchor.elapsed().as_secs_f64(), tc as f64]);
+                .push([self.anchor.elapsed().as_secs_f64(), snap.thumbs_cached as f64]);
+        }
+        // Phase attribution: the counters are cumulative, so this tick's
+        // cost per phase is the delta since the last one.
+        let now_phase = [snap.ns_ingest_install, snap.ns_drain_media, snap.ns_live];
+        for (i, (_, xs)) in self.phase_ms.iter_mut().enumerate() {
+            xs.push(now_phase[i].saturating_sub(self.last_phase[i]) as f64 / 1e6);
+        }
+        self.last_phase = now_phase;
+        // Scheduler state, compacted to changes — a 19k-file sweep would
+        // otherwise write one identical row per frame for minutes.
+        let d = self.app.media.depths();
+        if self.last_depths != Some(d) {
+            self.last_depths = Some(d);
+            self.queue_curve.push([
+                self.anchor.elapsed().as_secs_f64(),
+                d.thumbs as f64,
+                d.gen_sweep as f64,
+                d.anims as f64,
+                d.inflight as f64,
+                d.gen_running as f64,
+                snap.pending_results as f64,
+            ]);
         }
     }
 
@@ -471,6 +660,15 @@ impl Rig {
                 .is_some_and(|l| l.first_frame.is_some()),
             "grid_settled" => !self.animating,
             "cache_thumbs" => self.probe.snapshot().thumbs_cached >= n as u64,
+            // Background-sweep progress, in the app's own ledger terms —
+            // `cache_thumbs` only counts clips that reached the grid as
+            // cached, while this counts every finished job (hits, misses
+            // and failures alike). On a big library the two diverge, and
+            // the difference is itself diagnostic.
+            "jobs_done" => self.app.jobs_done >= n as u64,
+            "sweep_drained" => {
+                self.app.rx.is_none() && self.app.jobs_done >= self.app.jobs_total
+            }
             // Anim-sheet (storyboard) lifecycle for the SELECTED clip — the
             // sheet whose cells the seekbar hover and chapter-bar chips
             // sample. `requested` leaves Thumb::None the moment
@@ -667,6 +865,106 @@ fn compute_latencies(events: &[sb_media::RelEvent]) -> Vec<LatencyStat> {
     out.sort_by(|a, b| {
         (a.lane.as_str(), a.metric.as_str()).cmp(&(b.lane.as_str(), b.metric.as_str()))
     });
+    out
+}
+
+/// The worker-pool width, mirrored for the utilisation denominator. Not
+/// public in sb-media; kept here so a change there shows up as a wrong
+/// utilisation number rather than a compile error nobody notices.
+const MEDIA_WORKERS: usize = 3;
+
+/// Per-phase render-thread percentiles + each phase's share of the
+/// measured total. Shares are of *attributed* time only — the rest of
+/// `frame()` (layout, springs, frame build) is unattributed by design;
+/// these three are the phases that touch media and ingest.
+fn compute_phases(phases: &[(&'static str, Vec<f64>)]) -> Vec<PhaseStat> {
+    let total: f64 = phases.iter().map(|(_, xs)| xs.iter().sum::<f64>()).sum();
+    phases
+        .iter()
+        .map(|(name, xs)| {
+            let sum: f64 = xs.iter().sum();
+            let s = pctl_stat(&mut xs.clone());
+            PhaseStat {
+                phase: name.to_string(),
+                p50_ms: s.p50,
+                p95_ms: s.p95,
+                max_ms: s.max,
+                share: if total > 0.0 { sum / total } else { 0.0 },
+            }
+        })
+        .collect()
+}
+
+/// Worker-job cost per (tier, outcome), from the `JobEnd` events' own
+/// `ms`. Split by outcome because a cache hit and a cold 4K extract are
+/// different populations — pooling them makes a slow-disk run look fast
+/// in exactly the case where it isn't.
+fn compute_jobs(events: &[sb_media::RelEvent]) -> Vec<JobStat> {
+    use std::collections::HashMap;
+    let mut buckets: HashMap<(String, String), Vec<f64>> = HashMap::new();
+    for e in events.iter().filter(|e| e.kind == "job_end") {
+        let (Some(tier), Some(ms)) = (e.tier, e.ms) else {
+            continue;
+        };
+        buckets
+            .entry((tier.to_string(), e.outcome.unwrap_or("?").to_string()))
+            .or_default()
+            .push(ms);
+    }
+    let mut out: Vec<JobStat> = buckets
+        .into_iter()
+        .map(|((tier, outcome), mut xs)| {
+            let total_s = xs.iter().sum::<f64>() / 1000.0;
+            let count = xs.len();
+            let s = pctl_stat(&mut xs);
+            JobStat {
+                tier,
+                outcome,
+                count,
+                p50_ms: s.p50,
+                p95_ms: s.p95,
+                max_ms: s.max,
+                total_s,
+            }
+        })
+        .collect();
+    // Heaviest population first — that's the one holding the pool.
+    out.sort_by(|a, b| b.total_s.partial_cmp(&a.total_s).unwrap());
+    out
+}
+
+/// Gaps between consecutive `frame_served` events per lane incarnation,
+/// in ms. A live decoder starved by drive contention produces a long gap
+/// here while `tick_ms` stays clean — the app is fine, the video is not.
+/// Gaps are computed WITHIN a lane_gen: a respawn is not a stall.
+fn compute_frame_gaps(events: &[sb_media::RelEvent]) -> Vec<LatencyStat> {
+    use std::collections::HashMap;
+    let mut last: HashMap<u64, f64> = HashMap::new();
+    let mut by_lane: HashMap<String, Vec<f64>> = HashMap::new();
+    for e in events.iter().filter(|e| e.kind == "frame_served") {
+        if let Some(prev) = last.insert(e.lane_gen, e.t) {
+            by_lane
+                .entry(e.lane.to_string())
+                .or_default()
+                .push((e.t - prev) * 1000.0);
+        }
+    }
+    let mut out: Vec<LatencyStat> = by_lane
+        .into_iter()
+        .map(|(lane, mut xs)| {
+            let count = xs.len();
+            let s = pctl_stat(&mut xs);
+            LatencyStat {
+                lane,
+                metric: "frame_gap".into(),
+                count,
+                p50_ms: s.p50,
+                p95_ms: s.p95,
+                max_ms: s.max,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.lane.cmp(&b.lane));
     out
 }
 
@@ -889,7 +1187,7 @@ pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> S
     out.push_str("\n## Counters & totals\n\n");
     out.push_str("| metric | agg (min–max) | agg |\n|---|--:|:--|\n");
     let col = |f: &dyn Fn(&Summary) -> f64| -> Vec<f64> { summaries.iter().map(f).collect() };
-    let rows: [(&str, Vec<f64>, bool); 8] = [
+    let rows: [(&str, Vec<f64>, bool); 20] = [
         ("wall_s", col(&|s| s.wall_s), false),
         ("frames", col(&|s| s.frames as f64), false),
         ("late_frames", col(&|s| s.counters.late_frames as f64), true),
@@ -897,7 +1195,24 @@ pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> S
         ("evictions", col(&|s| s.counters.evictions as f64), true),
         ("thumbs_cached", col(&|s| s.counters.thumbs_cached as f64), false),
         ("drain_budget_hits", col(&|s| s.counters.drain_budget_hits as f64), false),
+        ("tick_ms p50", col(&|s| s.tick_ms.p50), false),
         ("tick_ms p95", col(&|s| s.tick_ms.p95), false),
+        ("tick_ms max", col(&|s| s.tick_ms.max), true),
+        // Scheduler / pool.
+        ("jobs_started", col(&|s| s.counters.jobs_started as f64), false),
+        ("jobs_finished", col(&|s| s.counters.jobs_finished as f64), false),
+        ("jobs_hit", col(&|s| s.counters.jobs_hit as f64), false),
+        ("jobs_failed", col(&|s| s.counters.jobs_failed as f64), true),
+        ("worker_utilisation", col(&|s| s.worker_utilisation), false),
+        // Backlog / memory canary.
+        ("pending_bytes_peak_mb", col(&|s| s.counters.pending_bytes_peak as f64 / 1048576.0), true),
+        // Ingest.
+        ("ingest_seen", col(&|s| s.counters.ingest_seen as f64), false),
+        ("ingest_rejected", col(&|s| s.counters.ingest_rejected as f64), false),
+        ("ingest_io_s", col(&|s| s.counters.ingest_io_us as f64 / 1e6), false),
+        ("rss_peak_mb", col(&|s| {
+            s.proc_curve.iter().map(|p| p[1]).fold(0.0, f64::max)
+        }), true),
     ];
     for (name, xs, burst) in &rows {
         let (m, lo, hi) = if *burst { mean3(xs) } else { stat3(xs) };
@@ -908,6 +1223,98 @@ pub fn markdown(summaries: &[Summary], reps: usize, label: &str, env: &str) -> S
             format!("{m:.2} ({lo:.2}–{hi:.2})")
         };
         out.push_str(&format!("| {name} | {cell} | {how} |\n"));
+    }
+
+    // Stall tail. Percentiles hide it by construction; the counts don't.
+    out.push_str("\n## Render-thread stalls (frames over threshold)\n\n");
+    out.push_str("| > ms | count (mean across runs) |\n|--:|--:|\n");
+    let mut overs: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for s in summaries {
+        for t in &s.tick_over {
+            overs
+                .entry(format!("{:>6.0}", t.over_ms))
+                .or_default()
+                .push(t.count as f64);
+        }
+    }
+    for (k, xs) in &overs {
+        out.push_str(&format!("| {} | {:.1} |\n", k.trim(), mean3(xs).0));
+    }
+
+    // Which phase of frame() owns the time.
+    out.push_str("\n## Render-thread phase attribution\n\n");
+    out.push_str("| phase | p50 ms | p95 ms | max ms | share |\n|---|--:|--:|--:|--:|\n");
+    let mut ph: BTreeMap<String, (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for s in summaries {
+        for p in &s.phase_ms {
+            let e = ph.entry(p.phase.clone()).or_default();
+            e.0.push(p.p50_ms);
+            e.1.push(p.p95_ms);
+            e.2.push(p.max_ms);
+            e.3.push(p.share);
+        }
+    }
+    for (k, (a, b, c, d)) in &ph {
+        out.push_str(&format!(
+            "| {k} | {} | {} | {} | {:.0}% |\n",
+            fmt3(a, ""),
+            fmt3(b, ""),
+            fmt3(c, ""),
+            stat3(d).0 * 100.0
+        ));
+    }
+
+    // Worker-pool occupancy per tier. `total_s` is what holds the pool.
+    out.push_str("\n## Worker jobs (per tier / outcome)\n\n");
+    out.push_str("| tier | outcome | n | p50 ms | p95 ms | max ms | worker-s |\n");
+    out.push_str("|---|---|--:|--:|--:|--:|--:|\n");
+    let mut jb: BTreeMap<(String, String), (usize, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> =
+        BTreeMap::new();
+    for s in summaries {
+        for j in &s.jobs {
+            let e = jb
+                .entry((j.tier.clone(), j.outcome.clone()))
+                .or_insert_with(|| (0, vec![], vec![], vec![], vec![]));
+            e.0 = j.count;
+            e.1.push(j.p50_ms);
+            e.2.push(j.p95_ms);
+            e.3.push(j.max_ms);
+            e.4.push(j.total_s);
+        }
+    }
+    for ((tier, outcome), (n, a, b, c, d)) in &jb {
+        out.push_str(&format!(
+            "| {tier} | {outcome} | {n} | {} | {} | {} | {} |\n",
+            fmt3(a, ""),
+            fmt3(b, ""),
+            fmt3(c, ""),
+            fmt3(d, ""),
+        ));
+    }
+
+    // The video-thread view: gaps between served frames, within a lane
+    // incarnation. A stall here is invisible in tick_ms.
+    if summaries.iter().any(|s| !s.frame_gap_ms.is_empty()) {
+        out.push_str("\n## Served-frame gaps (video-thread stalls)\n\n");
+        out.push_str("| lane | n | p50 ms | p95 ms | max ms |\n|---|--:|--:|--:|--:|\n");
+        let mut fg: BTreeMap<String, (usize, Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+        for s in summaries {
+            for g in &s.frame_gap_ms {
+                let e = fg.entry(g.lane.clone()).or_default();
+                e.0 = g.count;
+                e.1.push(g.p50_ms);
+                e.2.push(g.p95_ms);
+                e.3.push(g.max_ms);
+            }
+        }
+        for (lane, (n, a, b, c)) in &fg {
+            out.push_str(&format!(
+                "| {lane} | {n} | {} | {} | {} |\n",
+                fmt3(a, ""),
+                fmt3(b, ""),
+                fmt3(c, ""),
+            ));
+        }
     }
 
     out.push_str("\nRaw per-run `summary.json` + `events.jsonl` are under `repN/` beside this report.\n");
@@ -1076,6 +1483,30 @@ mod tests {
             events: 3,
             events_dropped: 0,
             conditions: vec![],
+            tick_over: vec![TickOver {
+                over_ms: 100.0,
+                count: 2,
+            }],
+            phase_ms: vec![PhaseStat {
+                phase: "drain_media".into(),
+                p50_ms: 0.02,
+                p95_ms: 0.4,
+                max_ms: 1.0,
+                share: 0.5,
+            }],
+            queue_curve: vec![],
+            jobs: vec![JobStat {
+                tier: "gen".into(),
+                outcome: "made".into(),
+                count: 4,
+                p50_ms: 900.0,
+                p95_ms: 2000.0,
+                max_ms: 2500.0,
+                total_s: 5.0,
+            }],
+            worker_utilisation: 0.9,
+            proc_curve: vec![[0.0, 120.0, 14.0, 1.0]],
+            frame_gap_ms: vec![],
         }
     }
 

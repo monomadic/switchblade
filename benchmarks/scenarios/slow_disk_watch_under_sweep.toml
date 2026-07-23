@@ -1,0 +1,76 @@
+name = "slow_disk_watch_under_sweep"
+
+intent = """
+The complaint itself: a big library on a slow external disk, and the user
+tries to WATCH something while the background sweep is still running. The
+sweep issues one seek-and-extract per file across thousands of files; the
+live decoder needs sustained sequential reads off the same spindle. This
+scenario puts both on the drive at once and measures who wins.
+
+What to read:
+  - `selected_served` in the condition list — how long from opening
+    quickview to the first frame, with the sweep already loose on the
+    drive. Compare against the same open on the internal-disk fixtures
+    (`cold_open_quickview`), which is the no-contention control.
+  - **Served-frame gaps** is the headline table. The app's own tick times
+    can look perfect while playback is dead: a decoder that cannot get
+    reads off a thrashing drive simply stops delivering, and only the gap
+    between consecutive `frame_served` events shows it. p95 near the frame
+    interval = smooth; multi-second max = a visible freeze.
+  - `late_frames` / `reanchors` are the pacing view of the same thing —
+    the player giving up on a deadline it could not meet.
+  - Worker jobs by tier. The gen throttle (`gen_live_concurrency`) is
+    supposed to narrow the sweep to one job while a stream presents. If
+    `gen`/`made` jobs are still overlapping the watched window in
+    `events.jsonl`, the throttle is not holding, and *that* is the bug —
+    not the decoder.
+
+Sweep the throttle with `--set gen_live_concurrency=0` (uncapped) to see
+what it is buying, and with the `no_storyboards` path to remove the
+on-demand sheet from the contention.
+"""
+
+[setup]
+inputs = ["/Volumes/Tower/Movies/Porn/Downloads"]
+animation = "normal"
+viewport = [1600.0, 1000.0]
+max_wall_s = 420.0
+
+# Enough of a grid to act on, with the sweep already running hard.
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 2000
+timeout = 300.0
+
+# Let the sweep get properly loose on the drive before we compete with it.
+[[step]]
+action = "wait"
+secs = 20.0
+
+# Open quickview on the selection and watch. This is the contended open.
+[[step]]
+action = "key"
+key = "space"
+
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 90.0
+
+# Sustained playback under sweep contention — the frame-gap window.
+[[step]]
+action = "wait"
+secs = 60.0
+
+# Advance to a neighbour: a fresh cold spawn while the drive is still busy.
+[[step]]
+action = "key"
+key = "l"
+
+[[step]]
+action = "wait"
+secs = 30.0
+
+[validity]
+require = ["library_count", "selected_served"]

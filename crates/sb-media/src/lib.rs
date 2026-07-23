@@ -10,7 +10,9 @@
 pub mod maintenance;
 pub mod probe;
 mod seekable;
-pub use probe::{CounterSnapshot, EventKind, Lane, LaneProbe, Probe, RelEvent};
+pub use probe::{
+    CounterSnapshot, EventKind, Lane, LaneProbe, Outcome, Probe, QueueDepths, RelEvent, Tier,
+};
 pub use seekable::SeekablePlayer;
 /// Re-exported so sb-app's bench runner can serialize its reports without
 /// taking its own serde_json dependency (it's already built for us here).
@@ -19,6 +21,7 @@ pub use serde_json;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -302,6 +305,25 @@ impl Queues {
     /// A worker finished `p`'s `art` job: clear in-flight and collect
     /// whatever merged requests are owed. Requests arriving after this
     /// enqueue normally — the artifact is cached now, so they're cheap.
+    /// The scheduler's own state, for the bench runner's per-tick sample
+    /// (`probe::QueueDepths`). Read under the queue lock like everything
+    /// else here; it is a handful of `len()` calls.
+    fn depths(&self) -> QueueDepths {
+        QueueDepths {
+            thumbs: self.thumbs.len(),
+            reprobes: self.reprobes.len(),
+            chapters: self.chapters.len(),
+            anims: self.anims_now.len(),
+            gen_sweep: self.r#gen.len(),
+            inflight: self.inflight.len(),
+            gen_running: self.gen_running,
+            owed: self.gen_owed.values().map(|&n| n as usize).sum::<usize>()
+                + self.thumb_owed.values().map(|&n| n as usize).sum::<usize>()
+                + self.anim_owed.values().map(|&n| n as usize).sum::<usize>(),
+            live: self.live,
+        }
+    }
+
     fn complete(&mut self, p: &Path, art: Art) -> Owed {
         self.inflight.remove(&(p.to_path_buf(), art));
         match art {
@@ -379,12 +401,15 @@ pub struct MediaService {
     /// Last value passed to `set_live` — dedupes the app's per-frame
     /// call down to a relaxed atomic load on the common no-change path.
     live: std::sync::atomic::AtomicBool,
+    /// Shared instrumentation: worker job events + the pool/backlog
+    /// counters. Cloned into every worker thread.
+    probe: Arc<Probe>,
 }
 
 impl MediaService {
     /// `gen_live_cap` = concurrent gen-sweep jobs allowed while the selected
     /// stream presents (config `gen_live_concurrency`; 0 = unlimited).
-    pub fn new(recipe: Recipe, notify: Notify, gen_live_cap: usize) -> Self {
+    pub fn new(recipe: Recipe, notify: Notify, gen_live_cap: usize, probe: Arc<Probe>) -> Self {
         // Start with the gen throttle ENGAGED. The workers begin draining the
         // queue during ingest, BEFORE the app's first `set_live` call — so an
         // uncapped default let the sweep grab all workers with slow 4K gen
@@ -417,12 +442,14 @@ impl MediaService {
             let tx = tx_done.clone();
             let root = root.clone();
             let notify = notify.clone();
-            thread::spawn(move || worker(q, tx, notify, root, have_ffmpeg, recipe));
+            let probe = probe.clone();
+            thread::spawn(move || worker(q, tx, notify, root, have_ffmpeg, recipe, probe));
         }
         Self {
             queue,
             rx: rx_done,
             recipe,
+            probe,
             // Kept in sync with the queue's `live` above so the app's first
             // `set_live(false)` (no video) registers as a real change and
             // opens the sweep; a first `set_live(true)` is a correct no-op.
@@ -510,7 +537,26 @@ impl MediaService {
     }
 
     pub fn try_recv(&self) -> Option<ThumbResult> {
-        self.rx.try_recv().ok()
+        let r = self.rx.try_recv().ok()?;
+        self.probe.result_drained(result_bytes(&r));
+        Some(r)
+    }
+
+    /// The scheduler's queue state right now (bench instrumentation —
+    /// see [`QueueDepths`]). One lock acquisition, a few `len()` calls;
+    /// the runner samples it per tick.
+    pub fn depths(&self) -> QueueDepths {
+        self.queue.0.lock().unwrap().depths()
+    }
+}
+
+/// Heap bytes a queued result is holding — the decoded RGBA, which is all
+/// that matters (paths and chapter lists are noise beside a 921KB thumb
+/// or a multi-megabyte sheet).
+fn result_bytes(r: &ThumbResult) -> u64 {
+    match r {
+        ThumbResult::Ready { rgba, .. } | ThumbResult::AnimReady { rgba, .. } => rgba.len() as u64,
+        _ => 0,
     }
 }
 
@@ -623,6 +669,7 @@ fn worker(
     root: PathBuf,
     have_ffmpeg: bool,
     recipe: Recipe,
+    probe: Arc<Probe>,
 ) {
     loop {
         // Strict priority (tier order documented on `Queues`). The lock
@@ -637,6 +684,24 @@ fn worker(
                 q = cv.wait(q).unwrap();
             }
         };
+        // Job instrumentation brackets the WORK, not the wait: a worker
+        // parked on the condvar is idle capacity, and counting that as
+        // occupancy would hide the thing we want to see (three workers
+        // pinned inside slow-disk ffmpeg reads).
+        let (tier, src) = match &req {
+            Request::Thumb(p) => (Tier::Thumb, p.clone()),
+            Request::Reprobe(p) => (Tier::Reprobe, p.clone()),
+            Request::Chapters(p) => (Tier::Chapters, p.clone()),
+            Request::Anim(p) => (Tier::Anim, p.clone()),
+            Request::Gen(p) => (Tier::Gen, p.clone()),
+        };
+        let job = probe.next_job_id();
+        probe.counters.jobs_started.fetch_add(1, Relaxed);
+        probe.mark_job(EventKind::JobStart, tier, job, &src, None, None);
+        let t0 = std::time::Instant::now();
+        let mut outcome = Outcome::Made;
+        // A job that produces no result and must not wake the render loop.
+        let mut silent = false;
         // One generation can settle several merged requests (P1.2): the
         // job's own result plus whatever `complete()` says is owed to
         // requests that joined instead of duplicating the work.
@@ -649,7 +714,8 @@ fn worker(
                     results.push(ThumbResult::GenDone { path: path.clone() });
                 }
                 match out {
-                    Ok((w, h, rgba)) => {
+                    Ok((w, h, rgba, made)) => {
+                        outcome = if made { Outcome::Made } else { Outcome::Hit };
                         for _ in 0..owed.thumbs {
                             results.push(ThumbResult::Ready {
                                 path: path.clone(),
@@ -661,6 +727,7 @@ fn worker(
                         results.push(ThumbResult::Ready { path, w, h, rgba });
                     }
                     Err(fail) => {
+                        outcome = Outcome::Failed;
                         for _ in 0..owed.thumbs {
                             results.push(ThumbResult::Failed { path: path.clone() });
                         }
@@ -679,7 +746,11 @@ fn worker(
                 if have_ffmpeg {
                     reprobe(&path, &root);
                 }
-                continue; // nothing to upload, no result
+                // Nothing to upload and no result — but the job still has
+                // to be closed out below, or a reprobe stuck behind a
+                // thrashing drive would read as a worker that vanished.
+                silent = true;
+                let _ = path;
             }
             Request::Chapters(path) => {
                 let (times, duration) = if have_ffmpeg {
@@ -698,6 +769,12 @@ fn worker(
                 // niced, full-library work off the VT media engine the
                 // live stream needs.
                 let jpg = ensure_thumb_file(&path, &root, have_ffmpeg, &recipe, false);
+                outcome = match &jpg {
+                    Ok((_, true)) => Outcome::Made,
+                    Ok((_, false)) => Outcome::Hit,
+                    Err(_) => Outcome::Failed,
+                };
+                let jpg = jpg.map(|(p, _)| p);
                 let owed = {
                     let mut q = queue.0.lock().unwrap();
                     q.gen_running -= 1;
@@ -756,6 +833,7 @@ fn worker(
                         results.push(ThumbResult::AnimReady { path, w, h, rgba });
                     }
                     None => {
+                        outcome = Outcome::Failed;
                         for _ in 0..=owed.anims {
                             results.push(ThumbResult::AnimFailed { path: path.clone() });
                         }
@@ -763,7 +841,30 @@ fn worker(
                 }
             }
         }
+        let busy = t0.elapsed();
+        probe.counters.jobs_finished.fetch_add(1, Relaxed);
+        probe
+            .counters
+            .worker_busy_us
+            .fetch_add(busy.as_micros() as u64, Relaxed);
+        match outcome {
+            Outcome::Hit => probe.counters.jobs_hit.fetch_add(1, Relaxed),
+            Outcome::Failed => probe.counters.jobs_failed.fetch_add(1, Relaxed),
+            Outcome::Made => 0,
+        };
+        probe.mark_job(
+            EventKind::JobEnd,
+            tier,
+            job,
+            &src,
+            Some(outcome),
+            Some(busy.as_secs_f64() * 1000.0),
+        );
+        if silent {
+            continue;
+        }
         for r in results {
+            probe.result_queued(result_bytes(&r));
             if tx.send(r).is_err() {
                 return;
             }
@@ -788,10 +889,11 @@ fn make_thumb(
     root: &Path,
     have_ffmpeg: bool,
     recipe: &Recipe,
-) -> Result<(u32, u32, Vec<u8>), ThumbFail> {
+) -> Result<(u32, u32, Vec<u8>, bool), ThumbFail> {
     // Foreground (a visible tile is waiting on it): VT keeps grid-fill snappy.
-    let jpg = ensure_thumb_file(src, root, have_ffmpeg, recipe, true)?;
-    decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h).ok_or(ThumbFail::Tooling)
+    let (jpg, made) = ensure_thumb_file(src, root, have_ffmpeg, recipe, true)?;
+    let (w, h, rgba) = decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h).ok_or(ThumbFail::Tooling)?;
+    Ok((w, h, rgba, made))
 }
 
 /// Make sure the thumb jpg (+ meta.json) exists on disk, returning its
@@ -799,13 +901,18 @@ fn make_thumb(
 /// background gen sweep. `hw` gates VideoToolbox: the sweep passes false
 /// so its niced decodes never contend with live playback for the media
 /// engine (see `extract_frame`).
+/// Returns the artifact path and whether this call *generated* it — the
+/// instrumentation's hit/made split. Only a `made` job pays source
+/// decode + drive I/O, so on a slow disk the two populations have to be
+/// kept apart or the per-job cost distribution is meaningless (a sweep
+/// re-walking a warm cache is all sub-millisecond hits).
 fn ensure_thumb_file(
     src: &Path,
     root: &Path,
     have_ffmpeg: bool,
     recipe: &Recipe,
     hw: bool,
-) -> Result<PathBuf, ThumbFail> {
+) -> Result<(PathBuf, bool), ThumbFail> {
     // A vanished or non-file source is as unservable as a corrupt one.
     let meta = std::fs::metadata(src).map_err(|_| ThumbFail::Unplayable)?;
     if !meta.is_file() {
@@ -814,7 +921,8 @@ fn ensure_thumb_file(
     let dir = entry_dir(root, src, meta.len(), mtime_secs(&meta));
     let jpg = dir.join(recipe.thumb_file());
 
-    if !jpg.exists() {
+    let made = !jpg.exists();
+    if made {
         if !have_ffmpeg {
             return Err(ThumbFail::Tooling);
         }
@@ -836,7 +944,7 @@ fn ensure_thumb_file(
         extract_frame(src, &jpg, seek, recipe, codec.as_deref(), hw).ok_or(ThumbFail::Unplayable)?;
         log::debug!("thumb generated: {}", src.display());
     }
-    Ok(jpg)
+    Ok((jpg, made))
 }
 
 /// Generate/serve the animated sprite sheet: ANIM_FRAMES frames sampled
@@ -1878,7 +1986,7 @@ mod tests {
             };
             let here = ensure_thumb_file(&clip, &root, true, &recipe, true);
             let there = t.join().unwrap();
-            let jpg = here.or(there).expect("at least one generation succeeds");
+            let (jpg, _) = here.or(there).expect("at least one generation succeeds");
             assert!(
                 decode_jpeg(&jpg, 320, 180).is_some(),
                 "published artifact must decode cleanly"

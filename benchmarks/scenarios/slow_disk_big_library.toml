@@ -1,0 +1,63 @@
+name = "slow_disk_big_library"
+
+intent = """
+Open a BIG library that lives on a SLOW EXTERNAL DISK, cold cache, and do
+nothing else — no clicking, no watching. This isolates the cost of merely
+existing: the ingest walk, the gatekeeper's per-file header read, and the
+background gen sweep's first minutes.
+
+What to read:
+  - `ingest_io_s` against wall time. The gatekeeper does one 16-byte read
+    per candidate file; on a spinning disk that is one ~12ms seek each, so
+    a library of thousands turns "listing the files" into minutes of I/O.
+    If ingest_io_s is a large fraction of the time to `library_count`, the
+    gatekeeper — not the sweep — is what makes a cold open feel dead.
+  - Worker jobs, `gen`/`made` row. `worker-s` is how much wall time the
+    sweep took out of the pool; p95/max say how long ONE file can pin a
+    worker. Three workers × a multi-second job each is the whole pool.
+  - Render-thread stalls + phase attribution. The claim under test is that
+    the UI thread stalls. If it does, `ingest_install` or `drain_media`
+    should own the tail; if neither does, the stall is not in this process
+    and the next place to look is Tier B (GPU/present) or the OS.
+  - `rss_peak_mb` and `pending_bytes_peak_mb`: the crash canary. A sweep
+    that outruns the per-frame upload budget grows the result channel
+    without bound, and the RGBA in it is ~1MB per thumb.
+
+This scenario deliberately has NO performance thresholds. `inputs` points
+at a real, user-owned library — it is machine-specific and will not run
+elsewhere unchanged.
+"""
+
+[setup]
+inputs = ["/Volumes/Tower/Movies/Porn/Downloads"]
+animation = "normal"
+viewport = [1600.0, 1000.0]
+max_wall_s = 400.0
+
+# Ingest first. The count is deliberately far below the library size: we
+# want the time to a USABLE grid, not to the last file.
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 500
+timeout = 300.0
+
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 4000
+timeout = 300.0
+
+# Then sit still while the sweep runs, sampling queues, stalls and memory.
+[[step]]
+action = "wait"
+secs = 120.0
+
+[[step]]
+action = "wait_until"
+cond = "cache_thumbs"
+n = 50
+timeout = 60.0
+
+[validity]
+require = ["library_count"]

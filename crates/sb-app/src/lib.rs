@@ -797,6 +797,25 @@ impl Switchblade {
         self.probe.clone()
     }
 
+    /// Run one render-thread phase, charging its wall time to a counter.
+    /// The runner samples the deltas per tick, so a stalled frame is
+    /// attributable to a phase instead of arriving as one opaque
+    /// `tick_ms` number — the difference between "the frame took 400ms"
+    /// and "the frame spent 390ms in `drain_media`".
+    fn phase<T>(
+        &mut self,
+        work: impl FnOnce(&mut Self) -> T,
+        pick: impl FnOnce(&sb_media::probe::Counters) -> &std::sync::atomic::AtomicU64,
+    ) -> T {
+        let t0 = Instant::now();
+        let out = work(self);
+        pick(&self.probe.counters).fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        out
+    }
+
     pub fn with_options(opts: Options) -> Self {
         // Load config up front: atlas geometry, the media recipe, and the
         // ingest recurse flag are startup-only (the rest keeps
@@ -820,6 +839,11 @@ impl Switchblade {
         // cache without splitting entries across two keyings.
         sb_media::set_cache_key(tuning.cache_key);
 
+        // Instrumentation is created before ingest and the worker pool:
+        // both tally into it (ingest I/O time, worker job occupancy), so
+        // it can't be built as part of the struct literal below.
+        let probe = sb_media::Probe::new();
+
         // Worker threads (ingest, media) fire this after delivering work;
         // the window layer arms it and turns each burst into one redraw.
         let waker = Waker::new();
@@ -836,11 +860,17 @@ impl Switchblade {
                 tuning.recurse,
                 tuning.gatekeeper,
                 notify.clone(),
+                probe.clone(),
             ))
         } else if opts.demo {
             None
         } else {
-            ingest::spawn_stdin_reader(tuning.recurse, tuning.gatekeeper, notify.clone())
+            ingest::spawn_stdin_reader(
+                tuning.recurse,
+                tuning.gatekeeper,
+                notify.clone(),
+                probe.clone(),
+            )
         };
         let demo = rx.is_none();
         let recipe = recipe_from(&tuning);
@@ -863,7 +893,12 @@ impl Switchblade {
             clips: Vec::new(),
             index: HashMap::new(),
             rx,
-            media: MediaService::new(recipe, notify.clone(), tuning.gen_live_concurrency),
+            media: MediaService::new(
+                recipe,
+                notify.clone(),
+                tuning.gen_live_concurrency,
+                probe.clone(),
+            ),
             slots: vec![None; atlas_cfg.slots()],
             live_sel: None,
             live_hover: None,
@@ -935,7 +970,7 @@ impl Switchblade {
             wake_until: Instant::now() + Duration::from_secs(1),
             waker,
             notify,
-            probe: sb_media::Probe::new(),
+            probe,
             next_lane_gen: 0,
             redraw_stats: RedrawStats::new(),
             last_scroll_event: Instant::now(),
@@ -2765,7 +2800,12 @@ impl Switchblade {
         };
         log::info!("browsing siblings of {}", path.display());
         // Siblings: this directory's own videos, non-recursive.
-        let rx = ingest::spawn_dir_reader(dir.to_path_buf(), self.tuning.gatekeeper, self.notify.clone());
+        let rx = ingest::spawn_dir_reader(
+            dir.to_path_buf(),
+            self.tuning.gatekeeper,
+            self.notify.clone(),
+            self.probe.clone(),
+        );
         self.swap_library(rx, Some(path));
     }
 
@@ -2784,6 +2824,7 @@ impl Switchblade {
             self.tuning.recurse,
             self.tuning.gatekeeper,
             self.notify.clone(),
+            self.probe.clone(),
         );
         self.swap_library(rx, None);
     }
@@ -4399,8 +4440,10 @@ impl Switchblade {
                     live.clip,
                     live.player.position(),
                 );
-                hover_served = Some((live.generation, live.clip, live.player.position()));
             }
+            // Per-frame, like the selected lane above — the hover
+            // preview's continuity is measured the same way.
+            hover_served = Some((live.generation, live.clip, live.player.position()));
             if live.served < 6
                 && let Some(c) = self.clips.get(live.clip)
             {
@@ -4492,8 +4535,14 @@ impl Switchblade {
                     live.spawned.elapsed().as_secs_f32() * 1000.0,
                     live.player.position(),
                 );
-                sel_served = Some((live.generation, live.path.clone(), live.player.position()));
             }
+            // EVERY served frame, not just the first: the gap between
+            // consecutive ones is the only view of a decoder starved by
+            // drive contention — the app's own tick times stay clean
+            // while playback freezes, so a first-frame-only event cannot
+            // see the stall at all. Free when recording is disarmed (one
+            // relaxed load; the closure never runs).
+            sel_served = Some((live.generation, live.path.clone(), live.player.position()));
             if live.served < 6 {
                 handoff_dump(
                     &live.path.file_stem().unwrap_or_default().to_string_lossy(),
@@ -6050,7 +6099,7 @@ impl App for Switchblade {
             self.tuning = cfg.tuning;
             self.keymap = cfg.keymap;
         }
-        self.drain_ingest();
+        self.phase(|s| s.drain_ingest(), |c| &c.ns_ingest_install);
         // The chapter bar is a fullview add-on describing one clip: drop
         // it the moment fullview exits or the selection leaves its clip
         // (movement keys, random jump, D swap churn) — no slide-out, the
@@ -6094,8 +6143,8 @@ impl App for Switchblade {
         let lay = self.layout();
         self.request_visible_thumbs(&lay);
         self.request_quickview_sheet();
-        let mut uploads = self.drain_media(&lay);
-        self.update_live(&lay, &mut uploads);
+        let mut uploads = self.phase(|s| s.drain_media(&lay), |c| &c.ns_drain_media);
+        self.phase(|s| s.update_live(&lay, &mut uploads), |c| &c.ns_live);
         self.update_title();
         let mut frame = self.build_frame();
         frame.uploads = uploads;
