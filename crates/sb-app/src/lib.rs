@@ -3729,25 +3729,60 @@ impl Switchblade {
         )
     }
 
-    /// Zone rows ordered center-outward, for prioritized requests.
+    /// Zone rows in request-priority order: the selection's row, then the
+    /// on-screen rows top to bottom, then the prefetch margin below, then
+    /// the margin above. The old ordering walked outward from the
+    /// viewport's vertical center — meant as "load where the eye rests
+    /// first", it read as broken instead: on open the grid filled from
+    /// mid-screen while the first rows (and the selected tile, waiting at
+    /// the top) sat empty. Loading in the order the eye actually scans —
+    /// selection, then top-down — looks intentional.
     fn zone_rows(&self, lay: &Layout) -> Vec<usize> {
-        let (first_row, last_row) = self.visible_rows(lay, PREFETCH_ROWS);
-        let center = self.row_at_y(lay, self.scroll + self.viewport.height * 0.5) as i64;
-        let mut rows: Vec<usize> = (first_row..=last_row).collect();
-        rows.sort_by_key(|r| (*r as i64 - center).abs());
+        let (zone_first, zone_last) = self.visible_rows(lay, PREFETCH_ROWS);
+        let (vis_first, vis_last) = self.visible_rows(lay, 0);
+        let mut rows: Vec<usize> = Vec::with_capacity(zone_last - zone_first + 1);
+        // The zone is a couple dozen rows at most — contains() is fine.
+        let mut push = |r: usize| {
+            if (zone_first..=zone_last).contains(&r) && !rows.contains(&r) {
+                rows.push(r);
+            }
+        };
+        push(self.row_of(lay, self.selected));
+        for r in vis_first..=vis_last {
+            push(r);
+        }
+        for r in vis_last + 1..=zone_last {
+            push(r);
+        }
+        for r in zone_first..vis_first {
+            push(r);
+        }
         rows
     }
 
-    /// Queue thumbnail generation for visible + nearby tiles, center-out,
-    /// within the atlas slot budget. Without the budget, a big viewport
-    /// demands more slots than exist and eviction churns everything
-    /// forever.
+    /// Queue thumbnail generation for visible + nearby tiles — the
+    /// selected tile first, then reading order (see `zone_rows`) — within
+    /// the atlas slot budget. Without the budget, a big viewport demands
+    /// more slots than exist and eviction churns everything forever.
     fn request_visible_thumbs(&mut self, lay: &Layout) {
         if self.demo {
             return;
         }
         let rows = self.zone_rows(lay);
         let mut budget = self.atlas_cfg.slots() as i64 - 8; // headroom incl. live slot
+
+        // The selected tile is the one the user is looking at (and the
+        // one live playback will hand off from): its thumb never waits
+        // behind its rowmates.
+        if let Some(clip) = self.clips.get_mut(self.selected)
+            && clip.readable
+            && matches!(clip.thumb, Thumb::None)
+        {
+            budget -= 1;
+            self.media.request(clip.path.clone());
+            clip.thumb = Thumb::Pending;
+            self.jobs_total += 1;
+        }
 
         'statics: for &row in &rows {
             for i in self.row_range(lay, row) {
@@ -7634,6 +7669,52 @@ mod tests {
             .map(|&i| app.clips[i].path.clone())
             .collect();
         assert_eq!(marked_now, marked_paths, "marks follow their clips");
+    }
+
+    /// Thumb requests load in the order the eye scans: the selection's
+    /// row first, then on-screen rows top to bottom, then the prefetch
+    /// margin below, then above — never the old center-out walk from the
+    /// viewport's middle, which filled the grid from eye level while the
+    /// first rows (and the selected tile) sat empty on open.
+    #[test]
+    fn thumbs_load_selection_first_then_reading_order() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let _ = app.frame(0.016, vp);
+        let lay = app.layout();
+
+        // Fresh open: scroll at the top, selection on the first clip.
+        let rows = app.zone_rows(&lay);
+        let (vis_first, vis_last) = app.visible_rows(&lay, 0);
+        assert_eq!(rows[0], 0, "the selection's row loads first on open");
+        assert_eq!(
+            &rows[..=vis_last - vis_first],
+            &(vis_first..=vis_last).collect::<Vec<_>>()[..],
+            "on-screen rows fill top to bottom, not center-out"
+        );
+
+        // Scrolled deep with the selection off in a scrolled-to row: its
+        // row still jumps the queue, then the visible rows in order,
+        // then the below margin, then the above margin.
+        app.scroll = app.content_height(&lay) * 0.5;
+        let (vf, vl) = app.visible_rows(&lay, 0);
+        let (zf, zl) = app.visible_rows(&lay, PREFETCH_ROWS);
+        app.selected = app.row_range(&lay, vf + 2).start;
+        let rows = app.zone_rows(&lay);
+        assert_eq!(rows[0], vf + 2, "the selection's row is always first");
+        let mut expect = vec![vf + 2];
+        expect.extend((vf..=vl).filter(|&r| r != vf + 2));
+        expect.extend(vl + 1..=zl);
+        expect.extend(zf..vf);
+        assert_eq!(rows, expect, "then top-down, then below, then above");
     }
 
     /// Sorted ingest (`--sort newest`): arrivals merge into a creation-

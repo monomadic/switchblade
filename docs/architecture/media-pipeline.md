@@ -16,7 +16,7 @@ When the atlas is momentarily full, arriving thumbs/sheets are dropped back to `
 
 ## Slot budget & eviction classes
 
-Statics claim budget center-out; anim (storyboard) slots only ever appear from on-demand quickview/fullview installs, a handful at most. Eviction order = out-of-zone anims → out-of-zone statics → in-zone anims; never in-zone statics or live slots.
+Statics claim budget in request-priority order — the selected tile first, then on-screen rows top to bottom, then the prefetch margins (below, then above); anim (storyboard) slots only ever appear from on-demand quickview/fullview installs, a handful at most. (This replaced a center-out walk from the viewport's middle, 2026-07-23: meant as "load where the eye rests", it read as broken on open — the grid filled from mid-screen while the first rows and the selected tile sat empty.) Eviction order = out-of-zone anims → out-of-zone statics → in-zone anims; never in-zone statics or live slots.
 ---
 
 Back to the [architecture index](README.md) · [CLAUDE.md](../../CLAUDE.md) · [DESIGN.md](../../DESIGN.md)
