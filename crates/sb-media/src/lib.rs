@@ -11,7 +11,8 @@ pub mod maintenance;
 pub mod probe;
 mod seekable;
 pub use probe::{
-    CounterSnapshot, EventKind, Lane, LaneProbe, Outcome, Probe, QueueDepths, RelEvent, Tier,
+    CounterSnapshot, EventKind, Lane, LaneProbe, Outcome, Probe, QueueDepths, RelEvent,
+    RenderStall, Tier,
 };
 pub use seekable::SeekablePlayer;
 /// Re-exported so sb-app's bench runner can serialize its reports without

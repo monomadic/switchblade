@@ -27,6 +27,16 @@ use std::time::Instant;
 /// to a minute; 100k events is far above any real run's yield.
 const EVENT_CAP: usize = 100_000;
 
+/// Op class for a render-thread filesystem stall (see [`Probe::render_stall`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderStall {
+    /// `clip_meta`: source stat + meta.json read at live-spawn (first read
+    /// per clip, then memoized).
+    Meta,
+    /// `cached_thumb_path`: source stat for the drag ghost / handoff dump.
+    ThumbPath,
+}
+
 /// Which live decoder lane an event belongs to. `None` is the lane-less
 /// context: worker-pool job events, which belong to a queue *tier*
 /// instead (see [`Tier`]).
@@ -269,14 +279,23 @@ pub struct Counters {
     pub ns_live: AtomicU64,
 
     // ── render-thread blocking fs ──────────────────────────────────
-    /// Blocking filesystem calls performed ON the render thread — today
-    /// `clip_meta` (source stat + meta.json read at live-spawn time) and
-    /// `cached_thumb_path` (source stat: drag ghost, handoff dump). The
-    /// phase counters above blame a phase; these name the exact op class,
-    /// and on a network volume each call is a synchronous round-trip.
+    /// Blocking filesystem calls performed ON the render thread. The phase
+    /// counters above blame a phase; these name the exact op class, split
+    /// so the fix target is unambiguous — on a network volume each call is
+    /// a synchronous round-trip and one of the two classes is avoidable:
+    /// - `meta`: `clip_meta` (source stat + meta.json read) at live-spawn.
+    ///   Load-bearing, but only the FIRST read per clip (then memoized).
+    /// - `path`: `cached_thumb_path` (source stat) — the drag ghost, and
+    ///   the handoff-dump arg that is computed even when the dump env var
+    ///   is unset (up to 6× per lane spawn, producing nothing).
+    /// `render_stalls`/`_us`/`_max_us` are the aggregate over both.
     pub render_stalls: AtomicU64,
     pub render_stall_us: AtomicU64,
     pub render_stall_max_us: AtomicU64,
+    pub render_stall_meta_count: AtomicU64,
+    pub render_stall_meta_us: AtomicU64,
+    pub render_stall_path_count: AtomicU64,
+    pub render_stall_path_us: AtomicU64,
 }
 
 /// A point-in-time read of the counters (serializable for the summary).
@@ -324,6 +343,14 @@ pub struct CounterSnapshot {
     pub render_stall_us: u64,
     #[serde(default)]
     pub render_stall_max_us: u64,
+    #[serde(default)]
+    pub render_stall_meta_count: u64,
+    #[serde(default)]
+    pub render_stall_meta_us: u64,
+    #[serde(default)]
+    pub render_stall_path_count: u64,
+    #[serde(default)]
+    pub render_stall_path_us: u64,
 }
 
 /// A drained event, rebased to seconds since the run anchor.
@@ -512,19 +539,27 @@ impl Probe {
             render_stalls: c.render_stalls.load(Ordering::Relaxed),
             render_stall_us: c.render_stall_us.load(Ordering::Relaxed),
             render_stall_max_us: c.render_stall_max_us.load(Ordering::Relaxed),
+            render_stall_meta_count: c.render_stall_meta_count.load(Ordering::Relaxed),
+            render_stall_meta_us: c.render_stall_meta_us.load(Ordering::Relaxed),
+            render_stall_path_count: c.render_stall_path_count.load(Ordering::Relaxed),
+            render_stall_path_us: c.render_stall_path_us.load(Ordering::Relaxed),
         }
     }
 
-    /// Account one blocking filesystem operation performed on the render
-    /// thread (see `Counters::render_stalls`). Callers time the op and
-    /// hand the duration in; always live, like every counter.
-    pub fn render_stall(&self, took: std::time::Duration) {
+    /// Which render-thread fs op class a stall belongs to (see
+    /// `Counters` render-stall fields).
+    pub fn render_stall(&self, kind: RenderStall, took: std::time::Duration) {
         let us = took.as_micros() as u64;
-        self.counters.render_stalls.fetch_add(1, Ordering::Relaxed);
-        self.counters.render_stall_us.fetch_add(us, Ordering::Relaxed);
-        self.counters
-            .render_stall_max_us
-            .fetch_max(us, Ordering::Relaxed);
+        let c = &self.counters;
+        c.render_stalls.fetch_add(1, Ordering::Relaxed);
+        c.render_stall_us.fetch_add(us, Ordering::Relaxed);
+        c.render_stall_max_us.fetch_max(us, Ordering::Relaxed);
+        let (n, sum) = match kind {
+            RenderStall::Meta => (&c.render_stall_meta_count, &c.render_stall_meta_us),
+            RenderStall::ThumbPath => (&c.render_stall_path_count, &c.render_stall_path_us),
+        };
+        n.fetch_add(1, Ordering::Relaxed);
+        sum.fetch_add(us, Ordering::Relaxed);
     }
 
     /// Stop recording and return the buffered events rebased to seconds

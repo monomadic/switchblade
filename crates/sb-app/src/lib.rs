@@ -889,10 +889,6 @@ impl Switchblade {
             atlas_cfg.rows,
             atlas_cfg.tex_w() as u64 * atlas_cfg.tex_h() as u64 * 4 / (1024 * 1024)
         );
-        // One probe shared with the media workers, so scheduler counters
-        // (job tallies, channel backlog) land in the same sink the bench
-        // runner samples.
-        let probe = sb_media::Probe::new();
         let mut app = Self {
             clips: Vec::new(),
             index: HashMap::new(),
@@ -4465,7 +4461,7 @@ impl Switchblade {
                         // into the render-stall counters (slow-disk diag).
                         let t0 = Instant::now();
                         let p = self.media.cached_thumb_path(&c.path);
-                        self.probe.render_stall(t0.elapsed());
+                        self.probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
                         p
                     },
                 );
@@ -4569,7 +4565,7 @@ impl Switchblade {
                         // into the render-stall counters (slow-disk diag).
                         let t0 = Instant::now();
                         let p = self.media.cached_thumb_path(&live.path);
-                        self.probe.render_stall(t0.elapsed());
+                        self.probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
                         p
                     },
                 );
@@ -4636,7 +4632,8 @@ impl Switchblade {
         // how a bench run proves/absolves it.
         let t0 = Instant::now();
         let m = sb_media::cached_meta(path);
-        self.probe.render_stall(t0.elapsed());
+        self.probe
+            .render_stall(sb_media::RenderStall::Meta, t0.elapsed());
         let m = m?;
         if m.pix_fmt.is_some() {
             self.meta_cache.insert(path.to_path_buf(), m.clone());
@@ -5948,7 +5945,7 @@ impl App for Switchblade {
                             } else {
                                 let t0 = Instant::now();
                                 let p = self.media.cached_thumb_path(&c.path);
-                                self.probe.render_stall(t0.elapsed());
+                                self.probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
                                 p
                             };
                             self.cmds.push(WindowCommand::BeginDrag {

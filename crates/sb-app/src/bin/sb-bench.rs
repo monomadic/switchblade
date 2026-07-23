@@ -275,6 +275,13 @@ fn print_summary(s: &sb_app::bench::Summary) {
         c.render_stall_us as f64 / 1000.0,
         c.render_stall_max_us as f64 / 1000.0,
     );
+    println!(
+        "render stalls: meta {}× {:.1}ms (clip_meta) | thumb_path {}× {:.1}ms (cached_thumb_path)",
+        c.render_stall_meta_count,
+        c.render_stall_meta_us as f64 / 1000.0,
+        c.render_stall_path_count,
+        c.render_stall_path_us as f64 / 1000.0,
+    );
     for l in &s.latencies {
         println!(
             "latency {:>8}/{:<20} n={:<3} p50={:.0}ms p95={:.0}ms max={:.0}ms",
