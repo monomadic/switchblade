@@ -262,6 +262,19 @@ fn print_summary(s: &sb_app::bench::Summary) {
         "tick_ms: p50={:.2} p95={:.2} max={:.2}",
         s.tick_ms.p50, s.tick_ms.p95, s.tick_ms.max
     );
+    println!(
+        "sched: jobs {}/{} started (hit {}, failed {}) busy={:.1}s util={:.2} | backlog peak {:.1} MB | render_stalls={} total={:.1}ms max={:.1}ms",
+        c.jobs_finished,
+        c.jobs_started,
+        c.jobs_hit,
+        c.jobs_failed,
+        c.worker_busy_us as f64 / 1e6,
+        s.worker_utilisation,
+        c.pending_bytes_peak as f64 / (1024.0 * 1024.0),
+        c.render_stalls,
+        c.render_stall_us as f64 / 1000.0,
+        c.render_stall_max_us as f64 / 1000.0,
+    );
     for l in &s.latencies {
         println!(
             "latency {:>8}/{:<20} n={:<3} p50={:.0}ms p95={:.0}ms max={:.0}ms",

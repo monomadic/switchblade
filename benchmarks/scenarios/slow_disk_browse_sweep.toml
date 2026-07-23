@@ -1,0 +1,104 @@
+name = "slow_disk_browse_sweep"
+intent = """
+The user-facing half of the slow-disk thrash: while the cold sweep churns
+against the slow volume, actually browse — scroll deep into the library
+(visible-thumb requests flood tier 1 and evict), move the selection, and
+open quickview so the selected stream must cold-spawn and present against
+the sweep's disk+CPU load. Watch: selected spawn_to_served latency,
+late_frames/reanchors while presenting, tick spikes on the render loop,
+queue depths and channel backlog while the visible tier floods, and
+render-thread fs stalls (clip_meta on the slow volume at spawn time).
+Point $SB_BENCH_LIBRARY at the corpus directory.
+"""
+
+[setup]
+inputs = ["$SB_BENCH_LIBRARY"]
+animation = "normal"
+viewport = [1280, 800]
+max_wall_s = 180.0
+
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 100
+timeout = 60.0
+
+# Let the sweep get its teeth in before we interfere.
+[[step]]
+action = "wait"
+secs = 8.0
+
+# A sustained flick deep into the library: every row scrolled into view
+# queues visible thumbs at tier 1 (over the sweep) and churns the atlas.
+[[step]]
+action = "scroll"
+dy = -30.0
+n = 120
+
+[[step]]
+action = "wait"
+secs = 5.0
+
+# Back up, then flick again — the return trip re-requests what eviction
+# dropped (retryable GPU-residency drops make this a real workload).
+[[step]]
+action = "scroll"
+dy = 30.0
+n = 120
+
+[[step]]
+action = "wait"
+secs = 5.0
+
+# Keyboard browse: selection moves spawn/kill warm + selected decoders.
+[[step]]
+action = "key"
+key = "l"
+
+[[step]]
+action = "wait"
+secs = 2.0
+
+[[step]]
+action = "key"
+key = "l"
+
+[[step]]
+action = "wait"
+secs = 2.0
+
+# Open quickview: the selected stream must reach first frame against the
+# sweep, then present cleanly for a while.
+[[step]]
+action = "key"
+key = "space"
+
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 30.0
+
+[[step]]
+action = "wait"
+secs = 15.0
+
+# Advance clips inside quickview: each step is a promotion or cold spawn
+# racing the sweep.
+[[step]]
+action = "key"
+key = "l"
+
+[[step]]
+action = "wait"
+secs = 6.0
+
+[[step]]
+action = "key"
+key = "l"
+
+[[step]]
+action = "wait"
+secs = 6.0
+
+[validity]
+require = ["library_count", "selected_served"]

@@ -267,6 +267,16 @@ pub struct Counters {
     pub ns_drain_media: AtomicU64,
     pub ns_ingest_install: AtomicU64,
     pub ns_live: AtomicU64,
+
+    // ── render-thread blocking fs ──────────────────────────────────
+    /// Blocking filesystem calls performed ON the render thread — today
+    /// `clip_meta` (source stat + meta.json read at live-spawn time) and
+    /// `cached_thumb_path` (source stat: drag ghost, handoff dump). The
+    /// phase counters above blame a phase; these name the exact op class,
+    /// and on a network volume each call is a synchronous round-trip.
+    pub render_stalls: AtomicU64,
+    pub render_stall_us: AtomicU64,
+    pub render_stall_max_us: AtomicU64,
 }
 
 /// A point-in-time read of the counters (serializable for the summary).
@@ -308,6 +318,12 @@ pub struct CounterSnapshot {
     pub ns_ingest_install: u64,
     #[serde(default)]
     pub ns_live: u64,
+    #[serde(default)]
+    pub render_stalls: u64,
+    #[serde(default)]
+    pub render_stall_us: u64,
+    #[serde(default)]
+    pub render_stall_max_us: u64,
 }
 
 /// A drained event, rebased to seconds since the run anchor.
@@ -493,7 +509,22 @@ impl Probe {
             ns_drain_media: c.ns_drain_media.load(Ordering::Relaxed),
             ns_ingest_install: c.ns_ingest_install.load(Ordering::Relaxed),
             ns_live: c.ns_live.load(Ordering::Relaxed),
+            render_stalls: c.render_stalls.load(Ordering::Relaxed),
+            render_stall_us: c.render_stall_us.load(Ordering::Relaxed),
+            render_stall_max_us: c.render_stall_max_us.load(Ordering::Relaxed),
         }
+    }
+
+    /// Account one blocking filesystem operation performed on the render
+    /// thread (see `Counters::render_stalls`). Callers time the op and
+    /// hand the duration in; always live, like every counter.
+    pub fn render_stall(&self, took: std::time::Duration) {
+        let us = took.as_micros() as u64;
+        self.counters.render_stalls.fetch_add(1, Ordering::Relaxed);
+        self.counters.render_stall_us.fetch_add(us, Ordering::Relaxed);
+        self.counters
+            .render_stall_max_us
+            .fetch_max(us, Ordering::Relaxed);
     }
 
     /// Stop recording and return the buffered events rebased to seconds

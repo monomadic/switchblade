@@ -613,11 +613,16 @@ impl Rig {
                 Ok(())
             }
             "scroll" => {
-                self.app.event(InputEvent::Scroll {
-                    dx: 0.0,
-                    dy: step.dy,
-                });
-                self.tick();
+                // Like `pinch`, a trackpad scroll is a STREAM of deltas —
+                // `n` repeats one event per frame so a scenario can drive
+                // a sustained flick through a big library.
+                for _ in 0..step.n.max(1) {
+                    self.app.event(InputEvent::Scroll {
+                        dx: 0.0,
+                        dy: step.dy,
+                    });
+                    self.tick();
+                }
                 Ok(())
             }
             "pinch" => {
@@ -756,7 +761,20 @@ fn parse_scenario(text: &str, sets: &[String]) -> Result<Scenario, String> {
 
 fn resolve_inputs(setup: &Setup) -> Result<Vec<PathBuf>, String> {
     if !setup.inputs.is_empty() {
-        return Ok(setup.inputs.iter().map(PathBuf::from).collect());
+        // A `$VAR` input resolves through the environment, so a scenario
+        // can target a machine-local corpus (an external or network
+        // volume) without hardcoding its mount point:
+        //   inputs = ["$SB_BENCH_LIBRARY"]
+        return setup
+            .inputs
+            .iter()
+            .map(|s| match s.strip_prefix('$') {
+                Some(var) => std::env::var_os(var)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| format!("input ${var}: environment variable not set")),
+                None => Ok(PathBuf::from(s)),
+            })
+            .collect();
     }
     if setup.demo {
         return Ok(Vec::new());

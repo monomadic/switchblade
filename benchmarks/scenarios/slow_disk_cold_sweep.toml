@@ -1,0 +1,40 @@
+name = "slow_disk_cold_sweep"
+intent = """
+Big library on a slow/external volume, cold cache: ingest the whole corpus
+and let the gen sweep + visible-thumb tier churn with NO user attention.
+The question is scheduler health, not throughput: does the render loop
+stay responsive (tick_ms p95 / tick_spikes), does the unbounded result
+channel balloon (peak_backlog_*), how deep do the queues run
+(sched_curve), and how much blocking fs work lands on the render thread
+(render_stall_*)? Point $SB_BENCH_LIBRARY at the corpus directory.
+The sweep is NOT expected to finish inside the wall budget on a big
+library — this scenario samples the steady thrash state, not completion.
+"""
+
+[setup]
+inputs = ["$SB_BENCH_LIBRARY"]
+animation = "normal"
+viewport = [1280, 800]
+max_wall_s = 150.0
+
+# Let ingest stream in (dir walk stats every file on the slow volume).
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 100
+timeout = 60.0
+
+# Ride the sweep: visible thumbs for the first screen + background gen
+# for everything else, all against the slow disk.
+[[step]]
+action = "wait_until"
+cond = "cache_thumbs"
+n = 60
+timeout = 60.0
+
+[[step]]
+action = "wait"
+secs = 45.0
+
+[validity]
+require = ["library_count", "cache_thumbs"]

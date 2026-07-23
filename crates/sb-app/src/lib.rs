@@ -889,6 +889,10 @@ impl Switchblade {
             atlas_cfg.rows,
             atlas_cfg.tex_w() as u64 * atlas_cfg.tex_h() as u64 * 4 / (1024 * 1024)
         );
+        // One probe shared with the media workers, so scheduler counters
+        // (job tallies, channel backlog) land in the same sink the bench
+        // runner samples.
+        let probe = sb_media::Probe::new();
         let mut app = Self {
             clips: Vec::new(),
             index: HashMap::new(),
@@ -4456,7 +4460,14 @@ impl Switchblade {
                     live.player.w,
                     live.player.h,
                     &rgba,
-                    self.media.cached_thumb_path(&c.path),
+                    {
+                        // Render-thread stat on the source volume — timed
+                        // into the render-stall counters (slow-disk diag).
+                        let t0 = Instant::now();
+                        let p = self.media.cached_thumb_path(&c.path);
+                        self.probe.render_stall(t0.elapsed());
+                        p
+                    },
                 );
             }
             live.served += 1;
@@ -4553,7 +4564,14 @@ impl Switchblade {
                     live.player.w,
                     live.player.h,
                     &rgba,
-                    self.media.cached_thumb_path(&live.path),
+                    {
+                        // Render-thread stat on the source volume — timed
+                        // into the render-stall counters (slow-disk diag).
+                        let t0 = Instant::now();
+                        let p = self.media.cached_thumb_path(&live.path);
+                        self.probe.render_stall(t0.elapsed());
+                        p
+                    },
                 );
             }
             live.served += 1;
@@ -4612,7 +4630,14 @@ impl Switchblade {
         if let Some(m) = self.meta_cache.get(path) {
             return Some(m.clone());
         }
-        let m = sb_media::cached_meta(path)?;
+        // Blocking disk on the render thread (source stat + meta.json):
+        // timed into the probe's render-stall counters — on a slow or
+        // network volume THIS is a direct UI hitch, and the counter is
+        // how a bench run proves/absolves it.
+        let t0 = Instant::now();
+        let m = sb_media::cached_meta(path);
+        self.probe.render_stall(t0.elapsed());
+        let m = m?;
         if m.pix_fmt.is_some() {
             self.meta_cache.insert(path.to_path_buf(), m.clone());
         }
@@ -5921,7 +5946,10 @@ impl App for Switchblade {
                             let image = if c.cloud {
                                 None
                             } else {
-                                self.media.cached_thumb_path(&c.path)
+                                let t0 = Instant::now();
+                                let p = self.media.cached_thumb_path(&c.path);
+                                self.probe.render_stall(t0.elapsed());
+                                p
                             };
                             self.cmds.push(WindowCommand::BeginDrag {
                                 path: c.path.clone(),
