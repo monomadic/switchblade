@@ -1,4 +1,4 @@
-//! Tier-A benchmark runner entry point (benchmarks/TASKS.md Phase 3).
+//! Tier-A benchmark runner entry point (benchmarks/HARNESS.md Phase 3).
 //!
 //! Subcommands:
 //!   sb-bench run   <scenario.toml> [--out <dir>] [--home <dir>] [--keep-home]

@@ -1,8 +1,13 @@
-# Performance improvement tasks
+# 02 — Performance & efficiency review (2026-07-16, stall addendum 2026-07-20)
 
-This is the implementation queue produced by the 2026-07 performance and
-efficiency review. [PLAN.md](PLAN.md) remains the source of truth for product
-scope and settled architecture; [PERF.md](PERF.md) remains the source for
+Reflective record of the 2026-07 performance and efficiency review and the
+2026-07-20 render-thread stall review that extended it. Most entries below are
+DONE and read as what-was-found / what-was-done history; the entries still open
+(P1.1, P1.7, the P2 group) are **tracked in [TASKS.md](../../TASKS.md)** — this
+document is the reference for their full problem statements, not the queue
+itself. [DESIGN.md](../../DESIGN.md) remains the source of truth for product
+scope and settled architecture;
+[01-live-video-pipeline.md](01-live-video-pipeline.md) remains the source for
 measured live-video facts and the deferred NV12 decision.
 
 The current architecture is fundamentally sound: hardware scaling, paced
@@ -16,7 +21,7 @@ gains are primarily in scheduling, memory residency, and work proportionality.
   and animation level.
 - Preserve the live-player invariants in `AGENTS.md`: promotion before pruning,
   bounded-queue warmth, serialized warm spawns, and drop waking the condvar.
-- Do not begin NV12/GPU color conversion unless a `PERF.md` entry criterion is
+- Do not begin NV12/GPU color conversion unless a `01-live-video-pipeline.md` entry criterion is
   met.
 - Do not add SQLite, a text stack, or a new dependency for any task here.
 - Keep stdin streaming and never move file stats or media work onto the render
@@ -1054,7 +1059,7 @@ churn on target usage.
 
 ### P2.5 — NV12 upload and GPU color conversion
 
-**Status:** Deferred by `PERF.md`
+**Status:** Deferred by `01-live-video-pipeline.md`
 
 Do not pull this forward merely because RGBA copies are visible in the code.
 The existing entry criteria still apply:
@@ -1064,7 +1069,7 @@ The existing entry criteria still apply:
   texture-format disruptions in one renderer change).
 
 When an entry criterion is met, follow the color-space/range metadata and PSNR
-verification plan in [PERF.md](PERF.md). This is not a substitute for the
+verification plan in [01-live-video-pipeline.md](01-live-video-pipeline.md). This is not a substitute for the
 scheduling and residency tasks above.
 
 ---
@@ -1127,8 +1132,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release
 ```
 
-For live-player changes, also run the serial performance/regression matrix from
-[PERF.md](PERF.md). For UI/render-loop changes, rebuild/install and validate on
+For live-player changes, also run the serial performance/[01-live-video-pipeline.md](01-live-video-pipeline.md). For UI/render-loop changes, rebuild/install and validate on
 the real clip library, including:
 
 - cold and warm cache;

@@ -1,4 +1,4 @@
-//! Tier-A headless benchmark runner (benchmarks/TASKS.md Phase 3;
+//! Tier-A headless benchmark runner (benchmarks/HARNESS.md Phase 3;
 //! benchmarks/design/phase-0-contracts.md).
 //!
 //! Drives the real `Switchblade` through its `App` interface with real

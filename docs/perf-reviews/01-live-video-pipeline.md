@@ -1,12 +1,13 @@
-# Live-video performance — status & durable facts
+# 01 — Live-video pipeline review (2026-07-10)
 
-Companion to [PLAN.md](PLAN.md), covering live-playback performance.
-Open performance and efficiency work is routed through
-[PERFORMANCE-TASKS.md](PERFORMANCE-TASKS.md).
+Reflective record of the live-playback performance investigation — root
+cause, measurements, and the durable facts it produced. Not a todo list:
+open work extracted from it is tracked in [TASKS.md](../../TASKS.md).
+Companion to [DESIGN.md](../../DESIGN.md).
 **Phases 0–4 shipped 2026-07-10** (investigated on an Apple M3, 8-core
 fanless, 60Hz panel, ffmpeg 8.1.1 Homebrew); **Phase 5 is deferred**
 (below). The per-lane player later moved from an ffmpeg-CLI player to the
-in-process `SeekablePlayer` (PLAN.md §15, 2026-07; the CLI player was
+in-process `SeekablePlayer` (DESIGN.md §15, 2026-07; the CLI player was
 removed 2026-07-22); the hw/sw scale chains and pacing invariants below
 carried over verbatim.
 

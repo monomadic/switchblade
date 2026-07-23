@@ -1,6 +1,6 @@
 //! sb-window: owns the winit event loop and the wgpu surface.
 //!
-//! Boundary rule (PLAN.md §12): this crate owns the loop and calls *into* an
+//! Boundary rule (DESIGN.md §12): this crate owns the loop and calls *into* an
 //! [`App`] trait. No winit or wgpu types cross the boundary — the app sees
 //! normalized input events and hands back a plain frame description.
 
@@ -264,7 +264,7 @@ pub trait App {
     }
 }
 
-/// Cross-thread render-loop wake handle (PERFORMANCE-TASKS.md P0.2).
+/// Cross-thread render-loop wake handle (docs/perf-reviews/02-efficiency-review.md P0.2).
 ///
 /// Worker threads call [`Waker::wake`] after delivering work; the window
 /// layer turns that into a single redraw, so background completions repaint

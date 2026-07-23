@@ -538,7 +538,7 @@ impl Gpu {
             config.height,
         );
 
-        // Residency telemetry (PERFORMANCE-TASKS.md P0.1): report what
+        // Residency telemetry (docs/perf-reviews/02-efficiency-review.md P0.1): report what
         // this startup reserved on the GPU so atlas sizing (P0.5) is
         // measured, not guessed. All three are RGBA/BGRA (4 B/px).
         let mip_bytes = |w: u32, h: u32, mips: u32| -> u64 {
@@ -573,7 +573,7 @@ impl Gpu {
             log::warn!(
                 "atlas reserves {} MiB for {} slots — verify visible+prefetch demand actually \
                  needs this (smaller atlas_width/height in switchblade.toml frees the rest; \
-                 PERFORMANCE-TASKS.md P0.5)",
+                 docs/perf-reviews/02-efficiency-review.md P0.5)",
                 atlas_bytes / MIB,
                 atlas_cfg.slots(),
             );

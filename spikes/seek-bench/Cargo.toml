@@ -3,7 +3,7 @@ name = "seek-bench"
 version = "0.1.0"
 edition = "2024"
 
-# Standalone spike (PLAN.md §15 "Low-latency seek", port step 1) — deliberately
+# Standalone spike (DESIGN.md §15 "Low-latency seek", port step 1) — deliberately
 # NOT a workspace member: rsmpeg is spike evidence, not an app dependency yet.
 # Build/run from this directory: cargo run --release -- <clip> [clip...]
 [workspace]

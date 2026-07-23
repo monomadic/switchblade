@@ -3,7 +3,7 @@
 These are the load-bearing agreements the runner is built on. They exist so
 measurements are honest and comparable *before* any runner code is written. Nothing
 here declares a performance number "good" or "bad" — that judgment is retrospective
-and agentic (see [TASKS.md](../TASKS.md)). File:line references are point-in-time
+and agentic (see [HARNESS.md](../HARNESS.md)). File:line references are point-in-time
 anchors to the hooks each contract leans on; verify against current code when
 implementing.
 
@@ -152,7 +152,7 @@ absolute** — Tier A has no vsync-blocking present, so "served on time" is a pr
 `action_to_presented`, GPU upload bytes/frame and `MEDIA_UPLOAD_BUDGET_LIVE` pressure,
 blur/backdrop cost, any "does it *look* smooth" claim.
 
-**Neither tier** substitutes for the PLAN §15 live-feel evaluation. Instrumentation
+**Neither tier** substitutes for the DESIGN.md §15 live-feel evaluation. Instrumentation
 can measure decoder churn and action-to-frame latency for the attention-lane verdict,
 but hover feel and misclick-modal cost are human judgments; the bench informs that
 decision, it does not make it.

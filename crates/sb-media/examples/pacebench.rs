@@ -1,9 +1,9 @@
-//! Live-playback pacing benchmark (PERF.md Phase 0).
+//! Live-playback pacing benchmark (docs/perf-reviews/01-live-video-pipeline.md Phase 0).
 //!
 //! Measures `SeekablePlayer` frame delivery exactly as the app consumes it:
 //! poll `take_frame()` every 16.67ms (a 60Hz render tick) and report
 //! delivered fps, interval percentiles, and gap count. Acceptance
-//! criteria for the PERF.md phases are runs of this benchmark.
+//! criteria for the docs/perf-reviews/01-live-video-pipeline.md phases are runs of this benchmark.
 //!
 //! ```sh
 //! cargo run --release -p sb-media --example pacebench -- <clip> <w> <h> <fps> [secs] [sw|swscale]
@@ -19,7 +19,7 @@
 //! disk reads) shows up as a burst of ~2×-interval gaps that vanishes
 //! on the rerun. Benchmark numbers come from warm runs.
 //!
-//! Standard deterministic test assets (also listed in PERF.md):
+//! Standard deterministic test assets (also listed in docs/perf-reviews/01-live-video-pipeline.md):
 //!
 //! ```sh
 //! ffmpeg -y -f lavfi -i "testsrc2=duration=8:size=3840x2160:rate=60" \
@@ -31,7 +31,7 @@
 //! ```
 //!
 //! **Run benchmarks strictly serially, on an idle machine, on AC power**
-//! — concurrent runs contaminate the numbers (PERF.md standing rules).
+//! — concurrent runs contaminate the numbers (docs/perf-reviews/01-live-video-pipeline.md standing rules).
 
 use std::time::{Duration, Instant};
 

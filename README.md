@@ -11,14 +11,14 @@ fd -e mp4 -e mov . ~/Clips | switchblade
 
 Built for VJs picking clips mid-set, creators sorting AI-generated footage, and anyone with a folder full of clips and no fast way to *see* them. Not an editor, not a media manager — a picker.
 
-> **Status:** early and moving fast. macOS-first (Metal via wgpu). See [PLAN.md](PLAN.md) for the design plan and roadmap.
+> **Status:** early and moving fast. macOS-first (Metal via wgpu). See [DESIGN.md](DESIGN.md) for the design record and [TASKS.md](TASKS.md) for the roadmap.
 
 ## What it does
 
 - **Instanced GPU grid** — thousands of clips render as one draw call; near-black field, thick-bordered selection, buttery springs everywhere.
 - **Streaming stdin** — tiles appear while `fd` is still finding files. Newline- or NUL-delimited, never blocks on a slow producer.
 - **Cached thumbnails** — one frame per clip (ffmpeg) in a content-addressed sidecar cache; a relaunch over the same library is instant. Your media files are never written to.
-- **Animated thumbnails** — a sprite sheet of frames sampled across each clip; tiles cycle with per-clip phase offsets and shader crossfade. Toggle with `a`.
+- **Storyboard sheets** — a sprite sheet of frames sampled across each clip, generated on demand the first time a clip is previewed; powers the seekbar hover thumbnails and the chapter chips.
 - **Live playback in-tile** — the selected and hovered clips play real (silent, looping) video inside their tiles, seek-matched to the thumbnail's frame so nothing jumps. An in-process (libav) decoder keeps the demuxer resident, so seeking is a jump-in-place, not a reload.
 - **Quickview** — `Space` (or click the selection): the grid dims and frosts and the clip plays large and centered at natural resolution (up to 1080p, configurable). Move the pointer over the video for a **seekbar** — click to seek, hold-drag to scrub, hover for storyboard thumbnails; scroll to fly the **filmstrip** of neighbors along the bottom, or `h`/`l` to step. `[`/`]` skip through the clip anywhere.
 - **Chapter bar** — `g` opens the clip fullscreen-in-app with a strip of chapter chips (real container chapters when present, synthesized checkpoints otherwise); click a chip to jump the video there.
@@ -62,7 +62,6 @@ switchblade --help    # options, including --animation and --fullscreen
 | `r` | reveal in Finder |
 | `[` / `]` | skip back / forward through the playing clip (wraps) |
 | `D` | browse the selected clip's siblings (its parent dir) |
-| `a` | toggle animated thumbnails |
 | `p` | toggle pause-when-unfocused |
 | `-` / `=` / `0` | zoom out / in / reset (also trackpad pinch) |
 | `f` | fullscreen |

@@ -1,8 +1,13 @@
-# Benchmark instrumentation — task plan
+# Benchmark harness (`sb-bench`) — design record
 
-Goal: repeatable, scripted benchmark runs of the real app that record everything and
-compute per-run summaries; **interpretation is retrospective and agentic**, not baked
-into the apparatus. A scenario states its intent in prose; the runner only measures.
+(Formerly `benchmarks/TASKS.md`.) Goal: repeatable, scripted benchmark runs of the
+real app that record everything and compute per-run summaries; **interpretation is
+retrospective and agentic**, not baked into the apparatus. A scenario states its
+intent in prose; the runner only measures.
+
+Phases 0–4 are implemented; this file is the settled-design record and phase
+history. The open items (2.2, the 3.4/3.5 leftovers, Phase 5) are indexed in
+[TASKS.md](../TASKS.md).
 
 ## Settled design decisions
 

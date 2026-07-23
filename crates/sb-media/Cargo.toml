@@ -8,7 +8,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 log = { workspace = true }
-# In-process libav for the seekable quickview decoder (PLAN.md §15
+# In-process libav for the seekable quickview decoder (DESIGN.md §15
 # "Low-latency seek", settled 2026-07). Links the system ffmpeg via
 # pkg-config — building sb-media now needs the ffmpeg 8.x dev headers
 # (brew ffmpeg provides them alongside the CLI we already require).

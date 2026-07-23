@@ -1,4 +1,4 @@
-//! Key → command dispatch (PLAN.md §11): one keymap resolves keys to
+//! Key → command dispatch (DESIGN.md §11): one keymap resolves keys to
 //! internal actions or external programs run on the selected clip.
 //!
 //! Movement is fully remappable: hjkl and the arrows bind to the

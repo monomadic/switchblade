@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Deterministic ffmpeg fixture corpus for the benchmark harness
-# (benchmarks/TASKS.md Phase 2; benchmarks/design/phase-0-contracts.md).
+# (benchmarks/HARNESS.md Phase 2; benchmarks/design/phase-0-contracts.md).
 #
 # The matrix targets switchblade's known performance fault lines: the VT
 # hardware path (h264/hevc), the heavy 4K60 + hw-scale path, the 10-bit
@@ -65,7 +65,7 @@ add_entry h264_1080p30.mp4 h264 1920 1080 30 10 \
   ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=10" \
   -c:v libx264 -preset ultrafast -pix_fmt yuv420p
 
-# 2. Heavy path: 4K60 + the hw-scale chain (4K60→1440p was the PERF.md win).
+# 2. Heavy path: 4K60 + the hw-scale chain (4K60→1440p was the docs/perf-reviews/01-live-video-pipeline.md win).
 add_entry hevc_2160p60.mp4 hevc 3840 2160 60 10 \
   ffmpeg -y -f lavfi -i "testsrc2=size=3840x2160:rate=60:duration=10" \
   -c:v libx265 -preset ultrafast -pix_fmt yuv420p -tag:v hvc1

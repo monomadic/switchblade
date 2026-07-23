@@ -1,4 +1,4 @@
-//! In-process libav playback with a real seek channel (PLAN.md §15
+//! In-process libav playback with a real seek channel (DESIGN.md §15
 //! "Low-latency seek", settled 2026-07; spike numbers in `spikes/seek-bench`).
 //!
 //! `SeekablePlayer` is the sole live player — every lane (selected, warm,

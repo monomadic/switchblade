@@ -4,6 +4,13 @@
 > Feed it clips on stdin, fly the grid, pick the shot.
 > Built in Rust. Minimal, fast, and clip-first.
 
+**This is the design record** — product vision, design pillars, settled
+decisions, and technical-spike records. It is deliberately *not* a task list:
+the prioritized queue of open work (epics and tasks) lives in
+[TASKS.md](TASKS.md), and reflective performance reviews live in
+[docs/perf-reviews/](docs/perf-reviews/). This file was formerly `PLAN.md`;
+section numbers (§N) are stable — code comments cite them.
+
 ---
 
 ## 1. What this is
@@ -391,7 +398,7 @@ Sequence:
 
 ## 14. Milestones
 
-> **Progress:** M0–M6 and M8 are shipped. The **attention-lane interaction spike** (§15 — hover/selection-following hires lane, click-to-quickview, cmd/shift-click multi-select) is built behind the `interaction` flag; its feel evaluation and verdict are next (the verdict shapes the select model everything else builds on), then M9, then M7 (which brings the text stack), then the planned M10 (hashtags) and M11 (drawers). A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
+> **Progress:** M0–M6 and M8 are shipped and recorded below as history (exit criteria kept for the record). The open milestones — the attention-lane evaluation (§15), M9, M7, M10, M11 — live as **epics in [TASKS.md](TASKS.md)**, which owns their full specs and priority order. A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
 
 ### M0 — Skeleton ✅
 - CLI accepts stdin paths (newline and NUL-delimited), **streaming** — don't wait for EOF.
@@ -457,13 +464,9 @@ Sequence:
 
 **Exit criteria:** the grid feels alive without live-decoding many full videos.
 
-### M7 — Search/filter *(MVP v2)*
-- Fuzzy filename search.
-- Filter current input set.
-- Keep selection sane across filters.
-- (Real text rendering lands here — first time a text stack enters the codebase.)
-
-**Exit criteria:** large clip sets become practical.
+### M7 — Search/filter *(MVP v2 — open)*
+Moved to [TASKS.md](TASKS.md) (epic E2). Brings the first text stack into the
+codebase; rides M9's view-indirection layer.
 
 ### M8 — Quickview scrub *(MVP v2)* ✅ *feature-complete (2026-07)*
 Pointer-driven seeking + filmstrip feel in the quickview modal; seeking hits **only the quickview main video** (grid never seeks). Every live lane rides the in-process `SeekablePlayer` (§15). Shipped:
@@ -476,67 +479,32 @@ Remaining, conditional (only if the g² storyboard proves too coarse in use): *p
 
 **Exit criteria:** met — the pointer alone finds a moment (bar + hover thumbs + click), the filmstrip feels physical, and chained seeks never flash the thumbnail (worst case is freeze-then-jump).
 
-### M9 — Metadata sort & filter *(MVP v2)*
-Reorder and subset the ingested grid by metadata, driven by **internal commands bound to keys** — no UI chrome yet (`[keys]`/`[commands]`, per §11). Needs no text stack, so it can land before M7.
+### M9 — Metadata sort & filter *(MVP v2 — open)*
+Moved to [TASKS.md](TASKS.md) (epic E1). The load-bearing design decision
+stays recorded here: **sort/filter is a view over the sacred ingest vector**
+— an ordered/filtered index list, selection tracked by path, never a
+reordering of the ingested set — and M7's fuzzy filter reuses that same
+view-indirection layer.
 
-Sorts (each toggles ascending/descending on repeat; a `sort_ingest` command restores stdin/CLI order):
-- `sort_created` — creation date.
-- `sort_rating` — rating.
-- `sort_size` — file size.
+### M10 — Hashtags *(planned — open)*
+Moved to [TASKS.md](TASKS.md) (epic E3). Filtering rides M9's view layer;
+the display half needs M7's text stack.
 
-Filters (each press cycles a mode, wrapping back to `all`):
-- `filter_resolution` — all → 1080p+ → 4K+.
-- `filter_fps` — all → 30fps+ → 60fps+ → 120fps+.
-
-**Data sources** — mostly already cached, which is why this is cheap:
-- resolution (`width`/`height`) and `fps` are already in `Meta` → the filters are free once a clip is probed; a not-yet-probed clip has no meta, so decide its bucket (show as "unknown", or hide until meta arrives — lean toward showing so an un-probed grid isn't empty).
-- file size: from the `stat()` already done at fingerprint time.
-- creation date: macOS `st_birthtime`, fall back to mtime. *Open: filesystem birthtime vs the container `creation_time` tag — the latter needs a new probe/`Meta` field; start with birthtime.*
-- rating: **the library encodes stars in filenames** (`… ★★★★★.mp4`, `★★★★☆`) — parse a trailing star run. *Confirm this is the canonical source before building; the alternative is an xattr or sidecar.*
-
-**Design constraints:**
-- **Stdin order stays sacred** (hard rule): sort/filter are a *view* over the ingested set, never a reordering of it. Keep the ingest vector authoritative and render from a separate ordered/filtered index list — the same view-indirection M7's fuzzy filter will want, so build it here and reuse it there.
-- **Selection stays sane across changes** (like M7): track the selected clip by path, re-resolve its position after any sort/filter; if a filter hides it, fall to the nearest visible clip.
-- Index-keyed machinery (warm pool, live lanes, slot owners) must key consistently off the *view* index, or off path where it already does (the D-swap `pending_reselect` path-matching is the precedent).
-- An empty result is a valid state (draw an empty grid, don't crash).
-
-**Exit criteria:** a keybind flips the grid between all/1080p+/4K+ and all/30/60/120fps+, and sorts by date/rating/size, with the selected clip preserved and stdin order restorable — all without a text stack.
-
-### M10 — Hashtags *(planned)*
-View a clip's hashtags and filter the grid by them.
-- **Source (confirm before building):** filename tokens (`clip #loop #glitch.mp4`) parsed at ingest, the same trick as M9's trailing-star rating — cheap, no probe, survives the cache. Alternatives: xattrs or a sidecar file.
-- **Filtering** rides M9's view-indirection layer verbatim — a hashtag predicate is just another filter over the sacred ingest vector, selection tracked by path, empty result valid.
-- **Viewing** tags on a clip needs real text, so the display half lands with/after M7's text stack; its natural home is the side drawer panels (M11). A keybound tag-cycle filter could ship text-free before that — scoping call.
-
-**Exit criteria:** a clip's hashtags are visible somewhere, and the grid can be narrowed to one or more tags and restored, with selection preserved.
-
-### M11 — Drawers *(planned)*
-Dock-style edge reveal: push the pointer to a screen edge and a drawer slides out; pull away and it retracts.
-- **Bottom edge** → the chapter bar (today `g`-only; edge-hover becomes a second way in, in fullview/quickview first).
-- **Left/right edges** → an info panel (name, resolution, fps, duration, size, date, rating) and a hashtag panel (view + toggle tag filters — M10's display surface).
-- Reuses the filmstrip/chapter-bar slide machinery (strip springs, slide-damped overlaps); reveal threshold and dwell/hide delays are `Tuning` fields — must not fire during ordinary pans or scrubs.
-- The info/hashtag panels need the text stack (M7); the bottom drawer (chapter bar) doesn't, so it can land first as the proving ground for the edge-hover gesture.
-
-**Exit criteria:** resting the pointer at an edge slides the drawer out smoothly (and never by accident mid-gesture); leaving retracts it; the bottom drawer is the existing chapter bar.
+### M11 — Drawers *(planned — open)*
+Moved to [TASKS.md](TASKS.md) (epic E4). Dock-style edge reveal reusing the
+filmstrip/chapter-bar slide machinery; the text-free bottom drawer can land
+before M7.
 
 ### Later
-- Still images as one-frame movies: an image file ingests like a clip whose thumb IS the image (no live lane, no sheet, duration 0/undefined). To be scoped and considered before committing — extension whitelist, what `Meta` looks like without a probe, and what quickview/seekbar/auto-skip mean for a still.
-- `--wrap` infinite grid mode.
-- Internal hardware-decoded preview.
-- Better thumbnail frame selection.
-- Multi-select.
-- Batch actions.
-- Metadata search.
-- Optional SQLite index if the filesystem cache proves insufficient.
-- Optional split into `sb-render`.
-- Optional platform-specific decode backends.
-- Optional post-fx flavor pass (scanlines/glow) via the reserved shader slot.
+The unscoped backlog (images as one-frame movies, `--wrap`, multi-select
+batch actions, optional SQLite index, post-fx pass, …) moved to
+[TASKS.md](TASKS.md) § Backlog.
 
 ---
 
 ## 15. Open technical spikes
 
-### Attention-lane interaction spike *(BUILT — evaluation pending, before M9)*
+### Attention-lane interaction spike *(BUILT — evaluation pending, tracked in [TASKS.md](TASKS.md))*
 
 > **Progress (2026-07):** the model below is implemented behind the hot-reloadable `interaction = "classic" | "attention"` flag (plus `attention_delay_ms`, the hover-settle guard — default 250ms, deliberately longer than `live_delay_ms`). Attention retargets the existing selected-stream lane (`attention_target()`: hover while mousing via a `mouse_attention` modality bit, selection while keyboard-navigating; strict — a gap hover plays nothing); the grid's tile-size hover lane is gated off; click-anywhere quickviews on mouse-up by promoting the lane; cmd/shift-click marks `marked` (border-only, shuffle-remapped, D-swap-cleared, Esc-dropped). Modifiers arrive as `Mods` on `MouseDown` (sb-window tracks `ModifiersChanged`). Classic is unchanged. What remains is the **evaluation + verdict** per the risks below.
 

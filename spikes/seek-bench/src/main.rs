@@ -1,4 +1,4 @@
-//! Spike benchmark for switchblade PLAN.md §15 "Low-latency seek", port step 1.
+//! Spike benchmark for switchblade DESIGN.md §15 "Low-latency seek", port step 1.
 //!
 //! Question under test: with a RESIDENT demuxer + VideoToolbox decoder session
 //! (in-process libav instead of an ffmpeg CLI respawn), what does an arbitrary
