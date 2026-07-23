@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SendError, SyncSender};
 use std::thread;
+use std::time::SystemTime;
 
 /// Ingest channels are bounded (P0.3): a fast directory walk during GPU
 /// init used to queue every entry in memory at once. A full channel now
@@ -29,11 +30,58 @@ pub struct Ingested {
     /// iCloud placeholder: the file exists in the tree but its data is in
     /// the cloud. Reading it would trigger a download, so we never do.
     pub cloud: bool,
+    /// Creation time (birthtime where the OS has one, mtime otherwise),
+    /// read from the stat the gatekeeper already performs — carried so
+    /// sorted ingest (`--sort newest`) never stats on the render thread.
+    pub created: Option<SystemTime>,
+}
+
+/// The gatekeeper's cheap content check: a valid video extension is not
+/// proof of a video. Zero-byte files and files whose first bytes don't
+/// match their extension's container family (an HTML error page saved as
+/// .mp4, a text file renamed) are rejected before they ever claim a chip.
+/// One 16-byte read on the ingest thread — never a probe, never a decode;
+/// truncated-but-well-headed files still pass and are caught later when
+/// their thumbnail generation fails (the app drops them from the grid).
+/// Container families we can't fingerprint confidently fail open.
+fn plausible_video(path: &Path, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return true;
+    };
+    let mut head = [0u8; 16];
+    let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
+        Ok(n) => n,
+        Err(_) => return true, // unreadable here ≠ invalid; later stages decide
+    };
+    let head = &head[..n];
+    let has = |sig: &[u8], at: usize| head.len() >= at + sig.len() && &head[at..at + sig.len()] == sig;
+    match ext.to_ascii_lowercase().as_str() {
+        // ISO BMFF / QuickTime: box size then a known top-level box type.
+        "mp4" | "m4v" | "mov" | "qt" | "3gp" | "3g2" | "f4v" => [
+            &b"ftyp"[..], b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot", b"uuid",
+        ]
+        .iter()
+        .any(|s| has(s, 4)),
+        "mkv" | "webm" => has(&[0x1A, 0x45, 0xDF, 0xA3], 0), // EBML
+        "avi" => has(b"RIFF", 0) && has(b"AVI ", 8),
+        "wmv" => has(&[0x30, 0x26, 0xB2, 0x75], 0), // ASF GUID head
+        "flv" => has(b"FLV", 0),
+        "mpg" | "mpeg" | "m2v" | "vob" => has(&[0x00, 0x00, 0x01], 0),
+        "ts" | "m2ts" | "mts" => has(&[0x47], 0) || has(&[0x47], 4), // sync byte (BDAV at +4)
+        "ogv" => has(b"OggS", 0),
+        "gif" => has(b"GIF8", 0),
+        "y4m" => has(b"YUV4MPEG2", 0),
+        "mxf" => has(&[0x06, 0x0E, 0x2B, 0x34], 0), // partition pack key
+        _ => true,
+    }
 }
 
 /// Fired after each delivered item (and once when a producer finishes),
 /// so the render loop wakes for streamed paths instead of polling for
-/// them (PERFORMANCE-TASKS.md P0.2). Wakes coalesce window-side, so
+/// them (docs/perf-reviews/02-efficiency-review.md P0.2). Wakes coalesce window-side, so
 /// per-item calls are cheap even on a fast directory walk.
 pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync>;
 
@@ -42,6 +90,9 @@ pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync>;
 struct Tx {
     tx: SyncSender<Ingested>,
     notify: Notify,
+    /// The gatekeeper's header check (`gatekeeper` config); off = the
+    /// pre-gatekeeper extension-and-exists test only.
+    check: bool,
 }
 
 impl Tx {
@@ -53,15 +104,19 @@ impl Tx {
 }
 
 /// Streams paths from stdin as they arrive — newline- or NUL-delimited,
-/// never waiting for EOF (PLAN.md §3 pillar 3). Returns None when stdin is
+/// never waiting for EOF (DESIGN.md §3 pillar 3). Returns None when stdin is
 /// a TTY. Directories walk recursively when `recurse` is on and are
 /// skipped otherwise; non-video files are skipped either way.
-pub fn spawn_stdin_reader(recurse: bool, notify: Notify) -> Option<Receiver<Ingested>> {
+pub fn spawn_stdin_reader(
+    recurse: bool,
+    check: bool,
+    notify: Notify,
+) -> Option<Receiver<Ingested>> {
     if io::stdin().is_terminal() {
         return None;
     }
     let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
-    let tx = Tx { tx, notify };
+    let tx = Tx { tx, notify, check };
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut pending: Vec<u8> = Vec::new();
@@ -97,9 +152,14 @@ pub fn spawn_stdin_reader(recurse: bool, notify: Notify) -> Option<Receiver<Inge
 
 /// CLI-argument source: same semantics as stdin, but from `argv`. Takes
 /// priority over stdin when both are present.
-pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool, notify: Notify) -> Receiver<Ingested> {
+pub fn spawn_args_reader(
+    paths: Vec<PathBuf>,
+    recurse: bool,
+    check: bool,
+    notify: Notify,
+) -> Receiver<Ingested> {
     let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
-    let tx = Tx { tx, notify };
+    let tx = Tx { tx, notify, check };
     thread::spawn(move || {
         for p in paths {
             if handle_path(&tx, p, recurse).is_err() {
@@ -114,9 +174,9 @@ pub fn spawn_args_reader(paths: Vec<PathBuf>, recurse: bool, notify: Notify) -> 
 /// One directory's own video files, no recursion — the "browse parent
 /// dir" (siblings) view. Streams like every other source; iCloud stubs
 /// in the directory still resolve to placeholders.
-pub fn spawn_dir_reader(dir: PathBuf, notify: Notify) -> Receiver<Ingested> {
+pub fn spawn_dir_reader(dir: PathBuf, check: bool, notify: Notify) -> Receiver<Ingested> {
     let (tx, rx) = mpsc::sync_channel(CHANNEL_CAP);
-    let tx = Tx { tx, notify };
+    let tx = Tx { tx, notify, check };
     thread::spawn(move || {
         let _ = walk_dir(&tx, &dir, 0, 0);
         finish(tx);
@@ -173,11 +233,28 @@ fn handle_path(tx: &Tx, path: PathBuf, recurse: bool) -> Result<(), SendError<In
     if meta.is_err() && !cloud {
         return Ok(());
     }
+    // Gatekeeper content check — never on cloud placeholders (reading one
+    // triggers a download).
+    if tx.check
+        && let Ok(m) = &meta
+        && !cloud
+        && !plausible_video(&path, m.len())
+    {
+        log::info!("gatekeeper: rejecting non-video content {}", path.display());
+        return Ok(());
+    }
     tx.send(Ingested {
         path,
         readable: meta.is_ok(),
         cloud,
+        created: meta.as_ref().ok().and_then(created_of),
     })
+}
+
+/// Creation time for sorted ingest: birthtime where the filesystem keeps
+/// one (APFS does), mtime otherwise.
+fn created_of(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    meta.created().or_else(|_| meta.modified()).ok()
 }
 
 /// Streaming recursive walk (depth-capped; hidden entries and symlinked
@@ -219,6 +296,7 @@ fn walk_dir(
                         path: orig,
                         readable: false,
                         cloud: true,
+                        created: None,
                     })?;
                 }
             }
@@ -231,10 +309,19 @@ fn walk_dir(
             let p = e.path();
             let meta = std::fs::metadata(&p);
             let cloud = is_cloud_placeholder(&p, meta.as_ref().ok());
+            if tx.check
+                && let Ok(m) = &meta
+                && !cloud
+                && !plausible_video(&p, m.len())
+            {
+                log::info!("gatekeeper: rejecting non-video content {}", p.display());
+                continue;
+            }
             tx.send(Ingested {
                 path: p,
                 readable: meta.is_ok(),
                 cloud,
+                created: meta.as_ref().ok().and_then(created_of),
             })?;
         }
     }
@@ -265,6 +352,14 @@ fn is_cloud_placeholder(path: &Path, meta: Option<&std::fs::Metadata>) -> bool {
     false
 }
 
+/// Test fixture: the smallest byte string the gatekeeper accepts as an
+/// ISO-BMFF (mp4/mov) file — a plausible `ftyp` box head. Shared with
+/// sb-app's tests, which create fake clips the ingest readers must pass.
+#[cfg(test)]
+pub(crate) fn fake_mp4_bytes() -> &'static [u8] {
+    b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,11 +373,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&sub).unwrap();
         for f in ["a.mp4", "b.mov", "note.txt"] {
-            std::fs::write(dir.join(f), b"").unwrap();
+            std::fs::write(dir.join(f), fake_mp4_bytes()).unwrap();
         }
-        std::fs::write(sub.join("c.mp4"), b"").unwrap();
+        std::fs::write(sub.join("c.mp4"), fake_mp4_bytes()).unwrap();
 
-        let rx = spawn_dir_reader(dir.clone(), std::sync::Arc::new(|| {}));
+        let rx = spawn_dir_reader(dir.clone(), true, std::sync::Arc::new(|| {}));
         let mut names: Vec<String> = rx
             .iter()
             .map(|i| i.path.file_name().unwrap().to_string_lossy().into_owned())
@@ -300,13 +395,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real.mp4");
-        std::fs::write(&real, b"").unwrap();
+        std::fs::write(&real, fake_mp4_bytes()).unwrap();
         let ghost = dir.join("ghost.mp4"); // valid extension, no file
 
         let (raw, rx) = mpsc::sync_channel(8);
         let tx = Tx {
             tx: raw,
             notify: std::sync::Arc::new(|| {}),
+            check: true,
         };
         send_path(&tx, real.to_string_lossy().as_bytes(), false).unwrap();
         send_path(&tx, ghost.to_string_lossy().as_bytes(), false).unwrap();
@@ -314,5 +410,40 @@ mod tests {
 
         let paths: Vec<PathBuf> = rx.iter().map(|i| i.path).collect();
         assert_eq!(paths, [real]);
+    }
+
+    /// The gatekeeper's content check: a valid extension over non-video
+    /// bytes (a saved error page, a renamed text file, a zero-byte stub)
+    /// never claims a chip; a plausibly-headed file passes and carries
+    /// its creation time for sorted ingest.
+    #[test]
+    fn garbage_behind_a_video_extension_never_reaches_the_grid() {
+        let dir = std::env::temp_dir().join("sb_ingest_gatekeeper_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.mp4");
+        std::fs::write(&good, fake_mp4_bytes()).unwrap();
+        std::fs::write(dir.join("html.mp4"), b"<!DOCTYPE html><html>").unwrap();
+        std::fs::write(dir.join("empty.mp4"), b"").unwrap();
+        std::fs::write(dir.join("text.mkv"), b"just some notes\n").unwrap();
+
+        let (raw, rx) = mpsc::sync_channel(8);
+        let tx = Tx {
+            tx: raw,
+            notify: std::sync::Arc::new(|| {}),
+            check: true,
+        };
+        for f in ["good.mp4", "html.mp4", "empty.mp4", "text.mkv"] {
+            send_path(&tx, dir.join(f).to_string_lossy().as_bytes(), false).unwrap();
+        }
+        drop(tx);
+
+        let got: Vec<Ingested> = rx.iter().collect();
+        assert_eq!(
+            got.iter().map(|i| i.path.clone()).collect::<Vec<_>>(),
+            [good],
+            "only the plausibly-headed file passes the gatekeeper"
+        );
+        assert!(got[0].created.is_some(), "the stat's creation time rides along");
     }
 }

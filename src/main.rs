@@ -42,6 +42,11 @@ OPTIONS:
                     covering the screen — instant, no separate Space
                     (bind the `fullscreen` / `fast_fullscreen` internal
                     actions in [keys] to toggle either at runtime)
+    --sort <none|newest|oldest>
+                    gatekeeper ordering (overrides the config's `sort`):
+                    merge arriving files into a creation-date-sorted grid
+                    as they stream in, instead of appending in input
+                    order — tiles glide aside as out-of-order files land
     --init          write the default config to ~/.config/switchblade.toml
     --no-config     ignore every config file: run on the internal
                     defaults, with hot-reload off (tests, triage —
@@ -90,6 +95,25 @@ fn main() -> anyhow::Result<()> {
                     Some(l) => opts.animation = Some(l),
                     None => {
                         eprintln!("switchblade: --animation takes none|minimal|normal\n");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--sort" => {
+                let mode = args.next().and_then(|v| sb_app::SortMode::parse(&v));
+                match mode {
+                    Some(m) => opts.sort = Some(m),
+                    None => {
+                        eprintln!("switchblade: --sort takes none|newest|oldest\n");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            eq if eq.starts_with("--sort=") => {
+                match sb_app::SortMode::parse(&eq["--sort=".len()..]) {
+                    Some(m) => opts.sort = Some(m),
+                    None => {
+                        eprintln!("switchblade: --sort takes none|newest|oldest\n");
                         std::process::exit(2);
                     }
                 }
@@ -215,7 +239,7 @@ fn reduce_cache(target_mb: u64) -> anyhow::Result<()> {
 /// quickview/hires lane. When the config's chain is hardware-scaled, a
 /// forced software-scale pass runs too, so users can see what the hw
 /// chain buys on their machine. Same methodology as the pacebench
-/// example (PERF.md Phase 0); a short warmup pass absorbs cold file
+/// example (docs/perf-reviews/01-live-video-pipeline.md Phase 0); a short warmup pass absorbs cold file
 /// access first.
 fn benchmark(clip: std::path::PathBuf) -> anyhow::Result<()> {
     let tuning = sb_app::load_tuning();

@@ -56,7 +56,38 @@ pub enum GridStyle {
     Flexible,
 }
 
-/// The grid's core gesture model (PLAN.md §15 spike). `classic` = the
+/// Where the ingest gatekeeper places arriving clips (`sort` config /
+/// `--sort` CLI). `none` (default) = sacred stdin/CLI order, arrivals
+/// append; `newest`/`oldest` = arrivals merge into the grid sorted by
+/// creation date (birthtime, mtime fallback) as they stream in — the
+/// grid is sorted at every moment of the stream, tiles gliding aside as
+/// earlier-sorted files arrive late. Startup-only. Distinct from M9's
+/// planned runtime sort commands (a view over the ingest order); this is
+/// the at-open gatekeeper ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SortMode {
+    #[default]
+    #[serde(alias = "ingest")]
+    None,
+    #[serde(alias = "latest")]
+    Newest,
+    Oldest,
+}
+
+impl SortMode {
+    /// CLI spelling — same names serde accepts from the config.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "ingest" => Some(Self::None),
+            "newest" | "latest" => Some(Self::Newest),
+            "oldest" => Some(Self::Oldest),
+            _ => None,
+        }
+    }
+}
+
+/// The grid's core gesture model (DESIGN.md §15 spike). `classic` = the
 /// shipped behavior: the selection plays hires, hover gets a tile-size
 /// lane, click selects, click-on-selection quickviews. `attention` = one
 /// hires lane follows attention (the hovered tile while mousing, the
@@ -82,7 +113,7 @@ pub enum BackdropStyle {
 }
 
 /// Every feel-related constant lives here and hot-reloads from
-/// `switchblade.toml` (PLAN.md §10). Don't hardcode feel values elsewhere.
+/// `switchblade.toml` (DESIGN.md §10). Don't hardcode feel values elsewhere.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Tuning {
@@ -181,10 +212,21 @@ pub struct Tuning {
     /// Walk directories given as inputs (CLI args or stdin) for video
     /// files. Off: directories are skipped entirely. Startup-only.
     pub recurse: bool,
+    /// Gatekeeper ordering: "none" (stdin/CLI order, the default),
+    /// "newest" or "oldest" — arrivals merge into a creation-date-sorted
+    /// grid as they stream in. CLI `--sort` overrides. Startup-only.
+    pub sort: SortMode,
+    /// The ingest gatekeeper's file checking: reject files whose header
+    /// doesn't match their video extension before they claim a chip, and
+    /// drop a clip from the grid when ffmpeg proves its file unplayable
+    /// (corrupt/truncated/vanished). Off = every path with a video
+    /// extension stays on the grid, playable or not (the pre-gatekeeper
+    /// behavior; UI tests with fake fixture files also rely on it).
+    pub gatekeeper: bool,
     /// How long the selection must settle before live playback starts.
     pub live_delay_ms: f32,
     /// Interaction model: "classic" (default) or "attention" — the
-    /// PLAN.md §15 spike where one hires lane follows attention and a
+    /// DESIGN.md §15 spike where one hires lane follows attention and a
     /// single click quickviews. Hot-reloadable, so the two models can be
     /// compared in place.
     pub interaction: Interaction,
@@ -376,6 +418,8 @@ impl Default for Tuning {
             zoom_reflow_smoothing: 0.25,
             pause_unfocused: true,
             recurse: true,
+            sort: SortMode::None,
+            gatekeeper: true,
             live_delay_ms: 100.0,
             interaction: Interaction::Classic,
             attention_delay_ms: 250.0,

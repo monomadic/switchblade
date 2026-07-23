@@ -1,12 +1,12 @@
 //! sb-app: application state and grid logic, headless of any OS/GPU types.
-//! Implements the `sb_window::App` trait (PLAN.md §12).
+//! Implements the `sb_window::App` trait (DESIGN.md §12).
 
 pub mod bench;
 mod commands;
 mod ingest;
 mod tuning;
 
-pub use tuning::{AnimLevel, BackdropStyle, GridStyle, Interaction, Tuning, config_path};
+pub use tuning::{AnimLevel, BackdropStyle, GridStyle, Interaction, SortMode, Tuning, config_path};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -348,7 +348,7 @@ struct LiveState {
 /// The selected clip's live stream: decoded once at quickview resolution
 /// into the mipmapped hires texture. The tile shows it downscaled and the
 /// quickview modal shows it big — one decoder, one timeline, no handoffs.
-/// Rides the resident in-process decoder (PLAN.md §15 "Low-latency seek"),
+/// Rides the resident in-process decoder (DESIGN.md §15 "Low-latency seek"),
 /// so `[`/`]` and future scrubbing are real `seek()`s, never respawns.
 struct SelLive {
     clip: usize,
@@ -404,6 +404,10 @@ struct Clip {
     /// chips, so this outlives `Thumb::Ready`. None until known (16:9
     /// assumed).
     aspect: Option<f32>,
+    /// Creation time from the ingest thread's stat (birthtime, mtime
+    /// fallback) — the sorted-ingest merge key. None for demo tiles and
+    /// cloud placeholders.
+    created: Option<std::time::SystemTime>,
 }
 
 /// Startup options from the CLI (config handles everything else).
@@ -433,6 +437,9 @@ pub struct Options {
     /// For A/B testing the feature and for machines where the nine niced
     /// ffmpeg extracts per opened clip aren't worth it.
     pub no_storyboards: bool,
+    /// `--sort <none|newest|oldest>`: overrides the config's `sort` —
+    /// the gatekeeper's at-open ordering (see `SortMode`).
+    pub sort: Option<SortMode>,
 }
 
 pub struct Switchblade {
@@ -487,6 +494,15 @@ pub struct Switchblade {
     /// playing while the parent-dir listing streams in; when it arrives
     /// it becomes the selection again.
     pending_reselect: Option<PathBuf>,
+    /// The gatekeeper's at-open ordering (`--sort` / config `sort`,
+    /// resolved at startup): arrivals merge into a creation-date-sorted
+    /// grid instead of appending.
+    sort: SortMode,
+    /// Sorted merging stays on only while the library's order IS the
+    /// sorted order: a shuffle takes ownership of the arrangement and
+    /// disarms it (arrivals append after the shuffled block, as ever); a
+    /// D-swap rebuild starts a fresh library and re-arms it.
+    sort_armed: bool,
     /// Paths whose live decoder failed, and when — spawn attempts wait
     /// out `LIVE_RETRY_COOLDOWN_S` (P0.4).
     live_retry: HashMap<PathBuf, Instant>,
@@ -672,7 +688,7 @@ struct Press {
 
 /// Once-a-second debug log of how many frames ran and which condition
 /// kept `Frame.animating` true — the acceptance instrument for idle-
-/// throttling work (PERFORMANCE-TASKS.md P0.2): it distinguishes visual
+/// throttling work (docs/perf-reviews/02-efficiency-review.md P0.2): it distinguishes visual
 /// animation, live playback, and explicit wake timers as redraw causes.
 /// Negligible when debug logging is off (one `log_enabled!` check).
 struct RedrawStats {
@@ -818,12 +834,13 @@ impl Switchblade {
             Some(ingest::spawn_args_reader(
                 opts.inputs.clone(),
                 tuning.recurse,
+                tuning.gatekeeper,
                 notify.clone(),
             ))
         } else if opts.demo {
             None
         } else {
-            ingest::spawn_stdin_reader(tuning.recurse, notify.clone())
+            ingest::spawn_stdin_reader(tuning.recurse, tuning.gatekeeper, notify.clone())
         };
         let demo = rx.is_none();
         let recipe = recipe_from(&tuning);
@@ -856,6 +873,8 @@ impl Switchblade {
             hires_shown: None,
             hires_reclaim: None,
             pending_reselect: None,
+            sort: opts.sort.unwrap_or(tuning.sort),
+            sort_armed: opts.sort.unwrap_or(tuning.sort) != SortMode::None,
             live_retry: HashMap::new(),
             sel_parked: false,
             skip_flash_at: None,
@@ -969,6 +988,7 @@ impl Switchblade {
                             16.0 / 9.0,
                         ][i % 7],
                     ),
+                    created: None,
                 });
             }
         }
@@ -1914,7 +1934,7 @@ impl Switchblade {
 
     // --- selection ---
 
-    /// The attention-lane interaction model is on (PLAN.md §15 spike).
+    /// The attention-lane interaction model is on (DESIGN.md §15 spike).
     fn attention(&self) -> bool {
         self.tuning.interaction == Interaction::Attention
     }
@@ -2020,6 +2040,112 @@ impl Switchblade {
         self.select_index(idx);
     }
 
+    /// Remap every index-keyed reference after `self.clips` has been
+    /// rebuilt in a new order (shuffle, sorted-ingest merge, unplayable
+    /// removal). `new_of_old[old] = Some(new)`, `None` = the clip is gone:
+    /// its index-map entry drops, its atlas slots free, its live lanes
+    /// die, and the selection falls to the nearest surviving neighbor.
+    /// Surviving clips' reflow entries move WITH them, so tiles glide to
+    /// their new slots instead of snapping (the sorted-ingest "animate
+    /// into place"); callers that want a crossfade instead (shuffle)
+    /// clear `reflow` themselves afterwards.
+    fn remap_refs(&mut self, new_of_old: &[Option<usize>]) {
+        let m = |i: usize| new_of_old.get(i).copied().flatten();
+        self.index.retain(|_, v| match m(*v) {
+            Some(n) => {
+                *v = n;
+                true
+            }
+            None => false,
+        });
+        for slot in self.slots.iter_mut() {
+            if let Some((owner, _)) = slot {
+                match m(*owner) {
+                    Some(n) => *owner = n,
+                    None => *slot = None,
+                }
+            }
+        }
+        if let Some(mut l) = self.live_sel.take() {
+            if let Some(n) = m(l.clip) {
+                l.clip = n;
+                self.live_sel = Some(l);
+            }
+        }
+        if let Some(mut h) = self.live_hover.take() {
+            if let Some(n) = m(h.clip) {
+                h.clip = n;
+                self.live_hover = Some(h);
+            }
+        }
+        self.warm.retain_mut(|w| match m(w.clip) {
+            Some(n) => {
+                w.clip = n;
+                true
+            }
+            None => false,
+        });
+        self.hover_resume = self.hover_resume.and_then(|(i, p)| m(i).map(|n| (n, p)));
+        self.hovered = self.hovered.and_then(m);
+        self.strip_hover = self.strip_hover.and_then(m);
+        let old_sel = self.selected;
+        self.selected = m(old_sel).unwrap_or_else(|| {
+            // Removed from under the selection: nearest surviving neighbor.
+            for d in 1..=new_of_old.len() {
+                if let Some(n) = old_sel.checked_sub(d).and_then(m) {
+                    return n;
+                }
+                if let Some(n) = m(old_sel + d) {
+                    return n;
+                }
+            }
+            0
+        });
+        self.selected = self.selected.min(self.clips.len().saturating_sub(1));
+        // A vanished selection is a real selection change; a pure
+        // renumbering isn't (the same clip keeps playing).
+        if m(old_sel).is_none() {
+            self.sel_changed_at = Instant::now();
+        }
+        self.marked = self.marked.iter().filter_map(|&i| m(i)).collect();
+        let old_reflow = std::mem::take(&mut self.reflow);
+        self.reflow = vec![TileReflow::default(); self.clips.len()];
+        for (o, r) in old_reflow.into_iter().enumerate() {
+            if let Some(n) = m(o)
+                && let Some(dst) = self.reflow.get_mut(n)
+            {
+                *dst = r;
+            }
+        }
+        self.ribbon_reset(); // the ribbon packing is index-keyed too
+        self.grid_rev = self.grid_rev.wrapping_add(1);
+        if self.quickview {
+            self.strip_pos = self.selected as f32;
+            self.strip_target = self.strip_pos;
+        }
+    }
+
+    /// The gatekeeper's second stage: a clip that passed the header sniff
+    /// but failed real thumbnail extraction (truncated download, corrupt
+    /// container, vanished file) leaves the grid — neighbors glide in
+    /// over the hole via the permuted reflow table.
+    fn remove_clip(&mut self, i: usize) {
+        if i >= self.clips.len() {
+            return;
+        }
+        let n = self.clips.len();
+        self.clips.remove(i);
+        let new_of_old: Vec<Option<usize>> = (0..n)
+            .map(|o| match o.cmp(&i) {
+                std::cmp::Ordering::Less => Some(o),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(o - 1),
+            })
+            .collect();
+        self.remap_refs(&new_of_old);
+        self.wake(0.6);
+    }
+
     /// `shuffle_library`: Fisher–Yates the cached clips to the front of
     /// the grid (uncached ones keep their order after them). All per-clip
     /// state rides inside `Clip` and moves with it; everything keyed by
@@ -2027,7 +2153,9 @@ impl Switchblade {
     /// warm/hover lanes, the selection — is remapped through the
     /// permutation, so the selected clip keeps playing and lands
     /// somewhere new. Hover clears (the pointer is over a different clip
-    /// now); mid-ingest arrivals simply append after the shuffled block.
+    /// now); mid-ingest arrivals simply append after the shuffled block
+    /// (a shuffle disarms sorted ingest — the arrangement is the
+    /// shuffle's now).
     fn shuffle_library(&mut self) {
         let n = self.clips.len();
         if n < 2 {
@@ -2056,44 +2184,17 @@ impl Switchblade {
         }
         let mut old: Vec<Option<Clip>> = self.clips.drain(..).map(Some).collect();
         self.clips = order.iter().map(|&o| old[o].take().unwrap()).collect();
-        // Same length, new order: the flexible layout must rebuild.
-        self.grid_rev = self.grid_rev.wrapping_add(1);
-        // reflow[i] now names a different clip — drop it so the wrap table
-        // reseeds cleanly (the shuffle rides the crossfade, not the wrap).
+        let map: Vec<Option<usize>> = new_of_old.into_iter().map(Some).collect();
+        self.remap_refs(&map);
+        // reflow[i] named a different clip — drop it so the wrap table
+        // reseeds cleanly (the shuffle rides the crossfade, not a glide
+        // across the whole rearrangement).
         self.reflow.clear();
-        self.ribbon_reset(); // the ribbon packing is index-keyed too
-        let remap = |i: &mut usize| {
-            if let Some(&ni) = new_of_old.get(*i) {
-                *i = ni;
-            }
-        };
-        self.index.values_mut().for_each(remap);
-        for slot in self.slots.iter_mut().flatten() {
-            remap(&mut slot.0);
-        }
-        if let Some(l) = &mut self.live_sel {
-            remap(&mut l.clip);
-        }
-        if let Some(h) = &mut self.live_hover {
-            remap(&mut h.clip);
-        }
-        for w in &mut self.warm {
-            remap(&mut w.clip);
-        }
-        remap(&mut self.selected);
-        // Multi-select marks are index-keyed like everything else.
-        self.marked = self
-            .marked
-            .iter()
-            .map(|&i| new_of_old.get(i).copied().unwrap_or(i))
-            .collect();
         self.hovered = None;
         self.strip_hover = None;
-        self.hover_resume = None; // index-keyed; hover clears anyway
-        if self.quickview {
-            self.strip_pos = self.selected as f32;
-            self.strip_target = self.strip_pos;
-        }
+        self.hover_resume = None; // hover clears anyway
+        // The arrangement is the shuffle's now — later arrivals append.
+        self.sort_armed = false;
         // Crossfade the old arrangement out, like the zoom reflow / D swap.
         if !self.last_tiles.is_empty() {
             self.transition = Some((std::mem::take(&mut self.last_tiles), Instant::now()));
@@ -2300,7 +2401,7 @@ impl Switchblade {
     }
 
     /// `[`/`]`: jump the playing clip by a fraction of its duration — an
-    /// in-place `seek()` on the resident decoder (PLAN.md §15). The
+    /// in-place `seek()` on the resident decoder (DESIGN.md §15). The
     /// demuxer jumps and the decoder flushes; the last frame stays on
     /// screen (the hires texture still holds it) until the new position
     /// delivers, so it reads as freeze-then-jump — GOP-bound (~30–600ms)
@@ -2584,7 +2685,7 @@ impl Switchblade {
         let track_a = t.seekbar_track_opacity.clamp(0.0, 1.0);
         tiles.push(bar(bx, bw, [1.0, 1.0, 1.0, track_a * bar_a]));
         tiles.push(bar(bx, (bw * pos).max(bh), [1.0, 1.0, 1.0, 0.95 * bar_a]));
-        // Storyboard preview (PLAN.md §14 M8 phase 1): the anim sheet is
+        // Storyboard preview (DESIGN.md §14 M8 phase 1): the anim sheet is
         // already g² frames spread across the duration — hovering the bar
         // shows the cell nearest that timestamp. A denser dedicated strip
         // lands later if g² is too coarse.
@@ -2627,7 +2728,7 @@ impl Switchblade {
 
     /// Seek the selected clip's stream to a fraction of its duration.
     /// Keyframe mode while a drag is in flight (instant feedback), exact
-    /// on release / click-settle (PLAN.md §14 M8 two-phase scrub).
+    /// on release / click-settle (DESIGN.md §14 M8 two-phase scrub).
     fn scrub_seek(&mut self, frac: f32, exact: bool) {
         let Some(clip) = self.clips.get(self.selected) else {
             return;
@@ -2664,7 +2765,7 @@ impl Switchblade {
         };
         log::info!("browsing siblings of {}", path.display());
         // Siblings: this directory's own videos, non-recursive.
-        let rx = ingest::spawn_dir_reader(dir.to_path_buf(), self.notify.clone());
+        let rx = ingest::spawn_dir_reader(dir.to_path_buf(), self.tuning.gatekeeper, self.notify.clone());
         self.swap_library(rx, Some(path));
     }
 
@@ -2678,7 +2779,12 @@ impl Switchblade {
             return;
         }
         log::info!("opening library {}", dir.display());
-        let rx = ingest::spawn_args_reader(vec![dir], self.tuning.recurse, self.notify.clone());
+        let rx = ingest::spawn_args_reader(
+            vec![dir],
+            self.tuning.recurse,
+            self.tuning.gatekeeper,
+            self.notify.clone(),
+        );
         self.swap_library(rx, None);
     }
 
@@ -2709,6 +2815,8 @@ impl Switchblade {
         self.marked.clear(); // index-keyed; the indices are gone
         self.selected = 0;
         self.pending_reselect = reselect;
+        // A fresh library: sorted ingest re-arms after any shuffle.
+        self.sort_armed = self.sort != SortMode::None;
         // Fade the old grid out over the new one, like the zoom reflow.
         if !self.last_tiles.is_empty() {
             self.transition = Some((std::mem::take(&mut self.last_tiles), Instant::now()));
@@ -3104,15 +3212,15 @@ impl Switchblade {
 
     fn drain_ingest(&mut self) {
         let Some(rx) = &self.rx else { return };
-        // The D swap's clip found its new index this drain (only field
+        // The D swap's clip streamed back in this drain (only field
         // updates are legal while `rx` borrows self; the selection move
-        // happens after the loop).
-        let mut reselect: Option<usize> = None;
-        let first_new = self.clips.len();
+        // happens after the batch installs and indices are final).
+        let mut reselect: Option<PathBuf> = None;
+        let mut incoming: Vec<Clip> = Vec::new();
         loop {
             // Per-frame budget (P0.3): leave the rest for the next frame
             // — which the wake guarantees — instead of stalling this one.
-            if self.clips.len() - first_new >= INGEST_DRAIN_BUDGET {
+            if incoming.len() >= INGEST_DRAIN_BUDGET {
                 self.waker.wake();
                 break;
             }
@@ -3120,9 +3228,8 @@ impl Switchblade {
                 Ok(item) => {
                     if self.pending_reselect.as_deref() == Some(item.path.as_path()) {
                         self.pending_reselect = None;
-                        reselect = Some(self.clips.len());
+                        reselect = Some(item.path.clone());
                     }
-                    self.index.insert(item.path.clone(), self.clips.len());
                     // Cloud placeholders never request a thumbnail: reading
                     // the file would force iCloud to download it.
                     let thumb = if item.cloud {
@@ -3137,7 +3244,7 @@ impl Switchblade {
                         self.media.request_gen(item.path.clone());
                         self.jobs_total += 1;
                     }
-                    self.clips.push(Clip {
+                    incoming.push(Clip {
                         path: item.path,
                         readable: item.readable,
                         cloud: item.cloud,
@@ -3154,11 +3261,15 @@ impl Switchblade {
                             Thumb::None
                         },
                         aspect: None,
+                        created: item.created,
                     });
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    log::info!("stdin closed — {} clips ingested", self.clips.len());
+                    log::info!(
+                        "stdin closed — {} clips ingested",
+                        self.clips.len() + incoming.len()
+                    );
                     self.rx = None;
                     // The awaited clip never showed up (deleted/moved):
                     // stop shielding its stream; update_live reaps it.
@@ -3167,18 +3278,22 @@ impl Switchblade {
                 }
             }
         }
-        // Spawn fade-in only needs the loop hot if a newcomer is actually
-        // on screen — a bulk stream appending offscreen rows must not keep
-        // the GPU presenting (P0.2). Offscreen arrivals still repaint once
-        // (their send fired the waker) so the title count stays fresh.
-        if first_new < self.clips.len() {
+        if !incoming.is_empty() {
+            let first_new = self.install_arrivals(incoming);
+            // Spawn fade-in only needs the loop hot if a newcomer is
+            // actually on screen — a bulk stream landing offscreen must
+            // not keep the GPU presenting (P0.2). Offscreen arrivals
+            // still repaint once (their send fired the waker) so the
+            // title count stays fresh.
             let lay = self.layout();
             let (_, last_vis) = self.visible_rows(&lay, PREFETCH_ROWS);
             if self.row_of(&lay, first_new) <= last_vis {
                 self.wake(0.6);
             }
         }
-        if let Some(i) = reselect {
+        if let Some(p) = reselect
+            && let Some(&i) = self.index.get(&p)
+        {
             self.selected = i;
             self.sel_changed_at = Instant::now();
             if let Some(l) = &mut self.live_sel
@@ -3192,6 +3307,67 @@ impl Switchblade {
                 self.strip_target = self.strip_pos;
             }
         }
+    }
+
+    /// Install one drained batch of arrivals. With sorting off (or
+    /// disarmed by a shuffle) this is the classic append — sacred
+    /// stdin/CLI order, no remap. With `--sort` armed, the batch merges
+    /// into the creation-date-sorted library: one stable merge plus one
+    /// index remap per FRAME (never per item — a per-item shift would go
+    /// quadratic over a big stream), and surviving tiles keep their
+    /// reflow entries so late-arriving older/newer files push them aside
+    /// with a glide, not a snap. Returns the smallest new index (the
+    /// visibility probe for the spawn-fade wake).
+    fn install_arrivals(&mut self, mut incoming: Vec<Clip>) -> usize {
+        let append_at = self.clips.len();
+        if self.sort == SortMode::None || !self.sort_armed {
+            for (k, c) in incoming.into_iter().enumerate() {
+                self.index.insert(c.path.clone(), append_at + k);
+                self.clips.push(c);
+            }
+            return append_at;
+        }
+        // Merge key: creation date (newest = descending), unknown last,
+        // arrival order as the stable tie-break.
+        let mode = self.sort;
+        let key = move |c: &Clip| -> (bool, i128) {
+            let nanos = c.created.map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i128)
+                    .unwrap_or_else(|e| -(e.duration().as_nanos() as i128))
+            });
+            match (mode, nanos) {
+                (_, None) => (true, 0),
+                (SortMode::Newest, Some(n)) => (false, -n),
+                (_, Some(n)) => (false, n),
+            }
+        };
+        incoming.sort_by_key(|c| key(c));
+        let old: Vec<Clip> = std::mem::take(&mut self.clips);
+        let n = old.len();
+        let mut new_of_old: Vec<Option<usize>> = vec![None; n];
+        let mut new_positions: Vec<usize> = Vec::with_capacity(incoming.len());
+        let mut merged: Vec<Clip> = Vec::with_capacity(n + incoming.len());
+        let mut inc = incoming.into_iter().peekable();
+        for (o, c) in old.into_iter().enumerate() {
+            // Existing clips win ties: they arrived first.
+            while inc.peek().is_some_and(|i| key(i) < key(&c)) {
+                new_positions.push(merged.len());
+                merged.push(inc.next().unwrap());
+            }
+            new_of_old[o] = Some(merged.len());
+            merged.push(c);
+        }
+        for c in inc {
+            new_positions.push(merged.len());
+            merged.push(c);
+        }
+        self.clips = merged;
+        self.remap_refs(&new_of_old);
+        for &p in &new_positions {
+            self.index.insert(self.clips[p].path.clone(), p);
+        }
+        new_positions.first().copied().unwrap_or(append_at)
     }
 
     fn step(&mut self, dt: f32) {
@@ -3801,6 +3977,20 @@ impl Switchblade {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                ThumbResult::Unplayable { path } => {
+                    // Gatekeeper stage two: it wore a valid extension and a
+                    // plausible header, but ffmpeg couldn't pull a single
+                    // frame from it (or the file vanished) — off the grid.
+                    // Cloud placeholders are exempt: their data is
+                    // legitimately absent, not corrupt.
+                    if self.tuning.gatekeeper
+                        && let Some(&i) = self.index.get(&path)
+                        && !self.clips[i].cloud
+                    {
+                        log::info!("gatekeeper: dropping unplayable {}", path.display());
+                        self.remove_clip(i);
+                    }
+                }
                 // Consumed before the ledger above.
                 ThumbResult::ChapterTimes { .. } => {}
             }
@@ -3892,7 +4082,7 @@ impl Switchblade {
         // repacks it, so any neighbour derived from the layout is noise.
         let ribboning = self.ribbon.is_some() || self.ribbon_settle.is_some();
         let delay_ms = self.tuning.live_delay_ms;
-        // Attention mode (PLAN.md §15 spike): the hires lane follows
+        // Attention mode (DESIGN.md §15 spike): the hires lane follows
         // attention — the hovered tile while mousing, the selection while
         // keyboard-navigating. `attn_hover` marks a hover-driven target,
         // which settles on the hover clock with its own (longer) guard:
@@ -4493,7 +4683,7 @@ impl Switchblade {
             .and_then(|c| c.path.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // Window-title label: the debug-quality label allowed pre-M7 (PLAN.md §9).
+        // Window-title label: the debug-quality label allowed pre-M7 (DESIGN.md §9).
         let title = format!("switchblade — {} clips — {name}", self.clips.len());
         if title != self.title {
             self.title = title.clone();
@@ -4934,7 +5124,7 @@ impl Switchblade {
             self.transition = None;
         }
 
-        // Quickview (PLAN.md §6 level 3, internal): blur + dim everything
+        // Quickview (DESIGN.md §6 level 3, internal): blur + dim everything
         // and show the selected clip large, centered, playing via the live
         // slot. Arrows keep working — the modal follows the selection.
         let mut blur = None;
@@ -6305,7 +6495,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for f in ["a.mp4", "b.mp4", "c.mp4"] {
-            std::fs::write(dir.join(f), b"").unwrap();
+            std::fs::write(dir.join(f), ingest::fake_mp4_bytes()).unwrap();
         }
 
         let mut app = Switchblade::with_options(Options {
@@ -6315,6 +6505,7 @@ mod tests {
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
+        app.tuning.gatekeeper = false; // fake fixtures — stage two would drop them
         assert!(
             pump_until(&mut app, |a| a.clips.len() == 1),
             "single-file ingest"
@@ -6418,7 +6609,7 @@ mod tests {
     /// Pending background jobs must not force continuous rendering: the
     /// gen sweep can run for hours on a big library while the grid is
     /// static — each completion wakes the loop via `Waker` instead
-    /// (PERFORMANCE-TASKS.md P0.2).
+    /// (docs/perf-reviews/02-efficiency-review.md P0.2).
     #[test]
     fn background_jobs_do_not_force_continuous_animation() {
         let mut app = Switchblade::with_options(Options {
@@ -6469,6 +6660,7 @@ mod tests {
             path: PathBuf::from("late/arrival.mp4"),
             readable: false, // no media jobs in this test
             cloud: false,
+            created: None,
         })
         .unwrap();
         let _ = app.frame(0.016, vp);
@@ -6707,6 +6899,7 @@ mod tests {
                 path: PathBuf::from(format!("bulk/{i:04}.mp4")),
                 readable: false, // no media jobs in this test
                 cloud: false,
+                created: None,
             })
             .unwrap();
         }
@@ -6746,14 +6939,35 @@ mod tests {
         let bad = dir.join("bad.mp4");
         std::fs::write(&bad, b"this is not a video file").unwrap();
 
+        // The gatekeeper (rightly) refuses this file at ingest now, so
+        // install the clip directly — the subject here is the lane
+        // reap + cooldown, which must still handle a stream that fails
+        // async after ingest let a file through.
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::Normal), // live lanes enabled
-            inputs: vec![bad.clone()],
-            demo: false,
+            demo: true,                         // no stdin reader in tests
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
-        assert!(pump_until(&mut app, |a| a.clips.len() == 1), "ingest");
+        app.clips.clear();
+        app.index.clear();
+        app.reflow.clear();
+        app.demo = false; // live lanes (and their cooldown) must engage
+        app.clips.push(Clip {
+            path: bad.clone(),
+            readable: true,
+            cloud: false,
+            cached: false,
+            spawned: Instant::now(),
+            scale: 1.0,
+            emph: 0.0,
+            thumb: Thumb::None,
+            anim: Thumb::None,
+            aspect: None,
+            created: None,
+        });
+        app.index.insert(bad.clone(), 0);
+        app.selected = 0;
 
         // Spawning on garbage succeeds — the failure surfaces async via
         // `failed()` — so install the lane the way update_live would.
@@ -6866,6 +7080,7 @@ mod tests {
                 thumb: Thumb::Failed,
                 anim: Thumb::Failed,
                 aspect: None,
+                created: None,
             });
         }
         app.scroll = 1e6;
@@ -7156,7 +7371,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for f in ["a.mp4", "b.mp4", "c.mp4"] {
-            std::fs::write(dir.join(f), b"").unwrap();
+            std::fs::write(dir.join(f), ingest::fake_mp4_bytes()).unwrap();
         }
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None), // no live decoders in tests
@@ -7165,6 +7380,7 @@ mod tests {
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
+        app.tuning.gatekeeper = false; // fake fixtures — stage two would drop them
         assert!(pump_until(&mut app, |a| a.clips.len() == 3), "ingest");
         app.quickview = true;
         app.quickview_at = Instant::now();
@@ -7248,7 +7464,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for f in ["a.mp4", "b.mp4", "c.mp4"] {
-            std::fs::write(dir.join(f), b"").unwrap();
+            std::fs::write(dir.join(f), ingest::fake_mp4_bytes()).unwrap();
         }
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None), // no live decoders in tests
@@ -7257,6 +7473,7 @@ mod tests {
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
+        app.tuning.gatekeeper = false; // fake fixtures — stage two would drop them
         assert!(pump_until(&mut app, |a| a.clips.len() == 3), "ingest");
         app.tuning.strip_scroll_selects = false;
         app.quickview = true;
@@ -7417,6 +7634,135 @@ mod tests {
             .map(|&i| app.clips[i].path.clone())
             .collect();
         assert_eq!(marked_now, marked_paths, "marks follow their clips");
+    }
+
+    /// Sorted ingest (`--sort newest`): arrivals merge into a creation-
+    /// date-sorted grid AS THEY STREAM — a later batch carrying a newer
+    /// file inserts ahead of already-landed tiles (one stable merge + one
+    /// remap per frame, never per item), the path→index map stays
+    /// consistent, and the selection follows its clip through the remap.
+    #[test]
+    fn sorted_ingest_places_arrivals_by_created_date() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: true,
+            no_config: true, // hermetic: the host config must not steer tests
+            sort: Some(SortMode::Newest),
+            ..Options::default()
+        });
+        // Start from an empty library; the injected channel is the producer.
+        app.clips.clear();
+        app.index.clear();
+        app.reflow.clear();
+        app.selected = 0;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rx = Some(rx);
+        let vp = Viewport {
+            width: 1280.0,
+            height: 800.0,
+        };
+        let t0 = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let send = |name: &str, secs: u64| {
+            tx.send(ingest::Ingested {
+                path: PathBuf::from(name),
+                readable: false, // no media jobs in this test
+                cloud: false,
+                created: Some(t0 + Duration::from_secs(secs)),
+            })
+            .unwrap();
+        };
+        send("sorted/a.mp4", 100);
+        let _ = app.frame(0.016, vp);
+        assert_eq!(app.clips.len(), 1);
+        assert_eq!(app.clips[app.selected].path, PathBuf::from("sorted/a.mp4"));
+
+        // A newer and an older file land in one later batch: the newer
+        // inserts BEFORE the already-landed clip, the older after it.
+        send("sorted/b.mp4", 300);
+        send("sorted/c.mp4", 50);
+        let _ = app.frame(0.016, vp);
+        let order: Vec<String> = app
+            .clips
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(order, ["b.mp4", "a.mp4", "c.mp4"], "newest first");
+        for (i, c) in app.clips.iter().enumerate() {
+            assert_eq!(
+                app.index.get(&c.path),
+                Some(&i),
+                "path→index stays consistent through the merge remap"
+            );
+        }
+        assert_eq!(
+            app.clips[app.selected].path,
+            PathBuf::from("sorted/a.mp4"),
+            "the selection follows its clip as newer arrivals push it down"
+        );
+
+        // A shuffle takes over the arrangement: later arrivals append.
+        app.clips.iter_mut().for_each(|c| c.cached = true);
+        app.shuffle_library();
+        send("sorted/d.mp4", 400);
+        let _ = app.frame(0.016, vp);
+        assert_eq!(
+            app.clips.last().unwrap().path,
+            PathBuf::from("sorted/d.mp4"),
+            "post-shuffle arrivals append instead of re-sorting the shuffle"
+        );
+    }
+
+    /// Gatekeeper stage two: a file wearing a valid extension AND a
+    /// plausible container header, but with no decodable video behind it
+    /// (truncated download, corrupt body), is dropped from the grid when
+    /// its gen-sweep job proves it unplayable — the real clip beside it
+    /// survives, indices intact. Needs ffmpeg — skipped quietly when it's
+    /// not on PATH.
+    #[test]
+    fn unplayable_clip_is_removed_from_the_grid() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_ffmpeg {
+            return;
+        }
+        let dir = std::env::temp_dir().join("sb_app_gatekeeper_stage2_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("gate_good.mp4");
+        if !good.exists() {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=duration=1:size=320x180:rate=30")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(&good)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "failed to generate test clip");
+        }
+        // Passes the header sniff (real ftyp box), fails real decoding.
+        let bad = dir.join("gate_bad.mp4");
+        std::fs::write(&bad, ingest::fake_mp4_bytes()).unwrap();
+
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None), // no live decoders in tests
+            inputs: vec![good.clone(), bad.clone()],
+            demo: false,
+            no_config: true, // hermetic: the host config must not steer tests
+            ..Options::default()
+        });
+        assert!(
+            pump_until(&mut app, |a| {
+                a.rx.is_none() && a.clips.len() == 1 && a.jobs_done >= a.jobs_total
+            }),
+            "the unplayable clip leaves the grid once the sweep judges it"
+        );
+        assert_eq!(app.clips[0].path, good, "the real clip survives");
+        assert_eq!(app.index.get(&good), Some(&0), "indices remapped");
+        assert!(app.index.get(&bad).is_none(), "the dropped path unindexed");
     }
 
     /// Auto-skip advances the selection once the current clip's time is
@@ -7878,7 +8224,7 @@ mod tests {
         let dir = std::env::temp_dir().join("sb_app_prewarm_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.mp4"), b"").unwrap();
+        std::fs::write(dir.join("a.mp4"), ingest::fake_mp4_bytes()).unwrap();
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::Normal), // live video expected
             inputs: vec![dir.join("a.mp4")],
@@ -7886,6 +8232,7 @@ mod tests {
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
+        app.tuning.gatekeeper = false; // fake fixtures — stage two would drop them
         assert!(pump_until(&mut app, |a| a.clips.len() == 1), "ingest");
         let vp = Viewport {
             width: 1280.0,
@@ -8714,6 +9061,7 @@ mod tests {
                 thumb: Thumb::Failed,
                 anim: Thumb::Failed,
                 aspect: Some([16.0 / 9.0, 9.0 / 16.0, 1.0, 2.35, 4.0 / 3.0][i % 5]),
+                created: None,
             });
         }
         app.grid_rev = app.grid_rev.wrapping_add(1);
@@ -9551,7 +9899,7 @@ mod tests {
         assert_eq!(app.selected, before, "nothing cached: selection holds");
     }
 
-    /// Attention mode (`interaction = "attention"`, PLAN.md §15 spike):
+    /// Attention mode (`interaction = "attention"`, DESIGN.md §15 spike):
     /// a single click on ANY grid tile selects it and opens quickview on
     /// release — while a matured drag-out still suppresses the open, and
     /// classic mode keeps its select-first behavior.

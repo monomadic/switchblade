@@ -1,6 +1,6 @@
 //! sb-media: media probing, thumbnail extraction, and the filesystem cache.
 //!
-//! PLAN.md §6 (media levels), §7 (sidecar cache), §8 (filesystem-first),
+//! DESIGN.md §6 (media levels), §7 (sidecar cache), §8 (filesystem-first),
 //! §15 (media backend spike: start with external ffmpeg/ffprobe).
 //!
 //! A small worker pool extracts one representative frame per clip via the
@@ -35,7 +35,7 @@ pub struct Recipe {
     /// ffmpeg -q:v — 2 ≈ visually lossless, 31 = worst.
     pub quality: u8,
     /// Anim sheets are `anim_grid × anim_grid` true-aspect frames sampled
-    /// evenly across the clip (PLAN.md §6 level 2), each fit inside a
+    /// evenly across the clip (DESIGN.md §6 level 2), each fit inside a
     /// thumb/anim_grid cell box, packed into one slot. 3 = more motion,
     /// 2 = crisper.
     pub anim_grid: u32,
@@ -97,10 +97,10 @@ impl Recipe {
 const WORKERS: usize = 3;
 
 /// Fired after each result lands in the channel, so the render loop can
-/// wake for it instead of polling (PERFORMANCE-TASKS.md P0.2). The app
+/// wake for it instead of polling (docs/perf-reviews/02-efficiency-review.md P0.2). The app
 /// passes its window-layer wake handle wrapped in a closure.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
-/// Default fraction into the clip the thumb is extracted at (PLAN.md §6
+/// Default fraction into the clip the thumb is extracted at (DESIGN.md §6
 /// initial policy) — the `thumb_seek_fraction` tuning overrides it via
 /// `Recipe::seek_fraction`. Kept public as the default and so callers
 /// without a recipe (maintenance) share one constant.
@@ -349,6 +349,15 @@ pub enum ThumbResult {
     GenDone {
         path: PathBuf,
     },
+    /// The gatekeeper's verdict: ffmpeg ran against the source itself and
+    /// could not extract a frame (corrupt, truncated, or vanished file) —
+    /// not a tooling problem (missing ffmpeg) and not a cache-artifact
+    /// hiccup. The app drops the clip from the grid. Emitted in place of
+    /// the failing job's final Failed/GenDone so the jobs ledger still
+    /// balances.
+    Unplayable {
+        path: PathBuf,
+    },
     /// The chapter probe's answer: the file's chapter start times
     /// (ascending; empty when it has none or the probe failed) plus the
     /// container duration, for the app's synthesized-checkpoint
@@ -518,7 +527,7 @@ fn vt_accel(codec: Option<&str>) -> bool {
 /// decode → (transpose_vt) → scale_vt, and only `hwdownload` at TARGET
 /// resolution — the CPU then converts ~1.5Mpx to RGBA instead of
 /// scaling 8Mpx down first. Measured on 4K60 HEVC → 1440p: 2.3× the
-/// throughput at ~2.5× less CPU than the software chain (PERF.md §1).
+/// throughput at ~2.5× less CPU than the software chain (docs/perf-reviews/01-live-video-pipeline.md §1).
 ///
 /// Returns the `-vf` string, or None when the clip must take the
 /// software chain instead:
@@ -640,7 +649,7 @@ fn worker(
                     results.push(ThumbResult::GenDone { path: path.clone() });
                 }
                 match out {
-                    Some((w, h, rgba)) => {
+                    Ok((w, h, rgba)) => {
                         for _ in 0..owed.thumbs {
                             results.push(ThumbResult::Ready {
                                 path: path.clone(),
@@ -651,10 +660,18 @@ fn worker(
                         }
                         results.push(ThumbResult::Ready { path, w, h, rgba });
                     }
-                    None => {
-                        for _ in 0..=owed.thumbs {
+                    Err(fail) => {
+                        for _ in 0..owed.thumbs {
                             results.push(ThumbResult::Failed { path: path.clone() });
                         }
+                        // The job's own result: the gatekeeper verdict
+                        // when ffmpeg judged the source, a plain Failed
+                        // when it couldn't.
+                        results.push(if fail == ThumbFail::Unplayable {
+                            ThumbResult::Unplayable { path }
+                        } else {
+                            ThumbResult::Failed { path }
+                        });
                     }
                 }
             }
@@ -692,7 +709,8 @@ fn worker(
                 // foreground decode now — the file just landed.
                 if owed.thumbs > 0 {
                     let decoded = jpg
-                        .as_deref()
+                        .as_ref()
+                        .ok()
                         .and_then(|j| decode_jpeg(j, recipe.thumb_w, recipe.thumb_h));
                     for _ in 0..owed.thumbs {
                         results.push(match &decoded {
@@ -709,7 +727,15 @@ fn worker(
                 for _ in 0..owed.gens {
                     results.push(ThumbResult::GenDone { path: path.clone() });
                 }
-                results.push(ThumbResult::GenDone { path });
+                // The sweep is the usual first (often only) ffmpeg pass
+                // over a file: when it proves the source unplayable, say
+                // so in place of the final GenDone — the app drops the
+                // clip, and the ledger still counts one result.
+                results.push(if matches!(jpg, Err(ThumbFail::Unplayable)) {
+                    ThumbResult::Unplayable { path }
+                } else {
+                    ThumbResult::GenDone { path }
+                });
             }
             Request::Anim(path) => {
                 let out = make_anim(&path, &root, have_ffmpeg, &recipe);
@@ -746,16 +772,26 @@ fn worker(
     }
 }
 
-/// Serve from the sidecar cache, generating on miss. See PLAN.md §7/§8.
+/// Why a thumb job produced nothing. `Unplayable` = ffmpeg itself ran
+/// against the source and failed (or the file is gone) — the gatekeeper's
+/// removal signal. `Tooling` = no verdict on the file: ffmpeg is missing,
+/// or a cached artifact failed to decode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ThumbFail {
+    Unplayable,
+    Tooling,
+}
+
+/// Serve from the sidecar cache, generating on miss. See DESIGN.md §7/§8.
 fn make_thumb(
     src: &Path,
     root: &Path,
     have_ffmpeg: bool,
     recipe: &Recipe,
-) -> Option<(u32, u32, Vec<u8>)> {
+) -> Result<(u32, u32, Vec<u8>), ThumbFail> {
     // Foreground (a visible tile is waiting on it): VT keeps grid-fill snappy.
     let jpg = ensure_thumb_file(src, root, have_ffmpeg, recipe, true)?;
-    decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h)
+    decode_jpeg(&jpg, recipe.thumb_w, recipe.thumb_h).ok_or(ThumbFail::Tooling)
 }
 
 /// Make sure the thumb jpg (+ meta.json) exists on disk, returning its
@@ -769,19 +805,20 @@ fn ensure_thumb_file(
     have_ffmpeg: bool,
     recipe: &Recipe,
     hw: bool,
-) -> Option<PathBuf> {
-    let meta = std::fs::metadata(src).ok()?;
+) -> Result<PathBuf, ThumbFail> {
+    // A vanished or non-file source is as unservable as a corrupt one.
+    let meta = std::fs::metadata(src).map_err(|_| ThumbFail::Unplayable)?;
     if !meta.is_file() {
-        return None;
+        return Err(ThumbFail::Unplayable);
     }
     let dir = entry_dir(root, src, meta.len(), mtime_secs(&meta));
     let jpg = dir.join(recipe.thumb_file());
 
     if !jpg.exists() {
         if !have_ffmpeg {
-            return None;
+            return Err(ThumbFail::Tooling);
         }
-        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::create_dir_all(&dir).map_err(|_| ThumbFail::Tooling)?;
         let probed = probe(src);
         if let Some(m) = &probed
             && let Ok(json) = serde_json::to_vec_pretty(m)
@@ -794,10 +831,12 @@ fn ensure_thumb_file(
             .map(|d| (d * recipe.seek_fraction as f64).max(0.0))
             .unwrap_or(0.0);
         let codec = probed.as_ref().and_then(|m| m.codec.clone());
-        extract_frame(src, &jpg, seek, recipe, codec.as_deref(), hw)?;
+        // ffmpeg saw the file itself and couldn't pull a frame: the
+        // gatekeeper's unplayable verdict.
+        extract_frame(src, &jpg, seek, recipe, codec.as_deref(), hw).ok_or(ThumbFail::Unplayable)?;
         log::debug!("thumb generated: {}", src.display());
     }
-    Some(jpg)
+    Ok(jpg)
 }
 
 /// Generate/serve the animated sprite sheet: ANIM_FRAMES frames sampled
@@ -1286,7 +1325,7 @@ fn decode_jpeg(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>
 }
 
 /// How cache entries are keyed to source files (config `cache_key`,
-/// PLAN.md §8). Startup-only: flipping it under a running cache would
+/// DESIGN.md §8). Startup-only: flipping it under a running cache would
 /// split entries across two keyings mid-session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1316,7 +1355,7 @@ fn active_cache_key() -> CacheKey {
     *CACHE_KEY.get_or_init(CacheKey::default)
 }
 
-/// Pragmatic MVP fingerprint (PLAN.md §8): what goes into it depends on
+/// Pragmatic MVP fingerprint (DESIGN.md §8): what goes into it depends on
 /// the configured `CacheKey`. FNV-1a so the key is stable across runs
 /// and toolchains. Stronger modes (partial content hash) come later.
 /// Always reached through `entry_dir` (which layers on lazy adoption);
@@ -1368,7 +1407,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-/// Platform cache dir (PLAN.md §8): ~/Library/Caches/switchblade.noindex
+/// Platform cache dir (DESIGN.md §8): ~/Library/Caches/switchblade.noindex
 /// on macOS, XDG cache dir elsewhere. The `.noindex` suffix keeps
 /// Spotlight's mdworker away from the thousands of generated jpegs (it
 /// honors the suffix); an existing un-suffixed cache is renamed across.

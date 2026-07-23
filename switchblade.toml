@@ -1,4 +1,4 @@
-# Switchblade config (PLAN.md §10)
+# Switchblade config (DESIGN.md §10)
 #
 # Edit this file while the app is running — changes apply within ~250ms.
 # The only exceptions are in "Startup settings" at the bottom, which are
@@ -115,7 +115,7 @@ animation = "normal"
 # so flying across the grid doesn't spawn a decoder per keypress.
 live_delay_ms = 100.0
 
-# Interaction model (PLAN.md §15 spike — hot-reloadable, compare in place):
+# Interaction model (DESIGN.md §15 spike — hot-reloadable, compare in place):
 #   "classic" (default) — the selection plays hires, hover gets a
 #   tile-size lane, click selects, click on the selection quickviews.
 #   "attention" — ONE hires lane follows attention (the hovered tile
@@ -266,6 +266,20 @@ chapter_dock_reveal_px = 80.0
 # either way.
 recurse = true
 
+# The ingest gatekeeper's file checking: reject files whose bytes don't
+# match their video extension before they claim a chip, and drop a clip
+# from the grid once ffmpeg proves its file unplayable (corrupt,
+# truncated, vanished). false = every path with a video extension stays,
+# playable or not.
+gatekeeper = true
+
+# Gatekeeper ordering: "none" (default — sacred stdin/CLI order, arrivals
+# append), "newest" or "oldest" — arriving files merge into a grid sorted
+# by creation date as they stream in, tiles gliding aside when an
+# out-of-order file lands late. CLI --sort overrides. A shuffle (s) takes
+# over the arrangement for the rest of the session.
+sort = "none"
+
 # Thumbnails generate at exactly thumb_width x thumb_height — any size
 # works. The GPU atlas below is carved into fixed slots of this same
 # size, so bigger thumbs = sharper selected/zoomed tiles but fewer clips
@@ -332,7 +346,7 @@ atlas_height = 15984
 quickview_max_width = 2560
 quickview_max_height = 1440
 
-# ── Keys & commands (PLAN.md §11) ────────────────────────────────────────
+# ── Keys & commands (DESIGN.md §11) ────────────────────────────────────────
 # Every key is remappable, movement included: hjkl and the arrows bind to
 # the context-sensitive `move_left`/`move_down`/`move_up`/`move_right`
 # actions by default — in the grid and quickview they move the selection,
