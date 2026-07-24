@@ -197,8 +197,19 @@ impl Gpu {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
+            // Honor the surface alpha so `window_opacity` < 1 shows the
+            // desktop through the background. Our tile blend leaves edges in
+            // premultiplied form, so prefer PreMultiplied; fall back to
+            // PostMultiplied, then whatever the platform offers.
+            alpha_mode: [
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+            ]
+            .into_iter()
+            .find(|m| caps.alpha_modes.contains(m))
+            .unwrap_or(caps.alpha_modes[0]),
             // Auto = wgpu's historical color-space choice (sRGB here).
+            // (alpha diag logged just below.)
             color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -859,6 +870,17 @@ impl Gpu {
             }
         }
         {
+            // Background clear composited against the desktop. The alpha is
+            // `window_opacity` (0 = pure desktop, 1 = opaque). RGB scaling
+            // depends on the surface's composite mode: PreMultiplied wants
+            // colour already multiplied by alpha; PostMultiplied (what Metal
+            // reports) wants straight colour and multiplies alpha itself —
+            // premultiplying there double-darkens the fill. Only this pass
+            // writes the real window surface; the offscreen backdrop/mip
+            // clears above stay fully opaque.
+            let a = frame.window_opacity as f64;
+            let premul = self.config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+            let s = if premul { a } else { 1.0 };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tiles"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -867,10 +889,10 @@ impl Gpu {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: frame.clear[0] as f64,
-                            g: frame.clear[1] as f64,
-                            b: frame.clear[2] as f64,
-                            a: 1.0,
+                            r: frame.clear[0] as f64 * s,
+                            g: frame.clear[1] as f64 * s,
+                            b: frame.clear[2] as f64 * s,
+                            a,
                         }),
                         store: wgpu::StoreOp::Store,
                     },

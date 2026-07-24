@@ -385,6 +385,11 @@ pub struct Tuning {
     /// Thin outline for tiles that have no thumbnail yet.
     pub empty_border: [f32; 3],
     pub background: [f32; 3],
+    /// Opacity (0..1) of the window's background fill — the clear color
+    /// behind the tiles. 1.0 is the classic opaque window; below 1.0 the
+    /// desktop shows through the gaps between tiles (macOS "glass" vibe).
+    /// The tiles themselves stay opaque; only the background is affected.
+    pub window_opacity: f32,
 }
 
 impl Default for Tuning {
@@ -484,6 +489,7 @@ impl Default for Tuning {
             hover_border: [1.0, 1.0, 1.0],
             empty_border: [0.10, 0.10, 0.13],
             background: [0.004, 0.004, 0.006],
+            window_opacity: 1.0,
         }
     }
 }

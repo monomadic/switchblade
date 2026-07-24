@@ -229,6 +229,11 @@ pub struct Blur {
 /// Everything the renderer needs for one frame.
 pub struct Frame {
     pub clear: [f32; 3],
+    /// Alpha of the surface clear (0..1). 1.0 = opaque window; below 1.0
+    /// the desktop shows through the background between tiles, so the
+    /// window must be created transparent and the surface composited with
+    /// a straight-alpha mode. Tiles are unaffected (they draw opaque).
+    pub window_opacity: f32,
     pub tiles: Vec<Tile>,
     pub uploads: Vec<ThumbUpload>,
     pub hires_upload: Option<HiresFrame>,
@@ -368,6 +373,8 @@ pub fn run(app: impl App) -> anyhow::Result<()> {
         animating: true,
         redraw_at: None,
         occluded: false,
+        #[cfg(target_os = "macos")]
+        titlebar_bg: None,
     };
     event_loop.run_app(&mut runner)?;
     Ok(())
@@ -393,6 +400,12 @@ struct Runner<A: App> {
     /// surface won't present, so the continuous-redraw path must not
     /// run — see `about_to_wait`.
     occluded: bool,
+    /// Last `[r, g, b, a]` pushed to the macOS window backgroundColor so the
+    /// glass titlebar matches the grid's clear. Cached so we only touch
+    /// AppKit when the color/opacity actually changes (config hot-reload),
+    /// not every frame.
+    #[cfg(target_os = "macos")]
+    titlebar_bg: Option<[f32; 4]>,
 }
 
 impl<A: App> Runner<A> {
@@ -484,6 +497,94 @@ fn set_window_shadow(w: &Window, on: bool) {
     }
 }
 
+/// Set `NSWindow.opaque`. Must be false for a transparent-background window
+/// so the surface's sub-1.0 clear alpha composites over the desktop rather
+/// than an opaque black backing. No-op if the AppKit handle can't be got.
+#[cfg(target_os = "macos")]
+fn set_window_opaque(w: &Window, opaque: bool) {
+    use objc2_app_kit::NSView;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = w.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return;
+    };
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    if let Some(window) = view.window() {
+        window.setOpaque(opaque);
+    }
+}
+
+/// Glass titlebar: hide the title text and drop the titlebar's own drawing,
+/// and — crucially — extend the content view *under* the titlebar
+/// (`fullSizeContentView`) so the wgpu surface fills that region too. The
+/// titlebar's transparent material would otherwise show the DEFAULT system
+/// window tint (a grey), not the app's black clear, so the only way to make
+/// the strip match the grid exactly is to let the same GPU clear paint it.
+/// The traffic-light buttons float above the content and are untouched.
+/// No-op if the AppKit handle can't be got.
+#[cfg(target_os = "macos")]
+fn set_titlebar_glass(w: &Window) {
+    use objc2_app_kit::{NSView, NSWindowStyleMask, NSWindowTitleVisibility};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = w.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return;
+    };
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    if let Some(window) = view.window() {
+        window.setTitlebarAppearsTransparent(true);
+        window.setTitleVisibility(NSWindowTitleVisibility::NSWindowTitleHidden);
+        // Content fills the whole frame, including behind the titlebar, so
+        // the grid's clear (exact colour + alpha + sRGB handling) paints the
+        // strip. Additive so winit's existing mask bits survive.
+        window.setStyleMask(window.styleMask() | NSWindowStyleMask::FullSizeContentView);
+    }
+}
+
+/// sRGB transfer (linear → sRGB-encoded), matching what the GPU applies
+/// when it stores a linear `LoadOp::Clear` value into an sRGB surface.
+#[cfg(target_os = "macos")]
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Fill the window's non-content area — the glass titlebar strip — with the
+/// grid's clear color so the tint runs continuously from the titlebar down
+/// into the grid. The wgpu surface covers the content area; the titlebar
+/// (transparent material) shows this `backgroundColor` instead. Alpha is
+/// `window_opacity`, matching the surface clear composited over the desktop.
+///
+/// `rgb` are LINEAR (the raw tuning values, as fed to the wgpu clear). The
+/// surface is sRGB, so the GPU encodes the clear to sRGB on store; NSColor's
+/// `colorWithSRGBRed:` instead takes already-sRGB components, so we apply the
+/// same transfer here or the titlebar reads as a different (darker) tint than
+/// the grid at the identical alpha.
+#[cfg(target_os = "macos")]
+fn set_window_background(w: &Window, rgb: [f32; 3], alpha: f32) {
+    use objc2_app_kit::{NSColor, NSView};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = w.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return;
+    };
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    if let Some(window) = view.window() {
+        let color = unsafe {
+            NSColor::colorWithSRGBRed_green_blue_alpha(
+                linear_to_srgb(rgb[0]) as f64,
+                linear_to_srgb(rgb[1]) as f64,
+                linear_to_srgb(rgb[2]) as f64,
+                alpha as f64,
+            )
+        };
+        window.setBackgroundColor(Some(&color));
+    }
+}
+
 impl<A: App> ApplicationHandler for Runner<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -495,8 +596,22 @@ impl<A: App> ApplicationHandler for Runner<A> {
         set_dock_icon();
         let attrs = Window::default_attributes()
             .with_title("switchblade")
+            // Always created transparent so `window_opacity` can be dialed
+            // live via config hot-reload without recreating the window; a
+            // 1.0 clear alpha keeps it visually opaque when opacity == 1.
+            .with_transparent(true)
             .with_inner_size(LogicalSize::new(1280.0, 800.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // winit sets NSWindow.opaque = false for a transparent window, but
+        // be explicit — a stray opaque flag makes the surface composite
+        // over black instead of the desktop.
+        #[cfg(target_os = "macos")]
+        set_window_opaque(&window, false);
+        // Glassy, text-free titlebar (traffic lights kept). The app still
+        // pushes clip info via SetTitle; the text is simply hidden, so the
+        // window title stays correct for anything that reads it.
+        #[cfg(target_os = "macos")]
+        set_titlebar_glass(&window);
         let gpu = pollster::block_on(render::Gpu::new(window.clone(), self.app.atlas()))
             .expect("init gpu");
         self.window = Some(window);
@@ -636,6 +751,22 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 let frame = self.app.frame(dt, viewport);
                 self.animating = frame.animating;
                 self.redraw_at = frame.redraw_at;
+                // Keep the glass titlebar's fill in lockstep with the grid's
+                // clear (both track hot-reloaded background/window_opacity),
+                // touching AppKit only when the value actually changes.
+                #[cfg(target_os = "macos")]
+                {
+                    let want = [
+                        frame.clear[0],
+                        frame.clear[1],
+                        frame.clear[2],
+                        frame.window_opacity,
+                    ];
+                    if self.titlebar_bg != Some(want) {
+                        set_window_background(window, frame.clear, frame.window_opacity);
+                        self.titlebar_bg = Some(want);
+                    }
+                }
                 gpu.render(&frame, viewport);
                 self.apply_commands(event_loop);
             }

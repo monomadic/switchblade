@@ -6070,6 +6070,7 @@ impl Switchblade {
 
         Frame {
             clear: t.background,
+            window_opacity: t.window_opacity,
             tiles,
             uploads: Vec::new(),
             hires_upload: None,

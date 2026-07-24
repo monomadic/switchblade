@@ -35,14 +35,18 @@ gap = 1.0  # space between tiles
 
 # ── Colors ──────────────────────────────────────────────────────────────
 # All colors are [r, g, b] with 0..1 channels.
-background = [0.007, 0.007, 0.007]  # window background
+background = [0.0, 0.0, 0.0]  # window background
+# Opacity of that background fill (0..1). 1.0 = classic opaque window;
+# below 1.0 the desktop shows through the gaps between tiles (macOS
+# "glass" vibe). Tiles stay opaque; hot-reloadable, so dial it live.
+window_opacity = 0.62
 selection_border = [1.0, 1.0, 1.0]  # selected tile + selected filmstrip chip
 hover_border = [1.0, 1.0, 1.0]  # hovered tile
-empty_border = [0.05, 0.05, 0.05]  # thin outline for tiles with no
+empty_border = [0.02, 0.02, 0.02]  # thin outline for tiles with no
 # thumbnail yet (their fill is clear)
 
 # ── Tile shape ──────────────────────────────────────────────────────────
-corner_radius = 0.0  # plain tiles
+corner_radius = 8.0  # plain tiles
 selection_corner_radius = 10.0  # the selected tile (usually rounder)
 
 # ── Selection & hover ───────────────────────────────────────────────────
