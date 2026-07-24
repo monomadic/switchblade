@@ -6,7 +6,7 @@ mod commands;
 mod ingest;
 mod tuning;
 
-pub use tuning::{AnimLevel, BackdropStyle, GridStyle, Interaction, SortMode, Tuning, config_path};
+pub use tuning::{AnimLevel, BackdropStyle, GridStyle, SortMode, Tuning, config_path};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -617,13 +617,13 @@ pub struct Switchblade {
     tuning_file: Option<TuningFile>,
     selected: usize,
     hovered: Option<usize>,
-    /// Multi-selected clips (attention mode's cmd/shift-click): border-only
+    /// Multi-selected clips (cmd/shift-click): border-only
     /// state — marked clips never play. Index-keyed like the selection, so
     /// shuffle remaps it and the D swap clears it.
     marked: std::collections::HashSet<usize>,
-    /// Attention mode: which input owns the attention lane. True after
-    /// pointer movement (attention = the hovered tile), false after a
-    /// keyboard selection move (attention = the selection).
+    /// Which input owns the attention lane. True after pointer movement
+    /// (attention = the hovered tile), false after a keyboard selection
+    /// move (attention = the selection).
     mouse_attention: bool,
     cursor: (f32, f32),
     scroll: f32,
@@ -2005,18 +2005,12 @@ impl Switchblade {
 
     // --- selection ---
 
-    /// The attention-lane interaction model is on (DESIGN.md §15 spike).
-    fn attention(&self) -> bool {
-        self.tuning.interaction == Interaction::Attention
-    }
-
-    /// Which clip the hires lane should play. Classic: always the
-    /// selection. Attention (grid only — modals always show the
-    /// selection): the hovered tile while mousing, the selection while
-    /// keyboard-navigating. Strict rule: mousing over empty space means
-    /// nothing plays (no "last selected keeps playing" fallback yet).
+    /// Which clip the hires lane should play (grid only — modals always
+    /// show the selection): the hovered tile while mousing, the selection
+    /// while keyboard-navigating. Strict rule: mousing over empty space
+    /// means nothing plays (no "last selected keeps playing" fallback).
     fn attention_target(&self) -> Option<usize> {
-        if self.attention() && !self.quickview && !self.fullview && self.mouse_attention {
+        if !self.quickview && !self.fullview && self.mouse_attention {
             self.hovered
         } else {
             Some(self.selected)
@@ -2358,8 +2352,8 @@ impl Switchblade {
                 self.quickview = false;
                 return;
             }
-            // In the grid, Esc drops the multi-select marks (attention
-            // mode's cmd/shift-click) — the last layer to peel.
+            // In the grid, Esc drops the multi-select marks
+            // (cmd/shift-click) — the last layer to peel.
             Key::Escape if !self.marked.is_empty() => {
                 self.marked.clear();
                 self.wake(0.3);
@@ -4233,16 +4227,13 @@ impl Switchblade {
         // repacks it, so any neighbour derived from the layout is noise.
         let ribboning = self.ribbon.is_some() || self.ribbon_settle.is_some();
         let delay_ms = self.tuning.live_delay_ms;
-        // Attention mode (DESIGN.md §15 spike): the hires lane follows
-        // attention — the hovered tile while mousing, the selection while
-        // keyboard-navigating. `attn_hover` marks a hover-driven target,
-        // which settles on the hover clock with its own (longer) guard:
-        // hover is volatile and every settle is a quickview-res spawn.
-        let attn_hover = self.attention()
-            && !self.quickview
-            && !self.fullview
-            && self.mouse_attention
-            && live_on;
+        // The hires lane follows attention — the hovered tile while
+        // mousing, the selection while keyboard-navigating. `attn_hover`
+        // marks a hover-driven target, which settles on the hover clock
+        // with its own (longer) guard: hover is volatile and every settle
+        // is a quickview-res spawn.
+        let attn_hover =
+            !self.quickview && !self.fullview && self.mouse_attention && live_on;
         let sel_target = if live_on {
             self.attention_target()
         } else if paused_live {
@@ -4253,19 +4244,15 @@ impl Switchblade {
         } else {
             None
         };
-        // The hover lane: in the grid, the hovered tile; in quickview,
-        // the hovered filmstrip chip. Never the selected clip (its
-        // stream owns that). Attention mode deletes the grid's tile-size
-        // hover lane — the attention lane IS grid hover playback (strict
-        // rule: nothing else ever plays in the grid).
-        let hover_target = if !live_on {
-            None
-        } else if self.quickview {
-            self.strip_hover.filter(|h| *h != self.selected)
-        } else if self.attention() {
+        // The hover lane is the QUICKVIEW FILMSTRIP's, and only ever
+        // that: the hovered chip, never the selected clip (its stream
+        // owns that). The grid has no tile-size hover lane — the
+        // attention lane IS grid hover playback (strict rule: nothing
+        // else ever plays in the grid).
+        let hover_target = if !live_on || !self.quickview {
             None
         } else {
-            self.hovered.filter(|h| *h != self.selected)
+            self.strip_hover.filter(|h| *h != self.selected)
         };
 
         // A D swap in flight: clip indices are churning, so don't warm,
@@ -4439,7 +4426,7 @@ impl Switchblade {
                     // Hover-driven attention settles on the hover clock,
                     // behind its own longer guard (cold-spawn churn).
                     self.hover_changed_at.elapsed().as_millis() as f32
-                        >= self.tuning.attention_delay_ms
+                        >= self.tuning.hover_delay_ms
                 } else {
                     self.sel_changed_at.elapsed().as_millis() as f32 >= delay_ms
                 }
@@ -4574,9 +4561,9 @@ impl Switchblade {
         self.sel_parked = paused && self.live_sel.is_some()
             || self.live_sel.is_some() && !self.quickview && !self.fullview && {
                 let (first, last) = self.visible_rows(lay, 0);
-                // Park by the LANE's tile, not the selection: in attention
-                // mode the lane may be playing the hovered tile (which is
-                // visible by definition, so it never parks). Lane indices can
+                // Park by the LANE's tile, not the selection: the lane
+                // may be playing the hovered tile (which is visible by
+                // definition, so it never parks). Lane indices can
                 // go stale mid-D-swap — fall back to the selection then.
                 let i = self
                     .live_sel
@@ -5106,8 +5093,9 @@ impl Switchblade {
 
                     let selected = i == self.selected;
                     let hovered = Some(i) == self.hovered;
-                    // The tile the hires lane belongs to: the selection in
-                    // classic mode, wherever attention points otherwise.
+                    // The tile the hires lane belongs to — wherever
+                    // attention points (hover while mousing, selection
+                    // while keyboard-navigating).
                     let attn_tile = self.attention_target() == Some(i);
                     let marked = self.marked.contains(&i);
 
@@ -5254,7 +5242,7 @@ impl Switchblade {
                             t.selection_corner_radius,
                         )
                     } else if marked {
-                        // Multi-selected (attention mode): the selection
+                        // Multi-selected: the selection
                         // border, border-only — the tile never plays.
                         (
                             [sb[0], sb[1], sb[2], 0.9 * ease],
@@ -6206,10 +6194,10 @@ impl App for Switchblade {
                 }
                 let lay = self.layout();
                 if let Some(i) = self.tile_at(&lay, x, y) {
-                    // Attention mode: cmd-click toggles, shift-click
-                    // range-selects from the selection — border-only
-                    // marks that never play and never open a modal.
-                    if self.attention() && (mods.cmd || mods.shift) {
+                    // cmd-click toggles, shift-click range-selects from
+                    // the selection — border-only marks that never play
+                    // and never open a modal.
+                    if mods.cmd || mods.shift {
                         if mods.shift {
                             let (a, b) = (self.selected.min(i), self.selected.max(i));
                             self.marked.extend(a..=b);
@@ -6218,22 +6206,20 @@ impl App for Switchblade {
                         }
                         return;
                     }
-                    let was_selected = i == self.selected;
-                    if !was_selected {
+                    if i != self.selected {
                         self.selected = i;
                         self.sel_changed_at = Instant::now();
                         self.pending_reselect = None; // click outranks the D reselect
                     }
                     // Quickview waits for release: this press may be the
-                    // start of a drag-out, not a click. Classic opens
-                    // only from a click on the already-selected tile;
-                    // attention opens from a single click on ANY tile,
-                    // promoting the attention lane's running stream.
+                    // start of a drag-out, not a click. A single click on
+                    // ANY tile opens it, promoting the attention lane's
+                    // already-running stream (zero handoff).
                     self.press = Some(Press {
                         x,
                         y,
                         clip: i,
-                        open_quickview: self.attention() || was_selected,
+                        open_quickview: true,
                         ghost: self.drag_ghost(i),
                     });
                 }
@@ -6993,16 +6979,19 @@ mod tests {
         assert!(app.rx.is_none(), "disconnect noticed without a hot loop");
     }
 
-    /// The continuity handoff: hover-preview a tile, let it play past the
-    /// thumb anchor, then click it. The selected-lane open (warm
-    /// promotion or fresh spawn) must continue from the PREVIEW's
-    /// position, not restart at the anchor — the restart was the reported
-    /// "video skips backward ~a GOP when it starts playing" (measured in
+    /// The continuity guarantee, grid half: hover a tile, let the
+    /// attention lane play it past the thumb anchor, then click it.
+    /// Playback must CONTINUE — the reported bug was "video skips
+    /// backward ~a GOP when it starts playing" (measured in
     /// benchmarks/scenarios/hover_then_select_handoff.toml: a 6s hover
-    /// jumped 6s back on click). Fixture keyframes are 1s apart (-g 30),
-    /// anchor = 10% of 8s = 0.8s → anchor keyframe 0.0; after >1.4s of
-    /// preview the resumed open must land at a keyframe ≥ 1.0. Needs
-    /// ffmpeg — skipped quietly when it's not on PATH.
+    /// jumped 6s back on click).
+    ///
+    /// Since the attention model became the only model, the grid gets this
+    /// for free and the test says so: hover and click resolve to the SAME
+    /// `attention_target`, so the click must not respawn the lane at all
+    /// (asserted on the lane generation). `hover_resume` still carries the
+    /// quickview filmstrip's chip→selection handoff, where the two lanes
+    /// are genuinely different. Needs ffmpeg — skipped when it's absent.
     #[test]
     fn hover_click_continues_from_the_preview_position() {
         let have_ffmpeg = std::process::Command::new("ffmpeg")
@@ -7058,10 +7047,15 @@ mod tests {
         app.hover_changed_at = Instant::now() - Duration::from_secs(2);
         assert!(
             pump_until(&mut app, |a| a
-                .live_hover
+                .live_sel
                 .as_ref()
-                .is_some_and(|l| l.first_frame.is_some())),
-            "hover preview never served"
+                .is_some_and(|l| l.clip == 1 && l.first_frame.is_some())),
+            "the attention lane never served the hovered tile"
+        );
+        assert_eq!(app.selected, 0, "hovering must not move the selection");
+        assert!(
+            app.live_hover.is_none(),
+            "the grid has no tile-size hover lane"
         );
         // Let the preview play well past the anchor keyframe (wall time —
         // the decoder paces on the wall clock).
@@ -7074,14 +7068,15 @@ mod tests {
             let _ = app.frame(0.016, vp);
             std::thread::sleep(Duration::from_millis(5));
         }
-        let preview_pos = app.live_hover.as_ref().unwrap().player.position();
+        let lane = app.live_sel.as_ref().unwrap();
+        let (preview_pos, generation) = (lane.position(), lane.generation);
         assert!(
             preview_pos > 1.2,
             "preview should have played past 1.2s, at {preview_pos}"
         );
 
-        // Click the hovered tile: selects it; the selected-lane open
-        // (promotion or spawn) must resume from the preview.
+        // Click the hovered tile: it becomes the selection and quickview
+        // opens by PROMOTING this same running stream.
         app.event(InputEvent::MouseDown {
             x: cx,
             y: cy,
@@ -7089,22 +7084,24 @@ mod tests {
         });
         app.event(InputEvent::MouseUp { x: cx, y: cy });
         assert_eq!(app.selected, 1, "click selects the hovered tile");
+        assert!(app.quickview, "a click on any tile opens quickview");
         assert!(
             pump_until(&mut app, |a| a
                 .live_sel
                 .as_ref()
                 .is_some_and(|l| l.clip == 1 && l.first_frame.is_some())),
-            "selected stream never served after the click"
+            "the lane stopped serving after the click"
         );
-        let pos = app.live_sel.as_ref().unwrap().position();
-        assert!(
-            pos >= 0.9,
-            "selected open must continue from the preview (~{preview_pos:.1}s, keyframe ≥1.0), \
-             not restart at the anchor keyframe 0.0 — got {pos}"
+        let lane = app.live_sel.as_ref().unwrap();
+        assert_eq!(
+            lane.generation, generation,
+            "the click must promote the running stream, never respawn it"
         );
+        let pos = lane.position();
         assert!(
-            pos <= preview_pos + 1.0,
-            "resumed position should be near the preview, got {pos} vs {preview_pos}"
+            pos >= preview_pos,
+            "playback must continue from the preview (~{preview_pos:.1}s), \
+             never jump back to the anchor — got {pos}"
         );
     }
 
@@ -7920,7 +7917,7 @@ mod tests {
                 app.clips[i].path.clone()
             })
             .collect();
-        // Multi-select marks (attention mode) are index-keyed too.
+        // Multi-select marks are index-keyed too.
         app.marked = [2usize, 9, 20].into_iter().collect();
         let marked_paths: std::collections::HashSet<PathBuf> = app
             .marked
@@ -10271,19 +10268,17 @@ mod tests {
         assert_eq!(app.selected, before, "nothing cached: selection holds");
     }
 
-    /// Attention mode (`interaction = "attention"`, DESIGN.md §15 spike):
-    /// a single click on ANY grid tile selects it and opens quickview on
-    /// release — while a matured drag-out still suppresses the open, and
-    /// classic mode keeps its select-first behavior.
+    /// A single click on ANY grid tile selects it and opens quickview on
+    /// release (DESIGN.md §15) — while a matured drag-out still
+    /// suppresses the open.
     #[test]
-    fn attention_click_opens_quickview_on_any_tile() {
+    fn click_opens_quickview_on_any_tile() {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
-        app.tuning.interaction = Interaction::Attention;
         let lay = app.layout();
         let (tx, ty, tw, th) = app.tile_rect(&lay, 1);
         let (cx, cy) = (tx + tw * 0.5, ty + th * 0.5);
@@ -10323,30 +10318,19 @@ mod tests {
                 .any(|c| matches!(c, WindowCommand::BeginDrag { .. })),
             "the drag still matured into a drag-out"
         );
-
-        // Classic mode: a click on an unselected tile only selects.
-        app.tuning.interaction = Interaction::Classic;
-        app.event(InputEvent::MouseDown {
-            x: cx,
-            y: cy,
-            mods: Mods::default(),
-        });
-        app.event(InputEvent::MouseUp { x: cx, y: cy });
-        assert!(!app.quickview, "classic: first click only selects");
     }
 
-    /// Attention mode: cmd-click toggles a border-only mark, shift-click
-    /// marks the range from the selection — neither opens quickview,
-    /// moves the selection, or feeds the playback lanes.
+    /// cmd-click toggles a border-only mark, shift-click marks the range
+    /// from the selection — neither opens quickview, moves the selection,
+    /// or feeds the playback lanes.
     #[test]
-    fn attention_multi_select_marks_without_playing() {
+    fn multi_select_marks_without_playing() {
         let mut app = Switchblade::with_options(Options {
             animation: Some(AnimLevel::None),
             demo: true,
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
-        app.tuning.interaction = Interaction::Attention;
         let lay = app.layout();
         let center = |app: &Switchblade, i: usize| {
             let (tx, ty, tw, th) = app.tile_rect(&lay, i);
@@ -10389,21 +10373,13 @@ mod tests {
             "shift-click marks the whole range from the selection"
         );
         assert_eq!(app.selected, 0, "range-marking holds the selection");
-
-        // Classic mode ignores the modifiers entirely: a plain select.
-        app.marked.clear();
-        app.tuning.interaction = Interaction::Classic;
-        app.event(InputEvent::MouseDown { x, y, mods: cmd });
-        assert!(app.marked.is_empty(), "classic: no marks");
-        assert_eq!(app.selected, 2, "classic: the click just selects");
     }
 
-    /// Attention mode: the ONE hires lane follows the pointer — hovering
-    /// an unselected tile (after the attention settle delay) retargets
-    /// the selected-stream lane to that clip without moving the
-    /// selection, and the grid's tile-size hover lane never spawns. A
-    /// keyboard move hands the lane back to the selection. Needs ffmpeg;
-    /// skipped quietly when it's not on PATH.
+    /// The ONE hires lane follows the pointer — hovering an unselected
+    /// tile (after `hover_delay_ms`) retargets the selected-stream lane to
+    /// that clip without moving the selection, and the grid never spawns a
+    /// tile-size hover lane. A keyboard move hands the lane back to the
+    /// selection. Needs ffmpeg; skipped quietly when it's not on PATH.
     #[test]
     fn attention_lane_follows_hover_then_keyboard() {
         let have_ffmpeg = std::process::Command::new("ffmpeg")
@@ -10448,7 +10424,6 @@ mod tests {
             no_config: true, // hermetic: the host config must not steer tests
             ..Options::default()
         });
-        app.tuning.interaction = Interaction::Attention;
         assert!(
             pump_until(&mut app, |a| a.clips.len() == 2),
             "ingest never delivered both clips"

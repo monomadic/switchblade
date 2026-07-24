@@ -398,7 +398,7 @@ Sequence:
 
 ## 14. Milestones
 
-> **Progress:** M0–M6 and M8 are shipped and recorded below as history (exit criteria kept for the record). The open milestones — the attention-lane evaluation (§15), M9, M7, M10, M11 — live as **epics in [TASKS.md](TASKS.md)**, which owns their full specs and priority order. A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
+> **Progress:** M0–M6 and M8 are shipped and recorded below as history (exit criteria kept for the record). The open milestones — M9, M7, M10, M11 — live as **epics in [TASKS.md](TASKS.md)**, which owns their full specs and priority order. A number of features landed beyond the numbered milestones — internal quickview + fullview modals, filmstrip, chapter bar, auto-skip, shuffle/random, native drag-out, siblings swap (`D`), flexible justified grid layout — see CLAUDE.md's Status section for the authoritative shipped-behavior notes.
 
 ### M0 — Skeleton ✅
 - CLI accepts stdin paths (newline and NUL-delimited), **streaming** — don't wait for EOF.
@@ -502,30 +502,27 @@ batch actions, optional SQLite index, post-fx pass, …) moved to
 
 ---
 
-## 15. Open technical spikes
+## 15. Technical spikes (settled records + open questions)
 
-### Attention-lane interaction spike *(BUILT — evaluation pending, tracked in [TASKS.md](TASKS.md))*
+### Attention-lane interaction *(SETTLED 2026-07-24 — adopted; `classic` deleted)*
 
-> **Progress (2026-07):** the model below is implemented behind the hot-reloadable `interaction = "classic" | "attention"` flag (plus `attention_delay_ms`, the hover-settle guard — default 250ms, deliberately longer than `live_delay_ms`). Attention retargets the existing selected-stream lane (`attention_target()`: hover while mousing via a `mouse_attention` modality bit, selection while keyboard-navigating; strict — a gap hover plays nothing); the grid's tile-size hover lane is gated off; click-anywhere quickviews on mouse-up by promoting the lane; cmd/shift-click marks `marked` (border-only, shuffle-remapped, D-swap-cleared, Esc-dropped). Modifiers arrive as `Mods` on `MouseDown` (sb-window tracks `ModifiersChanged`). Classic is unchanged. What remains is the **evaluation + verdict** per the risks below.
+> **Verdict (2026-07-24):** **adopted.** The attention model is now the only interaction model — the `interaction = "classic" | "attention"` flag is gone, and with it the classic path (git history has it if it is ever wanted back, same convention as the `LivePlayer` removal). `attention_delay_ms` was renamed `hover_delay_ms` (old key still parses via a serde alias): it is no longer "a mode's delay", it is simply the pointer-side settle guard, paired with `live_delay_ms` on the keyboard side. **Don't re-litigate this without the user.** One consequence to keep in view: the grid's tile-size hover lane is gone for good, but `live_hover`/`start_live` survive — the quickview **filmstrip** still uses that lane for hover-playing chips, and `hover_resume` still carries the chip→selection continuity handoff there. In the grid the handoff is now free: hover and click resolve to the same `attention_target`, so a click promotes the running stream and never respawns it (`hover_click_continues_from_the_preview_position` asserts the lane generation is unchanged across the click).
+>
+> The one risk from the list below that measurement cannot settle — the warm pool can't predict the mouse, so hover-to-first-frame stays a cold spawn — is left to live use to confirm.
 
-Rework the grid's core gesture around a single **attention lane** and see how it feels and performs before committing. Flag-gated (`interaction = "classic" | "attention"`, hot-reloadable if cheap) so the two models can be compared in place.
-
-**The model:**
+The model, as built and now shipped:
 - **One hires lane follows attention**: the hovered tile while mousing, the selected tile while keyboard-navigating. It decodes at quickview resolution exactly like today's selected lane (the tile samples it downscaled) — so it costs what the selected lane costs now, and today's tile-size hover lane is deleted.
 - **Click opens quickview immediately** by promoting the attention lane's already-running stream — the same zero-handoff trick quickview uses today, minus one click. Composes with drag-out unchanged (open already fires on mouse-up; a matured drag suppresses it).
 - **Cmd-click / shift-click select** (toggle / range): selected clips get the border + selected state only — they never play. Multiple selection allowed; this is the multi-select foundation the Later list wants, and actions/batch actions target it.
 - **Strict playback rule:** the attention lane is the only thing that ever plays in the grid. (A "last-selected keeps playing over empty space" rule can be added later if strict feels dead.)
 - Comparing two clips = quickview's filmstrip, or cmd-click the first and seek out the second.
 
-**Why it might win:** click-to-preview is more direct than select-then-Space; one decoder instead of two (small CPU/VT saving during hover); the interaction and the playback architecture collapse into one concept.
+**Why it won:** click-to-preview is more direct than select-then-Space; one decoder instead of two (a CPU/VT saving during hover); and the interaction and the playback architecture collapse into one concept — the lane *is* the interaction.
 
-**Spike risks / what to actually evaluate:**
-- Hover is more volatile than selection — every settle now spawns a 1080p decoder, not a tile-size one. The settle delay is the guard; it may need to be longer in this mode. Watch cold-spawn churn while sweeping the grid.
-- The warm pool pre-warms keyboard destinations and can't predict the mouse — hover-to-first-frame stays a cold spawn. Is that acceptable in feel?
-- Misclick cost: every stray click is now a modal. Does Esc-out feel cheap enough?
-- Measure with the `RUST_LOG=sb_app=debug` redraw-reason line + core usage vs classic on the same library.
-
-**Exit criteria:** a verdict — adopt (attention becomes the default, classic possibly deleted), keep both behind the flag, or reject with notes. Multi-select's border-only state likely survives regardless of the verdict.
+**The risks it was evaluated against** (kept as the record of what to watch if the feel ever regresses):
+- Hover is more volatile than selection — every settle spawns a quickview-res decoder, not a tile-size one. `hover_delay_ms` (250ms, deliberately longer than `live_delay_ms`) is the guard; lengthen it if cold-spawn churn shows up while sweeping the grid.
+- The warm pool pre-warms keyboard destinations and can't predict the mouse — hover-to-first-frame stays a cold spawn. Accepted; nothing in the pool design can fix it.
+- Misclick cost: every stray click is a modal, so Esc-out has to stay cheap (Esc peels fullview → quickview → marks → grid).
 
 ### Thumbnail format
 Compare:

@@ -111,24 +111,21 @@ zoom_reflow_smoothing = 0.25  # glide rate toward the new layout (also paces the
 # sprite-sheet cycling — is gone; the name still parses as "normal".)
 animation = "normal"
 
-# Live playback starts only after the selection has settled this long,
-# so flying across the grid doesn't spawn a decoder per keypress.
+# ONE hires lane follows your attention: the hovered tile while you're
+# mousing, the selected tile while you're on the keyboard. A single click
+# on any tile opens quickview by promoting that already-running stream
+# (no handoff), and cmd/shift-click multi-selects — border-only marks that
+# never play. These two delays guard the two halves of it.
+#
+# Keyboard: playback starts only after the selection has settled this
+# long, so flying across the grid doesn't spawn a decoder per keypress.
 live_delay_ms = 100.0
-
-# Interaction model (DESIGN.md §15 spike — hot-reloadable, compare in place):
-#   "classic" (default) — the selection plays hires, hover gets a
-#   tile-size lane, click selects, click on the selection quickviews.
-#   "attention" — ONE hires lane follows attention (the hovered tile
-#   while mousing, the selection while keyboard-navigating; the tile-size
-#   hover lane is gone), a single click on any tile opens quickview by
-#   promoting that stream, and cmd/shift-click multi-selects
-#   (border-only marks that never play).
-interaction = "classic"
-# Attention mode: how long a hover must settle before the attention lane
-# spawns for it. Hover is more volatile than the selection and every
-# settle costs a quickview-resolution cold spawn, so this guard runs
-# longer than live_delay_ms.
-attention_delay_ms = 250.0
+# Pointer: how long a hover must settle before the lane follows it. Hover
+# is more volatile than the selection and every settle costs a
+# quickview-resolution cold spawn, so this guard runs longer.
+# (Called attention_delay_ms before this became the only model; the old
+# key still parses.)
+hover_delay_ms = 250.0
 
 # A live lane needs the clip's cached probe meta (duration for the seek
 # anchor, coded dims for the decode size). That read happens off the

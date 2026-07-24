@@ -21,26 +21,7 @@ the entry — this file should only ever contain open work.
 
 ## Now
 
-### 1. Attention-lane evaluation & verdict *(blocks E1+)*
-
-The spike is BUILT (DESIGN.md §15) behind hot-reloadable
-`interaction = "classic" | "attention"`; what remains is the **feel evaluation
-and verdict**, and the verdict shapes the select model everything after builds
-on. Evaluate:
-
-- hover settle vs 1080p cold-spawn churn while sweeping the grid (the settle
-  delay `attention_delay_ms` is the guard; it may need to be longer);
-- keyboard-only warm-pool coverage (the pool can't predict the mouse —
-  hover-to-first-frame stays a cold spawn; acceptable in feel?);
-- misclick cost: every stray click is now a modal — does Esc-out feel cheap?
-- measure vs classic with the `RUST_LOG=sb_app=debug` redraw-reason line +
-  core usage on the same library.
-
-**Exit:** a verdict — adopt (attention becomes default, classic possibly
-deleted), keep both behind the flag, or reject with notes. Multi-select's
-border-only `marked` state likely survives regardless.
-
-### 2. Zoomed-out grid cannot be filled — 428 visible tiles vs 144 atlas slots *(design call)*
+### 1. Zoomed-out grid cannot be filled — 428 visible tiles vs 144 atlas slots *(design call)*
 
 **The "app feels utterly broken when zoomed out" bug.** At `zoom_min` (0.35)
 a 1600×1000 viewport shows **428 tiles**; the atlas holds **144** slots of
@@ -54,11 +35,11 @@ thumb queue empty, `atlas_full_drops` 0.
 
 Needs a **design decision**, not tuning: a small-slot mip tier for low zoom
 (far more tiles per byte of atlas), a bigger atlas, or a deliberate limit on
-zoom-out range. Pairs with #3 — at max zoom the sweep *is* foreground work.
+zoom-out range. Pairs with #2 — at max zoom the sweep *is* foreground work.
 Full statement:
 [perf review 05 §7](docs/perf-reviews/05-zoom-storm-scheduler.md).
 
-### 3. Gen throttle engages permanently, costing ~40–45% of sweep throughput
+### 2. Gen throttle engages permanently, costing ~40–45% of sweep throughput
 
 `gen_live_concurrency` is meant to narrow the sweep "while the selected stream
 presents", but its trigger (`live_sel.is_some()`) is true whenever the grid has
@@ -71,12 +52,12 @@ this", not "a tile has a lane" — and a 4K re-measurement before the cap's
 statement: [perf review 03 §2](docs/perf-reviews/03-slow-disk-scheduler.md).
 
 **Second, worse consequence found in review 05 §7:** when the grid is zoomed
-out past atlas capacity (#2), the tiles beyond the tier-1 budget depend on the
+out past atlas capacity (#1), the tiles beyond the tier-1 budget depend on the
 sweep — so the throttle is starving *visible* work, not just background
 throughput. `gen_running` pinned at 1 with a 4,231-job backlog while 292
 on-screen tiles wait on it.
 
-### 4. Tier B run of the slow-disk gesture + sweep scenarios
+### 3. Tier B run of the slow-disk gesture + sweep scenarios
 
 The reported UI stall did not reproduce in Tier A — worst frame 44.5 ms over
 six runs on a real 8,571-clip library. Upload stalls and present-to-present
@@ -84,7 +65,7 @@ gaps are Tier B by design (HARNESS.md §0.5), and the gesture run evicted 209
 atlas slots, so the GPU half is the remaining in-house suspect. Full
 statement: [perf review 03 §6](docs/perf-reviews/03-slow-disk-scheduler.md).
 
-### 5. Gatekeeper header sniff costs ~107 s of head movement on a cold HDD library
+### 4. Gatekeeper header sniff costs ~107 s of head movement on a cold HDD library
 
 One 16-byte read per candidate file is one ~12 ms seek on a spinning disk:
 8,586 files → 106.9 s of ingest-thread I/O on a cold open, to reject 15 files
@@ -93,7 +74,7 @@ Options: per-volume opt-out, defer to the first gen job (which opens the file
 anyway), or accept it. Product call. Full statement:
 [perf review 03 §3](docs/perf-reviews/03-slow-disk-scheduler.md).
 
-### 6. Long-run soak with the process canary armed
+### 5. Long-run soak with the process canary armed
 
 The reported crash did not reproduce in 2–3 minute windows; a full sweep of a
 big library needs ~1–2 hours. `pending_bytes_peak` stayed at 1.8 MB and threads
@@ -105,7 +86,7 @@ statement: [perf review 03 §6](docs/perf-reviews/03-slow-disk-scheduler.md).
 
 ## Epics (priority order)
 
-### E1 — M9: metadata sort & filter *(next buildable milestone after the verdict)*
+### E1 — M9: metadata sort & filter *(next buildable milestone)*
 
 Reorder and subset the ingested grid by metadata, driven by **internal
 commands bound to keys** — no UI chrome yet (`[keys]`/`[commands]`, DESIGN.md
@@ -233,8 +214,8 @@ smoothly (and never by accident mid-gesture); leaving retracts it.
   quickview, seekbar, auto-skip mean for a still).
 - `--wrap` infinite grid mode.
 - Better thumbnail frame selection.
-- Multi-select batch actions (the `marked` state from the attention spike is
-  the foundation).
+- Multi-select batch actions (the border-only `marked` state is the
+  foundation).
 - Metadata search.
 - Optional SQLite index — only if the filesystem cache provably hurts
   (DESIGN.md §8).
