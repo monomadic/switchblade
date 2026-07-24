@@ -1,0 +1,115 @@
+name = "zoom_storm_instant_open"
+
+intent = """
+The harshest form of the user's repro, and the variant most likely to
+reproduce "movie will not play".
+
+`zoomed_out_thumb_storm.toml` waits 25 s after zooming out before opening
+quickview — which turns out to be long enough for the tier-1 flood to
+drain substantially, so that run measured the storm's *tail*, not its
+peak. This scenario removes the settle entirely: zoom out four times and
+press space on the very next step, while all ~136 tier-1 thumb requests
+(the atlas budget bound) are freshly queued and all 3 workers are inside
+`made` ffmpeg jobs on the SMB volume.
+
+That is the moment the user actually describes: the screen is still full
+of 'loading' tiles when they click. Everything that could starve the open
+is at maximum — the worker pool is committed to multi-second seeked
+extracts, the SMB link is saturated by 3 concurrent ffmpeg readers, and
+the live lane's `SeekablePlayer` must now win reads on that same link
+while the render thread does its `clip_meta` stat.
+
+Read, in order:
+  - `selected_served` — vs the storm run's 200 ms and `cold_open_quickview`'s
+    uncontended number. This is "will not play", quantified.
+  - `decode reads` >100ms / >1s and `max` — the video thread blocking in
+    `av_read_frame`. The storm run already showed one 1.01 s read at the
+    storm's tail; this is the same measurement at its peak.
+  - `tick_ms max` + `render_stall_max_us` — the UI thread half. If a frame
+    equals a render stall to within a millisecond, that frame WAS one
+    synchronous fs call (review 04 §2's signature).
+  - `queue wait: thumb` max — starvation of the work the user is watching.
+
+`validity.require` deliberately omits `selected_served`: if the movie never
+plays, that is the finding, and the run must still be valid enough to read.
+"""
+
+[setup]
+inputs = ["$SB_BENCH_LIBRARY"]
+animation = "normal"
+viewport = [1600.0, 1000.0]
+max_wall_s = 420.0
+
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 1500
+timeout = 300.0
+
+# Let the sweep get its teeth in, same as the storm run.
+[[step]]
+action = "wait"
+secs = 10.0
+
+# ── zoom out hard, with only a frame or two between presses ─────────
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "wait"
+secs = 0.3
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "wait"
+secs = 0.3
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "wait"
+secs = 0.3
+
+[[step]]
+action = "key"
+key = "-"
+
+# Just enough for the newly-visible tiles to have pushed their tier-1
+# requests, and NOT enough for any of them to have been served.
+[[step]]
+action = "wait"
+secs = 1.0
+
+# ── open quickview at peak contention ───────────────────────────────
+[[step]]
+action = "key"
+key = "space"
+
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 150.0
+
+# Whatever happened above, keep watching: the frame-gap / decode-read
+# window while the storm drains around the playing stream.
+[[step]]
+action = "wait"
+secs = 90.0
+
+# Fullview, the other half of the report.
+[[step]]
+action = "key"
+key = "up"
+
+[[step]]
+action = "wait"
+secs = 40.0
+
+[validity]
+require = ["library_count"]

@@ -283,11 +283,14 @@ pub struct Counters {
     /// counters above blame a phase; these name the exact op class, split
     /// so the fix target is unambiguous — on a network volume each call is
     /// a synchronous round-trip and one of the two classes is avoidable:
-    /// - `meta`: `clip_meta` (source stat + meta.json read) at live-spawn.
-    ///   Load-bearing, but only the FIRST read per clip (then memoized).
-    /// - `path`: `cached_thumb_path` (source stat) — the drag ghost, and
-    ///   the handoff-dump arg that is computed even when the dump env var
-    ///   is unset (up to 6× per lane spawn, producing nothing).
+    /// - `meta`: `clip_meta` at live-spawn. Both halves are gone as of
+    ///   2026-07-24 (the stat eliminated, the read moved to
+    ///   `MetaService`), so this class should now read ZERO — a non-zero
+    ///   count means someone put a meta read back on the frame path.
+    /// - `path`: `cached_thumb_path` (source stat) — the drag ghost, now
+    ///   resolved once at mouse-down; the handoff-dump arg that used to
+    ///   be computed with the dump switched off is a closure now.
+    ///
     /// `render_stalls`/`_us`/`_max_us` are the aggregate over both.
     pub render_stalls: AtomicU64,
     pub render_stall_us: AtomicU64,
@@ -296,6 +299,66 @@ pub struct Counters {
     pub render_stall_meta_us: AtomicU64,
     pub render_stall_path_count: AtomicU64,
     pub render_stall_path_us: AtomicU64,
+    /// Live-lane spawns that gave up waiting for their clip's cached meta
+    /// (`Tuning::meta_wait_ms`) and opened on the fallbacks instead — a
+    /// wrong seek anchor and a guessed decode size. This is the cost side
+    /// of moving that read off the render thread (perf review 05 §3):
+    /// `render_stall_meta_*` reaching zero is only a win while this stays
+    /// near zero too.
+    pub meta_wait_expired: AtomicU64,
+
+    // ── live decoder read stalls (the VIDEO thread) ────────────────
+    /// Time the live lanes' reader threads spent blocked inside
+    /// `av_read_frame` — demuxing the source over whatever the volume is.
+    /// The render-stall counters above cover the *UI* thread; these are
+    /// the other half of the reported symptom ("the video thread stalls"),
+    /// and nothing else can see them: a reader parked on a slow SMB read
+    /// produces no frames, no events and no tick cost, so the app looks
+    /// idle while playback is frozen. `over_100ms`/`over_1s` are explicit
+    /// tail counts for the same reason the render-stall tails are — a mean
+    /// read time stays microseconds while a handful of multi-second reads
+    /// are the entire user-visible freeze.
+    pub decode_reads: AtomicU64,
+    pub decode_read_us: AtomicU64,
+    pub decode_read_max_us: AtomicU64,
+    pub decode_read_over_100ms: AtomicU64,
+    pub decode_read_over_1s: AtomicU64,
+
+    // ── queue wait (scheduler latency, not job cost) ───────────────
+    /// Time a request sat in its queue between being pushed and a worker
+    /// popping it, in µs, split thumb (tier 1, visible) vs gen (tier 5,
+    /// sweep). `JobStart`/`JobEnd` measure how long a job *runs*; this is
+    /// the number that makes "the scheduler thrashes" checkable — a
+    /// visible thumb whose queue wait is minutes is starvation, however
+    /// fast the job itself runs once it starts.
+    pub queue_wait_thumb_count: AtomicU64,
+    pub queue_wait_thumb_us: AtomicU64,
+    pub queue_wait_thumb_max_us: AtomicU64,
+    pub queue_wait_gen_count: AtomicU64,
+    pub queue_wait_gen_us: AtomicU64,
+    pub queue_wait_gen_max_us: AtomicU64,
+    /// Tier-1 visible-thumb requests pushed. A zoom-out admits a whole
+    /// screenful at once; this sizes that flood against the sweep.
+    pub thumb_requests: AtomicU64,
+    /// Finished artifacts thrown away because `alloc_slot` found no slot
+    /// (atlas full of in-zone statics, which cannot be evicted). The clip
+    /// resets to `Thumb::None` to stay retryable — so if it is still
+    /// visible, the very next frame re-requests it.
+    ///
+    /// **This is the runaway-loop canary.** When visible tiles exceed the
+    /// atlas slot count, request → generate → drop → re-request never
+    /// converges, and the pool regenerates the same artifacts at max rate
+    /// forever. `thumb_requests` climbing without bound while
+    /// `thumbs_cached` plateaus is the same loop seen from the other end.
+    pub atlas_full_drops: AtomicU64,
+    /// High-water mark of strictly-visible tiles. Against
+    /// `AtlasCfg::slots()` (144 by default) this is the **capacity
+    /// ceiling**: the atlas physically cannot hold a thumb per tile once
+    /// this exceeds it, and `request_visible_thumbs` stops its walk at the
+    /// same budget — so the surplus tiles are never requested at tier 1 and
+    /// depend entirely on the (live-throttled, 1-wide) gen sweep. Zooming
+    /// out is what drives this past the ceiling.
+    pub visible_tiles_max: AtomicU64,
 }
 
 /// A point-in-time read of the counters (serializable for the summary).
@@ -338,6 +401,8 @@ pub struct CounterSnapshot {
     #[serde(default)]
     pub ns_live: u64,
     #[serde(default)]
+    pub meta_wait_expired: u64,
+    #[serde(default)]
     pub render_stalls: u64,
     #[serde(default)]
     pub render_stall_us: u64,
@@ -351,6 +416,34 @@ pub struct CounterSnapshot {
     pub render_stall_path_count: u64,
     #[serde(default)]
     pub render_stall_path_us: u64,
+    #[serde(default)]
+    pub decode_reads: u64,
+    #[serde(default)]
+    pub decode_read_us: u64,
+    #[serde(default)]
+    pub decode_read_max_us: u64,
+    #[serde(default)]
+    pub decode_read_over_100ms: u64,
+    #[serde(default)]
+    pub decode_read_over_1s: u64,
+    #[serde(default)]
+    pub queue_wait_thumb_count: u64,
+    #[serde(default)]
+    pub queue_wait_thumb_us: u64,
+    #[serde(default)]
+    pub queue_wait_thumb_max_us: u64,
+    #[serde(default)]
+    pub queue_wait_gen_count: u64,
+    #[serde(default)]
+    pub queue_wait_gen_us: u64,
+    #[serde(default)]
+    pub queue_wait_gen_max_us: u64,
+    #[serde(default)]
+    pub thumb_requests: u64,
+    #[serde(default)]
+    pub atlas_full_drops: u64,
+    #[serde(default)]
+    pub visible_tiles_max: u64,
 }
 
 /// A drained event, rebased to seconds since the run anchor.
@@ -539,11 +632,67 @@ impl Probe {
             render_stalls: c.render_stalls.load(Ordering::Relaxed),
             render_stall_us: c.render_stall_us.load(Ordering::Relaxed),
             render_stall_max_us: c.render_stall_max_us.load(Ordering::Relaxed),
+            meta_wait_expired: c.meta_wait_expired.load(Ordering::Relaxed),
             render_stall_meta_count: c.render_stall_meta_count.load(Ordering::Relaxed),
             render_stall_meta_us: c.render_stall_meta_us.load(Ordering::Relaxed),
             render_stall_path_count: c.render_stall_path_count.load(Ordering::Relaxed),
             render_stall_path_us: c.render_stall_path_us.load(Ordering::Relaxed),
+            decode_reads: c.decode_reads.load(Ordering::Relaxed),
+            decode_read_us: c.decode_read_us.load(Ordering::Relaxed),
+            decode_read_max_us: c.decode_read_max_us.load(Ordering::Relaxed),
+            decode_read_over_100ms: c.decode_read_over_100ms.load(Ordering::Relaxed),
+            decode_read_over_1s: c.decode_read_over_1s.load(Ordering::Relaxed),
+            queue_wait_thumb_count: c.queue_wait_thumb_count.load(Ordering::Relaxed),
+            queue_wait_thumb_us: c.queue_wait_thumb_us.load(Ordering::Relaxed),
+            queue_wait_thumb_max_us: c.queue_wait_thumb_max_us.load(Ordering::Relaxed),
+            queue_wait_gen_count: c.queue_wait_gen_count.load(Ordering::Relaxed),
+            queue_wait_gen_us: c.queue_wait_gen_us.load(Ordering::Relaxed),
+            queue_wait_gen_max_us: c.queue_wait_gen_max_us.load(Ordering::Relaxed),
+            thumb_requests: c.thumb_requests.load(Ordering::Relaxed),
+            atlas_full_drops: c.atlas_full_drops.load(Ordering::Relaxed),
+            visible_tiles_max: c.visible_tiles_max.load(Ordering::Relaxed),
         }
+    }
+
+    /// A live decoder's reader thread finished a blocking `av_read_frame`.
+    /// Called from the media thread on every demuxed packet, so it stays a
+    /// handful of relaxed adds — see the `decode_read_*` counter docs.
+    pub fn decode_read(&self, took: std::time::Duration) {
+        let us = took.as_micros() as u64;
+        let c = &self.counters;
+        c.decode_reads.fetch_add(1, Ordering::Relaxed);
+        c.decode_read_us.fetch_add(us, Ordering::Relaxed);
+        c.decode_read_max_us.fetch_max(us, Ordering::Relaxed);
+        if us >= 100_000 {
+            c.decode_read_over_100ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if us >= 1_000_000 {
+            c.decode_read_over_1s.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A worker popped a request that had been waiting `took` in its
+    /// queue. Only the two tiers whose starvation is diagnostic are
+    /// tracked (visible thumbs vs the background sweep).
+    pub fn queue_wait(&self, tier: Tier, took: std::time::Duration) {
+        let us = took.as_micros() as u64;
+        let c = &self.counters;
+        let (n, sum, max) = match tier {
+            Tier::Thumb => (
+                &c.queue_wait_thumb_count,
+                &c.queue_wait_thumb_us,
+                &c.queue_wait_thumb_max_us,
+            ),
+            Tier::Gen => (
+                &c.queue_wait_gen_count,
+                &c.queue_wait_gen_us,
+                &c.queue_wait_gen_max_us,
+            ),
+            _ => return,
+        };
+        n.fetch_add(1, Ordering::Relaxed);
+        sum.fetch_add(us, Ordering::Relaxed);
+        max.fetch_max(us, Ordering::Relaxed);
     }
 
     /// Which render-thread fs op class a stall belongs to (see

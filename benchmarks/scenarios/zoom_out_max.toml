@@ -1,0 +1,135 @@
+name = "zoom_out_max"
+
+intent = """
+Zoom ALL the way out on a big library — the state the user actually
+described, and the one `zoomed_out_thumb_storm.toml` failed to reach (it
+zoomed 4 steps and recorded `evictions=0`, i.e. it never even filled the
+atlas).
+
+The hypothesis this tests is a **runaway regeneration loop**, not a
+throttle problem:
+
+  1. zoom out until visible tiles exceed the atlas slot count (12×12 = 144)
+  2. every visible tile is an in-zone static, so `alloc_slot` classifies
+     them all class 0 and an incoming static needs class ≥ 1 — it can
+     evict NOTHING and returns None
+  3. `drain_media` therefore throws the finished artifact away and resets
+     the clip to `Thumb::None` ("stay retryable")
+  4. the clip is still visible, so `request_visible_thumbs` re-queues it on
+     the very next frame
+  5. goto 3 — forever, at whatever rate the pool can sustain
+
+On a local SSD the redo is a cache `hit` (jpeg decode, no source I/O) and
+the loop is merely wasteful. On SMB every redo needs `entry_dir()` →
+`metadata()` on the SOURCE volume for the size_mtime cache key, so it is a
+network round-trip per retry; and on a COLD library the artifact does not
+exist yet, so every retry is a full `made` job — seek + decode over SMB,
+which never converges.
+
+Read:
+  - **`atlas_full_drops`** (new) — the canary. Non-zero means the loop is
+    running; climbing without bound means it will never stop on its own.
+  - `thumb_requests` climbing while `thumbs_cached` plateaus — the same
+    loop from the other end. Compare the ratio against `zoomed_in_control`,
+    where they should track each other.
+  - `jobs` with `hit` vs `made` split — on a cold library these retries are
+    `made`, which is what saturates the link.
+  - `queue_wait: thumb` — with the loop running, a genuinely new visible
+    thumb queues behind an endless stream of retries.
+  - `decode reads` / `render_stall_*` / `tick_ms` — whether playback and
+    the UI survive it.
+
+The zoom is applied as a stream of many presses with no settle, then held,
+so the run measures the steady state of the loop rather than its onset.
+"""
+
+[setup]
+inputs = ["$SB_BENCH_LIBRARY"]
+animation = "normal"
+viewport = [1600.0, 1000.0]
+max_wall_s = 420.0
+
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 3000
+timeout = 300.0
+
+[[step]]
+action = "wait"
+secs = 8.0
+
+# ── zoom all the way out ────────────────────────────────────────────
+# Far more presses than the 4 the first storm scenario used; the zoom
+# clamps at its floor, so overshooting is safe and guarantees we reach it.
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "key"
+key = "-"
+
+# ── hold at max zoom: the steady state of the loop ──────────────────
+# If the loop is real, atlas_full_drops climbs for the whole of this
+# window and never settles.
+[[step]]
+action = "wait"
+secs = 120.0
+
+# Now try to use the app, exactly as reported.
+[[step]]
+action = "key"
+key = "space"
+
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 150.0
+
+[[step]]
+action = "wait"
+secs = 60.0
+
+[validity]
+require = ["library_count"]

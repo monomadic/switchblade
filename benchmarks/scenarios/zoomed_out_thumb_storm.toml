@@ -1,0 +1,138 @@
+name = "zoomed_out_thumb_storm"
+
+intent = """
+The user's own reproduction, which no earlier scenario covers:
+
+  1. open a library with many entries
+  2. ZOOM OUT until the screen is full of 'loading' tiles and the thumb
+     workers stack up
+  3. click a movie and open quickview / fullview — "movie will not play,
+     in some cases the application locks up and needs to be killed"
+
+The zoom-out is the load-bearing step and the reason this differs from
+`slow_disk_watch_under_sweep` (03/04). Zooming out multiplies the VISIBLE
+tile count, and every visible tile pushes a tier-1 `Thumb` request. Tier 1
+sits at the TOP of the strict-priority ladder in `Queues::pop`, and — unlike
+the `gen` sweep — it is subject to NO live throttle: `gen_live_cap` and the
+anim-in-flight pause both gate `gen` only. So a zoom-out converts a
+throttled background sweep into an unthrottled foreground flood that holds
+every worker for as long as the visible set stays unfilled.
+
+What to read, in order:
+  - `queue_wait: thumb` (new) — the scheduler-latency instrument. Job
+    duration was already measured; this is how long a request SITS. If the
+    visible thumbs the user is waiting on show multi-second/minute waits
+    while `worker_utilisation` is ~1.0, the pool is not stalled, it is
+    saturated by work of its own top tier, and the ladder is the bug.
+  - `thumb_requests` vs `library_count` — sizes the flood the zoom-out
+    admits. Compare zoomed-in (control) against zoomed-out.
+  - `decode reads` (new) — the VIDEO thread. `av_read_frame` wall time on
+    the live lane's reader thread. This is the direct measure of "movie
+    will not play": a reader blocked on a contended SMB link produces no
+    frames while the app's tick times stay clean. `>100ms` / `>1s` are the
+    counts that matter; the mean stays microseconds even in a bad run.
+  - `selected_served` — time from pressing space to the FIRST frame, with
+    the storm already loose. Against `cold_open_quickview` (no contention)
+    this is the user-visible "won't play" number.
+  - served-frame gaps + `reanchors` — whether playback, once started,
+    survives the storm.
+  - `render_stall_*` — review 04's finding (render-thread fs on the source
+    volume); included so a lockup can be attributed to the UI thread vs
+    the video thread rather than guessed at.
+
+Point $SB_BENCH_LIBRARY at the corpus. Sweep with
+`--set gen_live_concurrency=0` to confirm the gen throttle is NOT what is
+holding things (it gates the wrong tier for this symptom).
+"""
+
+[setup]
+inputs = ["$SB_BENCH_LIBRARY"]
+animation = "normal"
+viewport = [1600.0, 1000.0]
+max_wall_s = 420.0
+
+# A substantial grid, so zooming out has something to flood with.
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 1500
+timeout = 300.0
+
+# Let the sweep get its teeth into the volume first.
+[[step]]
+action = "wait"
+secs = 10.0
+
+# ── the load-bearing step: zoom out hard ────────────────────────────
+# Each `-` widens the grid; the visible set grows superlinearly in tile
+# count, and every newly-visible tile pushes a tier-1 thumb request.
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "wait"
+secs = 2.0
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "wait"
+secs = 2.0
+
+[[step]]
+action = "key"
+key = "-"
+
+[[step]]
+action = "wait"
+secs = 2.0
+
+[[step]]
+action = "key"
+key = "-"
+
+# Let the screen fill with 'loading' tiles and the workers stack up —
+# this is the state the user describes before they click anything.
+[[step]]
+action = "wait"
+secs = 25.0
+
+# ── now open quickview, exactly as reported ─────────────────────────
+[[step]]
+action = "key"
+key = "space"
+
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 120.0
+
+# Sustained playback while the storm is still draining: the frame-gap and
+# decode-read window.
+[[step]]
+action = "wait"
+secs = 60.0
+
+# Dive to fullview — the second half of the report ("quicklook or fullview").
+[[step]]
+action = "key"
+key = "up"
+
+[[step]]
+action = "wait"
+secs = 30.0
+
+# Advance a clip: a cold spawn while the storm is still loose.
+[[step]]
+action = "key"
+key = "l"
+
+[[step]]
+action = "wait"
+secs = 30.0
+
+[validity]
+require = ["library_count"]

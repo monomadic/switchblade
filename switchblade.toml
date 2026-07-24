@@ -130,6 +130,13 @@ interaction = "classic"
 # longer than live_delay_ms.
 attention_delay_ms = 250.0
 
+# A live lane needs the clip's cached probe meta (duration for the seek
+# anchor, coded dims for the decode size). That read happens off the
+# render thread, so a spawn waits at most this long for it before opening
+# on fallbacks (start of file, guessed size) — normally it lands within a
+# frame, since only the local cache is touched.
+meta_wait_ms = 120.0
+
 # [ / ] jump the playing clip by this fraction of its duration (wraps at
 # the ends). A binding can override the amount per key — see [keys] below.
 skip_fraction = 0.10

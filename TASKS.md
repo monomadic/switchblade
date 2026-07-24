@@ -40,11 +40,23 @@ on. Evaluate:
 deleted), keep both behind the flag, or reject with notes. Multi-select's
 border-only `marked` state likely survives regardless.
 
-### 2. P1.7 — Resolve the drag-ghost thumb path at press time *(trivial)*
+### 2. Zoomed-out grid cannot be filled — 428 visible tiles vs 144 atlas slots *(design call)*
 
-Filesystem calls currently happen in the CursorMoved handler when a drag
-matures. Stash the ghost path in `Press` at mouse-down. Full statement:
-[perf review 02 § P1.7](docs/perf-reviews/02-efficiency-review.md).
+**The "app feels utterly broken when zoomed out" bug.** At `zoom_min` (0.35)
+a 1600×1000 viewport shows **428 tiles**; the atlas holds **144** slots of
+640×360 (used to draw ~84×47 tiles), and `request_visible_thumbs` budgets its
+walk against those same slots, so only **136** are ever requested at tier 1.
+The ~292-tile remainder is outside the foreground policy entirely and is served
+only by the gen sweep — which `gen_live_cap` pins at **one job wide** whenever
+any tile has a lane, against a backlog measured at 4,231 and *growing*. Over
+SMB (~1 s/job) that screen fills at ~1 tile/sec. Not thrash: utilisation 0.36,
+thumb queue empty, `atlas_full_drops` 0.
+
+Needs a **design decision**, not tuning: a small-slot mip tier for low zoom
+(far more tiles per byte of atlas), a bigger atlas, or a deliberate limit on
+zoom-out range. Pairs with #3 — at max zoom the sweep *is* foreground work.
+Full statement:
+[perf review 05 §7](docs/perf-reviews/05-zoom-storm-scheduler.md).
 
 ### 3. Gen throttle engages permanently, costing ~40–45% of sweep throughput
 
@@ -57,6 +69,12 @@ way) on a 1080p corpus. Needs a condition that means "the user is watching
 this", not "a tile has a lane" — and a 4K re-measurement before the cap's
 *value* is touched (the original justification was a 4K cold spawn). Full
 statement: [perf review 03 §2](docs/perf-reviews/03-slow-disk-scheduler.md).
+
+**Second, worse consequence found in review 05 §7:** when the grid is zoomed
+out past atlas capacity (#2), the tiles beyond the tier-1 budget depend on the
+sweep — so the throttle is starving *visible* work, not just background
+throughput. `gen_running` pinned at 1 with a 4,231-job backlog while 292
+on-screen tiles wait on it.
 
 ### 4. Tier B run of the slow-disk gesture + sweep scenarios
 

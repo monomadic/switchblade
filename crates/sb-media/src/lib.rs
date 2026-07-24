@@ -180,6 +180,13 @@ struct Queues {
     chapters: VecDeque<PathBuf>,
     anims_now: VecDeque<PathBuf>,
     r#gen: VecDeque<PathBuf>,
+    /// Enqueue stamps for `thumbs` / `gen`, kept in lockstep with those
+    /// two deques so `pop` can report how long a request waited (the
+    /// scheduler-latency instrument; see `Counters::queue_wait_*`). Only
+    /// these two tiers carry stamps — they are the ones whose starvation
+    /// is diagnostic, and the others are short and self-deduped.
+    thumbs_at: VecDeque<std::time::Instant>,
+    gen_at: VecDeque<std::time::Instant>,
     // ── artifact coalescing (P1.2) ──────────────────────────────────
     // Membership mirrors of the four artifact queues (reprobes are
     // self-deduped app-side and cheap): O(1) duplicate checks — the
@@ -224,6 +231,7 @@ impl Queues {
         if self.in_gen.remove(&p) {
             let i = self.r#gen.iter().position(|q| q == &p).unwrap();
             self.r#gen.remove(i);
+            self.gen_at.remove(i);
             *self.gen_owed.entry(p.clone()).or_default() += 1;
         }
         if self.in_thumbs.contains(&p) || self.thumb_busy(&p) {
@@ -231,6 +239,7 @@ impl Queues {
         } else {
             self.in_thumbs.insert(p.clone());
             self.thumbs.push_back(p);
+            self.thumbs_at.push_back(std::time::Instant::now());
         }
     }
 
@@ -242,6 +251,7 @@ impl Queues {
         } else {
             self.in_gen.insert(p.clone());
             self.r#gen.push_back(p);
+            self.gen_at.push_back(std::time::Instant::now());
         }
     }
 
@@ -257,22 +267,32 @@ impl Queues {
         }
     }
 
+    /// Strict-priority pop, discarding the queue-wait measurement. Kept
+    /// for the unit tests, which assert ordering only.
+    #[cfg(test)]
     fn pop(&mut self) -> Option<Request> {
+        self.pop_timed().map(|(r, _)| r)
+    }
+
+    /// Strict-priority pop, reporting how long the request sat in its
+    /// queue (thumb and gen tiers only — the two that carry stamps).
+    fn pop_timed(&mut self) -> Option<(Request, Option<std::time::Duration>)> {
         if let Some(p) = self.thumbs.pop_front() {
             self.in_thumbs.remove(&p);
             self.inflight.insert((p.clone(), Art::Thumb));
-            return Some(Request::Thumb(p));
+            let waited = self.thumbs_at.pop_front().map(|t| t.elapsed());
+            return Some((Request::Thumb(p), waited));
         }
         if let Some(p) = self.reprobes.pop_front() {
-            return Some(Request::Reprobe(p));
+            return Some((Request::Reprobe(p), None));
         }
         if let Some(p) = self.chapters.pop_front() {
-            return Some(Request::Chapters(p));
+            return Some((Request::Chapters(p), None));
         }
         if let Some(p) = self.anims_now.pop_front() {
             self.in_anims_now.remove(&p);
             self.inflight.insert((p.clone(), Art::Anim));
-            return Some(Request::Anim(p));
+            return Some((Request::Anim(p), None));
         }
         // Live cap: leave gen work queued rather than racing the
         // presenting stream for the drive. Workers park on the condvar;
@@ -298,7 +318,8 @@ impl Queues {
             self.in_gen.remove(&p);
             self.inflight.insert((p.clone(), Art::Thumb));
             self.gen_running += 1;
-            return Some(Request::Gen(p));
+            let waited = self.gen_at.pop_front().map(|t| t.elapsed());
+            return Some((Request::Gen(p), waited));
         }
         None
     }
@@ -488,6 +509,7 @@ impl MediaService {
 
     pub fn request(&self, path: PathBuf) {
         let (lock, cv) = &*self.queue;
+        self.probe.counters.thumb_requests.fetch_add(1, Relaxed);
         lock.lock().unwrap().push_thumb(path);
         cv.notify_one();
     }
@@ -675,11 +697,11 @@ fn worker(
     loop {
         // Strict priority (tier order documented on `Queues`). The lock
         // drops before any work starts.
-        let req = {
+        let (req, waited) = {
             let (lock, cv) = &*queue;
             let mut q = lock.lock().unwrap();
             loop {
-                if let Some(r) = q.pop() {
+                if let Some(r) = q.pop_timed() {
                     break r;
                 }
                 q = cv.wait(q).unwrap();
@@ -697,6 +719,11 @@ fn worker(
             Request::Gen(p) => (Tier::Gen, p.clone()),
         };
         let job = probe.next_job_id();
+        // Queue latency, before the job's own cost starts accruing: how
+        // long this request sat behind higher-priority work.
+        if let Some(w) = waited {
+            probe.queue_wait(tier, w);
+        }
         probe.counters.jobs_started.fetch_add(1, Relaxed);
         probe.mark_job(EventKind::JobStart, tier, job, &src, None, None);
         let t0 = std::time::Instant::now();
@@ -1137,20 +1164,99 @@ pub struct Meta {
 /// Read the cached meta.json for a clip without probing (cheap: one small
 /// file read; no process spawn). Present for anything with a thumbnail.
 ///
-/// Strictly read-only (P0.7): live spawns call this on the render thread,
-/// so a stale `src` (a rename under `size_mtime` keying strands the
-/// recorded path, and `--cleanup-cache` judges entries dead by whether
-/// meta.src still fingerprints) comes back as-is — the caller queues a
-/// background reprobe, whose worker rewrites the entry off-thread. The
-/// heal still happens on first access, just never on this thread.
+/// Strictly read-only (P0.7): a stale `src` (a rename under `size_mtime`
+/// keying strands the recorded path, and `--cleanup-cache` judges entries
+/// dead by whether meta.src still fingerprints) comes back as-is — the
+/// caller queues a background reprobe, whose worker rewrites the entry.
+///
+/// **Blocking, and the block is a source `stat` on the clip's own volume**
+/// — 401 ms mean on a contended SMB link (perf review 05 §3). Never call
+/// it from the render thread: `MetaService` is the async door, and
+/// `cached_meta_keyed` skips the stat outright when the caller already
+/// knows the file's size/mtime.
 pub fn cached_meta(path: &Path) -> Option<Meta> {
     cached_meta_in(&cache_root(), path)
 }
 
 fn cached_meta_in(root: &Path, path: &Path) -> Option<Meta> {
     let meta = std::fs::metadata(path).ok()?;
-    let file = entry_dir(root, path, meta.len(), mtime_secs(&meta)).join("meta.json");
+    cached_meta_keyed_in(root, path, meta.len(), mtime_secs(&meta))
+}
+
+/// `cached_meta` for a caller that already holds the file's fingerprint
+/// inputs (the ingest thread stats every clip anyway — `fingerprint_key`).
+/// Reads only the cache entry, which lives on the LOCAL cache volume: no
+/// round-trip to the clip's own disk at all.
+pub fn cached_meta_keyed(path: &Path, size: u64, mtime: u64) -> Option<Meta> {
+    cached_meta_keyed_in(&cache_root(), path, size, mtime)
+}
+
+fn cached_meta_keyed_in(root: &Path, path: &Path, size: u64, mtime: u64) -> Option<Meta> {
+    let file = entry_dir(root, path, size, mtime).join("meta.json");
     serde_json::from_slice(&std::fs::read(&file).ok()?).ok()
+}
+
+/// The cache-keying inputs of a `stat` the caller already performed, so
+/// they can be carried to a later `cached_meta_keyed` instead of being
+/// re-read. Must stay the exact pair `entry_dir` keys on.
+pub fn fingerprint_key(meta: &std::fs::Metadata) -> (u64, u64) {
+    (meta.len(), mtime_secs(meta))
+}
+
+/// Off-thread reader for cached `meta.json`: one thread, one job kind.
+///
+/// Live-lane spawns need a clip's duration and coded dims before they can
+/// pick a seek anchor and decode size, and reading that meta blocks —
+/// perf review 05 §3 measured a single `clip_meta` call freezing one
+/// `frame()` for 901 ms over SMB. The app now asks here instead and defers
+/// the spawn by a frame (`Tuning::meta_wait_ms` caps the wait), adopting
+/// the answer when it lands.
+///
+/// **Deliberately not the ffmpeg worker pool.** Those three workers sit in
+/// ~1 s ffmpeg jobs on a network volume, so a meta read queued behind them
+/// would arrive far too late to anchor a spawn. This thread only ever does
+/// small reads, so a lookup completes within a frame or two.
+pub struct MetaService {
+    tx: mpsc::Sender<(PathBuf, Option<(u64, u64)>)>,
+    rx: Receiver<(PathBuf, Option<Meta>)>,
+}
+
+impl MetaService {
+    pub fn new(notify: Notify) -> Self {
+        let (tx, jobs) = mpsc::channel::<(PathBuf, Option<(u64, u64)>)>();
+        let (done, rx) = mpsc::channel::<(PathBuf, Option<Meta>)>();
+        thread::spawn(move || {
+            let root = cache_root();
+            for (path, fp) in jobs {
+                let m = match fp {
+                    Some((size, mtime)) => cached_meta_keyed_in(&root, &path, size, mtime),
+                    // No fingerprint from ingest (demo tiles, or a path
+                    // that arrived without a stat): pay the source stat
+                    // HERE, where blocking is allowed.
+                    None => cached_meta_in(&root, &path),
+                };
+                if done.send((path, m)).is_err() {
+                    return; // app gone
+                }
+                notify(); // deadline-paced loop: wake for the answer
+            }
+        });
+        Self { tx, rx }
+    }
+
+    /// Queue a lookup. `fp` is the ingest stat's `fingerprint_key`, when
+    /// the caller has it. Callers dedupe (the app keys its in-flight set
+    /// by path); a duplicate would only cost a second small read.
+    pub fn request(&self, path: PathBuf, fp: Option<(u64, u64)>) {
+        let _ = self.tx.send((path, fp));
+    }
+
+    /// One finished lookup, or `None` when nothing is ready. `None` in the
+    /// payload means "no cached meta for this clip" — a real answer, and
+    /// the one that stops a spawn waiting forever.
+    pub fn try_recv(&self) -> Option<(PathBuf, Option<Meta>)> {
+        self.rx.try_recv().ok()
+    }
 }
 
 /// Worker-side half of `request_reprobe`: probe again and rewrite the
@@ -1809,6 +1915,51 @@ mod tests {
         assert!(q.pop().is_none(), "the absorbed gen must not run twice");
         let owed = q.complete(&p, Art::Thumb);
         assert_eq!((owed.gens, owed.thumbs), (1, 0), "sweep's GenDone owed");
+    }
+
+    /// The queue-wait stamps (`thumbs_at` / `gen_at`, the instrument
+    /// behind `Counters::queue_wait_*`) must stay in lockstep with their
+    /// path deques through the awkward case: a visible request absorbing
+    /// a gen entry, which removes at an ARBITRARY index rather than the
+    /// front. A desync here doesn't fail loudly — it silently reports one
+    /// request's wait against another's, which is worse than no
+    /// instrument at all (perf review 05 §1).
+    #[test]
+    fn queue_wait_stamps_stay_in_lockstep_through_absorption() {
+        let mut q = Queues::default();
+        let (a, b, c) = (
+            PathBuf::from("a.mp4"),
+            PathBuf::from("b.mp4"),
+            PathBuf::from("c.mp4"),
+        );
+        // Three sweep entries, then promote the MIDDLE one to tier 1.
+        q.push_gen(a.clone());
+        q.push_gen(b.clone());
+        q.push_gen(c.clone());
+        q.push_thumb(b.clone());
+        assert_eq!(q.r#gen.len(), q.gen_at.len(), "gen stamps track gen queue");
+        assert_eq!(
+            q.thumbs.len(),
+            q.thumbs_at.len(),
+            "thumb stamps track thumb queue"
+        );
+
+        // Every pop must yield a stamp, and the queues must stay paired.
+        let mut popped = Vec::new();
+        while let Some((req, waited)) = q.pop_timed() {
+            assert!(waited.is_some(), "thumb/gen pops carry a queue wait");
+            assert_eq!(q.r#gen.len(), q.gen_at.len(), "gen stays paired");
+            assert_eq!(q.thumbs.len(), q.thumbs_at.len(), "thumbs stay paired");
+            popped.push(match req {
+                Request::Thumb(p) | Request::Gen(p) => p,
+                _ => panic!("only thumb/gen requests were queued"),
+            });
+            // The pool is unbounded here (gen_live_cap = 0 by default), so
+            // completing each job keeps the sweep flowing.
+            let p = popped.last().unwrap().clone();
+            q.complete(&p, Art::Thumb);
+        }
+        assert_eq!(popped, vec![b, a, c], "promoted first, then sweep order");
     }
 
     /// A visible request arriving while the gen sweep is ALREADY

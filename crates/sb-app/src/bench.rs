@@ -175,6 +175,11 @@ pub struct Summary {
     /// throttle; ~1.0 = saturated.
     #[serde(default)]
     pub worker_utilisation: f64,
+    /// Atlas slot count for this run (`AtlasCfg::slots()`). The hard
+    /// ceiling on how many tiles can hold a thumb at once — read
+    /// `counters.visible_tiles_max` against it.
+    #[serde(default)]
+    pub atlas_slots: u64,
     /// Process-tree resident memory + thread count, sampled off the
     /// render thread (see `sample_process`): [t, rss_mb, threads,
     /// children]. The crash canary — an unbounded backlog or a thread
@@ -364,6 +369,7 @@ pub fn run(scenario_path: &Path, out_dir: &Path, sets: &[String]) -> Result<Summ
         phase_ms: compute_phases(&rig.phase_ms),
         queue_curve: rig.queue_curve.clone(),
         jobs: compute_jobs(&events),
+        atlas_slots: rig.app.atlas_slots() as u64,
         worker_utilisation: {
             let busy_s = rig.probe.snapshot().worker_busy_us as f64 / 1e6;
             busy_s / (wall_s.max(1e-9) * MEDIA_WORKERS as f64)
@@ -1523,6 +1529,7 @@ mod tests {
                 total_s: 5.0,
             }],
             worker_utilisation: 0.9,
+            atlas_slots: 144,
             proc_curve: vec![[0.0, 120.0, 14.0, 1.0]],
             frame_gap_ms: vec![],
         }

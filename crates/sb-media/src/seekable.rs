@@ -530,6 +530,11 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
             seek_to(cfg.start);
         }
 
+        // The lane's probe sink, cached once it is attached (attachment
+        // happens just after spawn, so the first reads may miss it). Held
+        // locally so timing a read costs no mutex on the packet path.
+        let mut sink: Option<std::sync::Arc<crate::probe::Probe>> = None;
+
         loop {
             if shared.closed.load(Ordering::Relaxed) {
                 return Ok(());
@@ -540,7 +545,17 @@ unsafe fn reader(shared: &Shared, cfg: &ReaderCfg) -> Result<(), String> {
                 pump.anchor = None;
                 continue;
             }
+            if sink.is_none() {
+                sink = shared.probe.lock().unwrap().as_ref().map(|lp| lp.sink.clone());
+            }
+            // The blocking demux read: on a network or slow volume THIS is
+            // where the video thread freezes, and no other instrument can
+            // see it (a parked reader emits nothing and costs no tick time).
+            let t_read = Instant::now();
             let r = ffi::av_read_frame(fmt.0, pkt.0);
+            if let Some(s) = &sink {
+                s.decode_read(t_read.elapsed());
+            }
             if r == ffi::AVERROR_EOF {
                 // Drain the decoder's tail, then loop the clip (the CLI
                 // used `-stream_loop -1`; a resident demuxer just seeks).

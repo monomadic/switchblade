@@ -276,11 +276,54 @@ fn print_summary(s: &sb_app::bench::Summary) {
         c.render_stall_max_us as f64 / 1000.0,
     );
     println!(
-        "render stalls: meta {}× {:.1}ms (clip_meta) | thumb_path {}× {:.1}ms (cached_thumb_path)",
+        "render stalls: meta {}× {:.1}ms (clip_meta) | thumb_path {}× {:.1}ms (cached_thumb_path) \
+         | meta_wait_expired={}",
         c.render_stall_meta_count,
         c.render_stall_meta_us as f64 / 1000.0,
         c.render_stall_path_count,
         c.render_stall_path_us as f64 / 1000.0,
+        // The cost side of moving that read off-thread: spawns that gave
+        // up waiting for meta. `meta 0× / expired 0` is the fix landing.
+        c.meta_wait_expired,
+    );
+    println!(
+        "decode reads: n={} mean={:.2}ms max={:.1}ms | >100ms={} >1s={}",
+        c.decode_reads,
+        if c.decode_reads > 0 {
+            c.decode_read_us as f64 / c.decode_reads as f64 / 1000.0
+        } else {
+            0.0
+        },
+        c.decode_read_max_us as f64 / 1000.0,
+        c.decode_read_over_100ms,
+        c.decode_read_over_1s,
+    );
+    println!(
+        "queue wait: thumb n={} mean={:.0}ms max={:.0}ms | gen n={} mean={:.0}ms max={:.0}ms | thumb_requests={}",
+        c.queue_wait_thumb_count,
+        if c.queue_wait_thumb_count > 0 {
+            c.queue_wait_thumb_us as f64 / c.queue_wait_thumb_count as f64 / 1000.0
+        } else {
+            0.0
+        },
+        c.queue_wait_thumb_max_us as f64 / 1000.0,
+        c.queue_wait_gen_count,
+        if c.queue_wait_gen_count > 0 {
+            c.queue_wait_gen_us as f64 / c.queue_wait_gen_count as f64 / 1000.0
+        } else {
+            0.0
+        },
+        c.queue_wait_gen_max_us as f64 / 1000.0,
+        c.thumb_requests,
+    );
+    println!(
+        "atlas: visible_tiles_max={} vs {} slots{} | full_drops={} | evictions={} | thumbs_cached={}",
+        c.visible_tiles_max,
+        s.atlas_slots,
+        if c.visible_tiles_max > s.atlas_slots { "  <-- OVER CAPACITY" } else { "" },
+        c.atlas_full_drops,
+        c.evictions,
+        c.thumbs_cached,
     );
     for l in &s.latencies {
         println!(

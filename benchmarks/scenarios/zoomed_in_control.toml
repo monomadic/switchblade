@@ -1,0 +1,85 @@
+name = "zoomed_in_control"
+
+intent = """
+The zoomed-IN control for `zoomed_out_thumb_storm.toml`. Byte-for-byte the
+same scenario — same library, same settle waits, same quickview open,
+fullview dive and clip advance — with ONLY the four zoom-out keypresses
+removed. The default grid's visible set stands in as the control.
+
+Its whole job is to isolate the zoom-out as a variable. Read the same
+instruments and diff them against the storm run:
+  - `thumb_requests` — how many tier-1 requests each visible-set size
+    admits. This is the flood, sized.
+  - `queue_wait: thumb` mean/max — whether a visible thumb waits behind
+    the pool at this visible-set size.
+  - `decode reads` >100ms/>1s and `selected_served` — whether the video
+    thread suffers WITHOUT the storm, i.e. whether the zoom-out is causal
+    or the SMB link alone accounts for it.
+
+Run this back-to-back with the storm scenario, never concurrently: two
+runs against the same network volume contend and invalidate both.
+"""
+
+[setup]
+inputs = ["$SB_BENCH_LIBRARY"]
+animation = "normal"
+viewport = [1600.0, 1000.0]
+max_wall_s = 420.0
+
+# A substantial grid, so zooming out has something to flood with.
+[[step]]
+action = "wait_until"
+cond = "library_count"
+n = 1500
+timeout = 300.0
+
+# Let the sweep get its teeth into the volume first.
+[[step]]
+action = "wait"
+secs = 10.0
+
+# NO zoom-out: the default grid's visible set is the control.
+
+# Same settle window as the storm run, so the two are time-comparable.
+
+# this is the state the user describes before they click anything.
+[[step]]
+action = "wait"
+secs = 25.0
+
+# ── now open quickview, exactly as reported ─────────────────────────
+[[step]]
+action = "key"
+key = "space"
+
+[[step]]
+action = "wait_until"
+cond = "selected_served"
+timeout = 120.0
+
+# Sustained playback while the storm is still draining: the frame-gap and
+# decode-read window.
+[[step]]
+action = "wait"
+secs = 60.0
+
+# Dive to fullview — the second half of the report ("quicklook or fullview").
+[[step]]
+action = "key"
+key = "up"
+
+[[step]]
+action = "wait"
+secs = 30.0
+
+# Advance a clip: a cold spawn while the storm is still loose.
+[[step]]
+action = "key"
+key = "l"
+
+[[step]]
+action = "wait"
+secs = 30.0
+
+[validity]
+require = ["library_count"]

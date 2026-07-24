@@ -36,6 +36,13 @@ pub struct Ingested {
     /// read from the stat the gatekeeper already performs — carried so
     /// sorted ingest (`--sort newest`) never stats on the render thread.
     pub created: Option<SystemTime>,
+    /// Cache-key inputs (size, mtime secs) from that same stat. Carried
+    /// for the same reason `created` is, and for a sharper one: without
+    /// them a cached-meta lookup has to stat the clip's own volume, which
+    /// on SMB is a ~400 ms round-trip (perf review 05 §3). With them the
+    /// lookup only reads the local cache entry. `None` for cloud
+    /// placeholders and paths that never resolved.
+    pub fp: Option<(u64, u64)>,
 }
 
 /// The gatekeeper's cheap content check: a valid video extension is not
@@ -297,6 +304,7 @@ fn handle_path(tx: &Tx, path: PathBuf, recurse: bool) -> Result<(), SendError<In
         readable: meta.is_ok(),
         cloud,
         created: meta.as_ref().ok().and_then(created_of),
+        fp: meta.as_ref().ok().map(sb_media::fingerprint_key),
     })
 }
 
@@ -346,6 +354,7 @@ fn walk_dir(
                         readable: false,
                         cloud: true,
                         created: None,
+                        fp: None,
                     })?;
                 }
             }
@@ -377,6 +386,7 @@ fn walk_dir(
                 readable: meta.is_ok(),
                 cloud,
                 created: meta.as_ref().ok().and_then(created_of),
+                fp: meta.as_ref().ok().map(sb_media::fingerprint_key),
             })?;
         }
     }

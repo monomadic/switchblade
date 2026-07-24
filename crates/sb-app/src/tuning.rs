@@ -235,6 +235,15 @@ pub struct Tuning {
     /// selection and every settle costs a quickview-res cold spawn, so
     /// this guard defaults longer than `live_delay_ms`.
     pub attention_delay_ms: f32,
+    /// How long a live-lane spawn may wait for the clip's cached meta to
+    /// arrive from the off-thread reader before opening without it (perf
+    /// review 05 §3 moved that read off the render thread). The wait buys
+    /// the right seek anchor and decode size — normally one frame, since
+    /// the reader only touches the local cache — and this caps it, so a
+    /// slow or wedged lookup can never hold playback back. Beyond it the
+    /// lane opens at 0:00 on guessed dims and adopts the real meta on its
+    /// next spawn.
+    pub meta_wait_ms: f32,
     /// Fraction of the clip's duration that `[`/`]` jump (0..1). A binding
     /// can override it per key via `amount` on an internal command.
     pub skip_fraction: f32,
@@ -423,6 +432,7 @@ impl Default for Tuning {
             live_delay_ms: 100.0,
             interaction: Interaction::Classic,
             attention_delay_ms: 250.0,
+            meta_wait_ms: 120.0,
             skip_fraction: 0.10,
             thumb_seek_fraction: 0.10,
             drag_threshold: 6.0,

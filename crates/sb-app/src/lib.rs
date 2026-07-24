@@ -408,6 +408,23 @@ struct Clip {
     /// fallback) — the sorted-ingest merge key. None for demo tiles and
     /// cloud placeholders.
     created: Option<std::time::SystemTime>,
+    /// Cache-key inputs (size, mtime secs) from that same ingest stat, so
+    /// a cached-meta lookup never has to stat the clip's own volume again
+    /// (perf review 05 §3 — that stat was the 901 ms UI freeze). None
+    /// leaves `MetaService` to stat for itself, off-thread.
+    fp: Option<(u64, u64)>,
+}
+
+/// Answer of the non-blocking cached-meta lookup (`App::clip_meta`).
+/// `Ready(None)` is a real answer — the clip has no cached meta (or the
+/// lookup outran `meta_wait_ms`) — while `Pending` means a read is in
+/// flight and the caller should try again next frame. Spawns treat
+/// `Pending` as "no lane this frame": one frame of delay buys the right
+/// seek anchor and decode size, where guessing would open the clip at
+/// 0:00 and then jolt.
+enum MetaLookup {
+    Ready(Option<sb_media::Meta>),
+    Pending,
 }
 
 /// Startup options from the CLI (config handles everything else).
@@ -523,14 +540,23 @@ pub struct Switchblade {
     /// `MediaService::request_reprobe`). Keeps repeat visits from
     /// re-queueing the same clip.
     reprobed: std::collections::HashSet<PathBuf>,
-    /// Session memo of complete cached_meta results by path (P0.7): live
-    /// spawns run on the render thread, so the disk read behind them
-    /// (source stat + meta.json) is paid at most once per clip — every
-    /// warm/re-spawn afterwards is a pure memory hit. Incomplete metas
-    /// (no pix_fmt: pre-heal cache entries) are deliberately NOT
-    /// memoized — they re-read each spawn, which is how the background
-    /// reprobe's heal gets picked up without a cross-thread signal.
-    meta_cache: HashMap<PathBuf, sb_media::Meta>,
+    /// Session memo of cached_meta results by path (P0.7). `None` is a
+    /// real answer — "this clip has no cached meta" — and is what keeps a
+    /// deferred spawn from waiting forever on a clip that never had one.
+    ///
+    /// The read itself no longer happens here: it runs on `meta_svc` and
+    /// lands via `drain_meta` (perf review 05 §3 — one such read froze a
+    /// frame for 901 ms on SMB). Incomplete metas (no pix_fmt: pre-heal
+    /// cache entries) ARE memoized now; `heal_meta` evicts the entry at
+    /// the spawn that notices, so the next spawn re-reads and adopts the
+    /// reprobe's heal — without ever blocking to find out.
+    meta_cache: HashMap<PathBuf, Option<sb_media::Meta>>,
+    /// Meta lookups in flight on `meta_svc`, with the instant they were
+    /// queued: the dedupe set, and the deadline clock for a spawn that is
+    /// waiting on one (`Tuning::meta_wait_ms`).
+    meta_pending: HashMap<PathBuf, Instant>,
+    /// The off-thread cached-meta reader (see `sb_media::MetaService`).
+    meta_svc: sb_media::MetaService,
     sel_changed_at: Instant,
     hover_changed_at: Instant,
     demo: bool,
@@ -684,6 +710,13 @@ struct Press {
     /// The press was on the already-selected grid tile: releasing
     /// without dragging opens quickview.
     open_quickview: bool,
+    /// The drag-out ghost image, resolved HERE at mouse-down (P1.7).
+    /// `cached_thumb_path` stats the source volume; doing it where the
+    /// drag matures put an unbounded slow-volume block inside the
+    /// CursorMoved callback — the same cadence that feeds scrubbing.
+    /// Mouse-down is a discrete user act, so one stat there is fine, and
+    /// cloud clips skip it entirely (never read, so never a ghost).
+    ghost: Option<PathBuf>,
 }
 
 /// Once-a-second debug log of how many frames ran and which condition
@@ -916,6 +949,8 @@ impl Switchblade {
             auto_skip_since: None,
             reprobed: std::collections::HashSet::new(),
             meta_cache: HashMap::new(),
+            meta_pending: HashMap::new(),
+            meta_svc: sb_media::MetaService::new(notify.clone()),
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
@@ -1024,6 +1059,7 @@ impl Switchblade {
                         ][i % 7],
                     ),
                     created: None,
+                    fp: None,
                 });
             }
         }
@@ -3303,6 +3339,7 @@ impl Switchblade {
                         },
                         aspect: None,
                         created: item.created,
+                        fp: item.fp,
                     });
                 }
                 Err(TryRecvError::Empty) => break,
@@ -3660,7 +3697,7 @@ impl Switchblade {
     /// thumb's `meta.json` records. Memory-only (`meta_cache`), so safe on
     /// the render thread; `None` until a spawn has read the clip's meta.
     fn meta_aspect(&self, path: &std::path::Path) -> Option<f32> {
-        let m = self.meta_cache.get(path)?;
+        let m = self.meta_cache.get(path)?.as_ref()?;
         Self::meta_aspect_of(m)
     }
 
@@ -3684,8 +3721,14 @@ impl Switchblade {
         if c.aspect.is_some() {
             return;
         }
-        let path = c.path.clone();
-        if let Some(a) = self.clip_meta(&path).as_ref().and_then(Self::meta_aspect_of) {
+        let (path, fp) = (c.path.clone(), c.fp);
+        // Non-blocking: a miss queues the read and this retries next
+        // frame (the call site already runs per frame while aspect is
+        // unknown), so the bar never opens on a stale shape *and* never
+        // waits on the disk here.
+        if let MetaLookup::Ready(Some(m)) = self.clip_meta(&path, fp)
+            && let Some(a) = Self::meta_aspect_of(&m)
+        {
             self.clips[self.selected].aspect = Some(a);
             // A newly-known aspect reshapes the flexible grid; the key
             // can't see it, so bump the revision (like the thumb arm).
@@ -3811,6 +3854,21 @@ impl Switchblade {
         }
         let rows = self.zone_rows(lay);
         let mut budget = self.atlas_cfg.slots() as i64 - 8; // headroom incl. live slot
+
+        // Strictly-visible tile count vs the atlas capacity that bounds
+        // `budget` below. When this exceeds `slots()`, most of the screen
+        // cannot hold a thumb AT ALL — the walk stops at `budget`, so the
+        // remainder is never requested at tier 1 and falls to the (live-
+        // throttled) gen sweep. That is a capacity ceiling, not a
+        // scheduling delay; see perf review 05 §9.
+        {
+            let (vf, vl) = self.visible_rows(lay, 0);
+            let n: usize = (vf..=vl).map(|r| self.row_range(lay, r).len()).sum();
+            self.probe
+                .counters
+                .visible_tiles_max
+                .fetch_max(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // The selected tile is the one the user is looking at (and the
         // one live playback will hand off from): its thumb never waits
@@ -3983,6 +4041,14 @@ impl Switchblade {
                         // retryable — the disk cache makes the redo cheap.
                         // (A Failed latch here permanently "lost" thumbs.)
                         log::debug!("static dropped, atlas full: {}", path.display());
+                        // Runaway-loop canary: this clip is still visible,
+                        // so `request_visible_thumbs` re-requests it next
+                        // frame — and the cycle only ends if something
+                        // scrolls out of the zone. See the counter docs.
+                        self.probe
+                            .counters
+                            .atlas_full_drops
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.clips[i].thumb = Thumb::None;
                         continue;
                     };
@@ -4000,6 +4066,15 @@ impl Switchblade {
                     if self.clips[i].aspect != Some(a) {
                         self.clips[i].aspect = Some(a);
                         self.grid_rev = self.grid_rev.wrapping_add(1);
+                    }
+                    // A static thumb is exactly what makes a clip
+                    // spawn-eligible, so this is the moment to have its
+                    // meta read off-thread: by the time the pointer or the
+                    // selection reaches the tile, the lookup is a memo hit
+                    // and the lane opens without deferring a frame.
+                    if self.clips[i].readable && !self.clips[i].cloud {
+                        let (p, fp) = (self.clips[i].path.clone(), self.clips[i].fp);
+                        self.request_meta(&p, fp);
                     }
                     uploads.push(ThumbUpload { slot, w, h, rgba });
                 }
@@ -4447,6 +4522,7 @@ impl Switchblade {
             if live.served < 6
                 && let Some(c) = self.clips.get(live.clip)
             {
+                let (media, probe) = (&self.media, &self.probe);
                 handoff_dump(
                     &c.path.file_stem().unwrap_or_default().to_string_lossy(),
                     "hover",
@@ -4456,12 +4532,13 @@ impl Switchblade {
                     live.player.w,
                     live.player.h,
                     &rgba,
-                    {
+                    || {
                         // Render-thread stat on the source volume — timed
                         // into the render-stall counters (slow-disk diag).
+                        // Only runs when the dump is armed (see the fn doc).
                         let t0 = Instant::now();
-                        let p = self.media.cached_thumb_path(&c.path);
-                        self.probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
+                        let p = media.cached_thumb_path(&c.path);
+                        probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
                         p
                     },
                 );
@@ -4551,6 +4628,7 @@ impl Switchblade {
             // relaxed load; the closure never runs).
             sel_served = Some((live.generation, live.path.clone(), live.player.position()));
             if live.served < 6 {
+                let (media, probe) = (&self.media, &self.probe);
                 handoff_dump(
                     &live.path.file_stem().unwrap_or_default().to_string_lossy(),
                     "sel",
@@ -4560,12 +4638,13 @@ impl Switchblade {
                     live.player.w,
                     live.player.h,
                     &rgba,
-                    {
+                    || {
                         // Render-thread stat on the source volume — timed
                         // into the render-stall counters (slow-disk diag).
+                        // Only runs when the dump is armed (see the fn doc).
                         let t0 = Instant::now();
-                        let p = self.media.cached_thumb_path(&live.path);
-                        self.probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
+                        let p = media.cached_thumb_path(&live.path);
+                        probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
                         p
                     },
                 );
@@ -4610,35 +4689,96 @@ impl Switchblade {
     /// longer heals inline (P0.7: that was a write on the render thread).
     /// Never probe on the render thread — that's a hitch.
     fn heal_meta(&mut self, meta: Option<&sb_media::Meta>, path: &std::path::Path) {
-        if meta.is_some_and(|m| m.pix_fmt.is_none() || m.src != path)
-            && self.reprobed.insert(path.to_path_buf())
-        {
+        if !meta.is_some_and(|m| m.pix_fmt.is_none() || m.src != path) {
+            return;
+        }
+        // Drop the stale entry from the memo so this clip's NEXT spawn
+        // re-reads it and picks up whatever the reprobe wrote. Only the
+        // spawn paths call this — invalidating from the per-frame read
+        // path would re-queue a lookup (and a wake) every frame.
+        self.meta_cache.remove(path);
+        if self.reprobed.insert(path.to_path_buf()) {
             self.media.request_reprobe(path.to_path_buf());
         }
     }
 
-    /// `cached_meta` behind the session memo (P0.7): the first read of a
-    /// clip pays the disk (source stat + meta.json — acceptable once, on
-    /// an explicit attention move); every spawn after that is memory.
-    /// Only complete metas (pix_fmt present) are memoized, so pre-heal
-    /// entries keep re-reading until the background reprobe lands.
-    fn clip_meta(&mut self, path: &std::path::Path) -> Option<sb_media::Meta> {
+    /// Atlas slot count — the hard ceiling on simultaneously-thumbed
+    /// tiles. Exposed for the bench summary, which reads it against
+    /// `visible_tiles_max` to detect a zoom level the atlas cannot fill.
+    pub fn atlas_slots(&self) -> usize {
+        self.atlas_cfg.slots()
+    }
+
+    /// `cached_meta` behind the session memo (P0.7), and **never on this
+    /// thread** (perf review 05 §3): a memo miss queues the read on
+    /// `meta_svc` and answers `Pending`, which asks the caller to try
+    /// again next frame rather than blocking here for what SMB measured
+    /// at 401 ms mean / 901 ms worst.
+    ///
+    /// A memoized-but-incomplete meta (no pix_fmt — a pre-heal cache
+    /// entry) is returned as-is; `heal_meta` drops it from the memo at the
+    /// spawn that noticed, so the NEXT spawn re-reads and adopts whatever
+    /// the reprobe wrote. Deliberately not refreshed here: `clip_meta` is
+    /// also called per frame (`resolve_selected_aspect`), and a refresh on
+    /// the read path would queue a lookup — and a wake — every frame for
+    /// as long as the entry stayed stale.
+    fn clip_meta(&mut self, path: &std::path::Path, fp: Option<(u64, u64)>) -> MetaLookup {
         if let Some(m) = self.meta_cache.get(path) {
-            return Some(m.clone());
+            return MetaLookup::Ready(m.clone());
         }
-        // Blocking disk on the render thread (source stat + meta.json):
-        // timed into the probe's render-stall counters — on a slow or
-        // network volume THIS is a direct UI hitch, and the counter is
-        // how a bench run proves/absolves it.
+        let queued = self.request_meta(path, fp);
+        // Speed and fluidity win over exactness (hard rule): if the answer
+        // is taking longer than a spawn may wait, open the lane anyway on
+        // the fallbacks. A slightly wrong anchor beats a lane that doesn't
+        // start — and the memo adopts the real meta for the next spawn.
+        if queued.elapsed().as_secs_f32() * 1000.0 >= self.tuning.meta_wait_ms {
+            self.probe
+                .counters
+                .meta_wait_expired
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return MetaLookup::Ready(None);
+        }
+        MetaLookup::Pending
+    }
+
+    /// Queue an off-thread cached-meta read, deduped by path; returns when
+    /// the in-flight lookup for that path was queued. Cheap and
+    /// idempotent — call it as soon as a clip becomes spawn-eligible, so
+    /// the answer is already memoized by the time a lane wants it.
+    fn request_meta(&mut self, path: &std::path::Path, fp: Option<(u64, u64)>) -> Instant {
+        match self.meta_pending.entry(path.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.meta_svc.request(path.to_path_buf(), fp);
+                *e.insert(Instant::now())
+            }
+        }
+    }
+
+    /// Install finished meta lookups (`meta_svc`) into the memo. A clip
+    /// whose spawn is deferred on one is retried by the next frame's
+    /// normal spawn path — the service's notify already woke the loop.
+    fn drain_meta(&mut self) {
+        while let Some((path, meta)) = self.meta_svc.try_recv() {
+            self.meta_pending.remove(&path);
+            self.meta_cache.insert(path, meta);
+        }
+    }
+
+    /// The drag-out ghost image for a clip, resolved at mouse-down (P1.7).
+    /// One source stat on a discrete user act, timed into the render-stall
+    /// counters like every other blocking fs call on this thread. Cloud
+    /// placeholders never get a ghost (their file is legitimately absent).
+    fn drag_ghost(&self, clip: usize) -> Option<PathBuf> {
+        let c = self.clips.get(clip)?;
+        if c.cloud {
+            return None;
+        }
         let t0 = Instant::now();
-        let m = sb_media::cached_meta(path);
+        let p = self.media.cached_thumb_path(&c.path);
         self.probe
-            .render_stall(sb_media::RenderStall::Meta, t0.elapsed());
-        let m = m?;
-        if m.pix_fmt.is_some() {
-            self.meta_cache.insert(path.to_path_buf(), m.clone());
-        }
-        Some(m)
+            .render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
+        p
     }
 
     /// The selected clip's decoder: natural resolution, capped at the hires
@@ -4676,6 +4816,7 @@ impl Switchblade {
         resume: Option<f64>,
     ) -> Option<SelLive> {
         let clip = self.clips.get(i)?;
+        let fp = clip.fp;
         let (tw, th, path) = match clip.thumb {
             Thumb::Ready { tw, th, .. } if clip.readable && !clip.cloud => {
                 (tw, th, clip.path.clone())
@@ -4685,7 +4826,12 @@ impl Switchblade {
         if self.live_cooling(&path) {
             return None;
         }
-        let meta = self.clip_meta(&path);
+        // No lane until the clip's meta is known (or the wait expires):
+        // the anchor and decode size both come from it, and this read is
+        // NOT allowed to block the render thread (perf review 05 §3).
+        let MetaLookup::Ready(meta) = self.clip_meta(&path, fp) else {
+            return None; // next frame; the reader's notify wakes the loop
+        };
         let (mut sw, mut sh) = meta
             .as_ref()
             .and_then(|m| Some((m.width? as f32, m.height? as f32)))
@@ -4742,6 +4888,7 @@ impl Switchblade {
 
     fn start_live(&mut self, lay: &Layout, i: usize) -> Option<LiveState> {
         let clip = self.clips.get(i)?;
+        let fp = clip.fp;
         // Decode at the static thumb's exact fit dimensions, so the
         // emphasized tile's aspect math applies unchanged.
         let (tw, th, path) = match clip.thumb {
@@ -4753,10 +4900,14 @@ impl Switchblade {
         if self.live_cooling(&path) {
             return None;
         }
+        // Resolve the meta BEFORE claiming a slot: a deferred spawn must
+        // not hold an atlas slot for the frames it spends waiting.
+        let MetaLookup::Ready(meta) = self.clip_meta(&path, fp) else {
+            return None; // next frame; the reader's notify wakes the loop
+        };
         let slot = self.alloc_slot(lay, SlotKind::Live)?;
         // Start where the thumbnail was taken, so video continues from
         // the frame the tile already shows instead of jolting to 0:00.
-        let meta = self.clip_meta(&path);
         let seek = meta
             .as_ref()
             .and_then(|m| m.duration)
@@ -5939,18 +6090,13 @@ impl App for Switchblade {
                     let (dx, dy) = (x - p.x, y - p.y);
                     let t = self.tuning.drag_threshold.max(1.0);
                     if dx * dx + dy * dy >= t * t {
+                        // Pure memory: the ghost path was resolved at
+                        // mouse-down (P1.7), so maturation touches no
+                        // filesystem inside the pointer callback.
                         if let Some(c) = self.clips.get(p.clip) {
-                            let image = if c.cloud {
-                                None
-                            } else {
-                                let t0 = Instant::now();
-                                let p = self.media.cached_thumb_path(&c.path);
-                                self.probe.render_stall(sb_media::RenderStall::ThumbPath, t0.elapsed());
-                                p
-                            };
                             self.cmds.push(WindowCommand::BeginDrag {
                                 path: c.path.clone(),
-                                image,
+                                image: p.ghost.clone(),
                             });
                         }
                         // The OS owns the gesture from here: no MouseUp
@@ -6046,6 +6192,7 @@ impl App for Switchblade {
                             y,
                             clip: i,
                             open_quickview: false,
+                            ghost: self.drag_ghost(i),
                         });
                     } else if self.quickview_video_rect().is_some_and(|(vx, vy, vw, vh)| {
                         (vx..=vx + vw).contains(&x) && (vy..=vy + vh).contains(&y)
@@ -6087,6 +6234,7 @@ impl App for Switchblade {
                         y,
                         clip: i,
                         open_quickview: self.attention() || was_selected,
+                        ghost: self.drag_ghost(i),
                     });
                 }
             }
@@ -6157,14 +6305,17 @@ impl App for Switchblade {
             // The chapter bar takes the played clip's true aspect. If its
             // static thumb never went atlas-resident (jumped here via
             // random/shuffle) `Clip.aspect` is still None, so resolve it
-            // from the probe meta once — a one-off memoized read, so the
-            // bar opens with the right chip shape instead of a 16:9
-            // default. Levels without live video (no spawn to seed
-            // `meta_cache`) read it straight off disk here.
+            // from the probe meta once, so the bar opens with the right
+            // chip shape instead of a 16:9 default. Levels without live
+            // video (no spawn to seed `meta_cache`) get it from the
+            // off-thread reader, landing a frame or two later.
             self.resolve_selected_aspect();
         }
         self.tick_auto_skip();
         self.step(dt);
+        // Before the spawn paths, so a lookup that landed since the last
+        // frame is already in the memo when a lane asks for it.
+        self.drain_meta();
         let lay = self.layout();
         self.request_visible_thumbs(&lay);
         self.request_quickview_sheet();
@@ -6427,6 +6578,15 @@ fn checkpoint_count(d: f64) -> usize {
     }
 }
 
+/// The dump directory, resolved once — the callers sit on the per-frame
+/// serve path, and the whole point of the gate is that it costs nothing
+/// when the dump is off.
+fn handoff_dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("SB_HANDOFF_DUMP").map(PathBuf::from))
+        .as_deref()
+}
+
 /// SB_HANDOFF_DUMP field instrumentation: with the env var set to a
 /// directory, the first few frames every hover/selected lane serves are
 /// written there as PPMs named with lane, generation, serve index and the
@@ -6435,6 +6595,12 @@ fn checkpoint_count(d: f64) -> usize {
 /// (locate each PPM's true timestamp in the source with an SSIM sweep)
 /// instead of a perception argument. Completely inert without the env
 /// var; costs nothing in steady state (callers gate on the first serves).
+///
+/// `thumb` is a CLOSURE, not a value: resolving it stats the source
+/// volume, and an eagerly-evaluated argument ran that stat up to 6 times
+/// per lane spawn even with the dump off — 6 network round-trips producing
+/// nothing on SMB (perf review 04 §2). It is now called only after the env
+/// var and the `k == 0` gates.
 fn handoff_dump(
     stem: &str,
     lane: &str,
@@ -6444,12 +6610,11 @@ fn handoff_dump(
     w: u32,
     h: u32,
     rgba: &[u8],
-    thumb: Option<PathBuf>,
+    thumb: impl FnOnce() -> Option<PathBuf>,
 ) {
-    let Some(dir) = std::env::var_os("SB_HANDOFF_DUMP") else {
+    let Some(dir) = handoff_dump_dir() else {
         return;
     };
-    let dir = PathBuf::from(dir);
     let _ = std::fs::create_dir_all(&dir);
     let stem: String = stem
         .chars()
@@ -6462,7 +6627,7 @@ fn handoff_dump(
         .chars()
         .rev()
         .collect();
-    if k == 0 && let Some(t) = thumb {
+    if k == 0 && let Some(t) = thumb() {
         let _ = std::fs::copy(&t, dir.join(format!("{stem}__thumb.jpg")));
     }
     let (w, h) = (w as usize, h as usize);
@@ -6572,9 +6737,20 @@ mod tests {
             rotation: None,
             pix_fmt: Some("yuv420p".into()),
         };
-        app.meta_cache.insert(path.clone(), sentinel);
-        let got = app.clip_meta(&path).expect("memo hit needs no disk");
+        app.meta_cache.insert(path.clone(), Some(sentinel));
+        let MetaLookup::Ready(Some(got)) = app.clip_meta(&path, None) else {
+            panic!("memo hit must answer Ready, with no disk read")
+        };
         assert_eq!(got.width, Some(1280));
+
+        // A miss never blocks: it answers Pending and queues the read on
+        // the off-thread reader (perf review 05 §3).
+        let miss = PathBuf::from("/nonexistent/sb_app_meta_memo/miss.mp4");
+        assert!(
+            matches!(app.clip_meta(&miss, None), MetaLookup::Pending),
+            "a memo miss defers instead of reading on this thread"
+        );
+        assert!(app.meta_pending.contains_key(&miss));
 
         // A stale src queues exactly one background reprobe.
         let stale = sb_media::Meta {
@@ -6583,6 +6759,10 @@ mod tests {
         };
         app.heal_meta(Some(&stale), &path);
         assert!(app.reprobed.contains(&path), "stale src queues the heal");
+        assert!(
+            !app.meta_cache.contains_key(&path),
+            "and drops the stale memo entry, so the next spawn re-reads it"
+        );
         app.heal_meta(Some(&stale), &path); // deduped per session
         assert_eq!(app.reprobed.len(), 1);
 
@@ -6594,6 +6774,37 @@ mod tests {
         };
         app.heal_meta(Some(&good), &other);
         assert!(!app.reprobed.contains(&other));
+    }
+
+    /// The deferral has a floor: a lookup that never answers must not
+    /// hold a lane closed forever (hard rule — fluidity over exactness).
+    /// Past `meta_wait_ms` the spawn path gets a real `Ready(None)` and
+    /// opens on the fallbacks.
+    #[test]
+    fn a_meta_lookup_that_never_lands_still_lets_the_lane_open() {
+        let mut app = Switchblade::with_options(Options {
+            animation: Some(AnimLevel::None),
+            demo: false,
+            no_config: true,
+            tuning: Some(Tuning {
+                meta_wait_ms: 0.0, // the wait expires immediately
+                ..Tuning::default()
+            }),
+            ..Options::default()
+        });
+        let path = PathBuf::from("/nonexistent/sb_app_meta_deadline/clip.mp4");
+        assert!(
+            matches!(app.clip_meta(&path, None), MetaLookup::Ready(None)),
+            "an expired wait answers Ready(None), never Pending"
+        );
+        assert_eq!(
+            app.probe
+                .counters
+                .meta_wait_expired
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and the give-up is counted — it is the cost side of the fix"
+        );
     }
 
     /// `D` rebuilds the library from the selected clip's parent directory
@@ -6770,6 +6981,7 @@ mod tests {
             readable: false, // no media jobs in this test
             cloud: false,
             created: None,
+            fp: None,
         })
         .unwrap();
         let _ = app.frame(0.016, vp);
@@ -7009,6 +7221,7 @@ mod tests {
                 readable: false, // no media jobs in this test
                 cloud: false,
                 created: None,
+                fp: None,
             })
             .unwrap();
         }
@@ -7074,6 +7287,7 @@ mod tests {
             anim: Thumb::None,
             aspect: None,
             created: None,
+            fp: None,
         });
         app.index.insert(bad.clone(), 0);
         app.selected = 0;
@@ -7190,6 +7404,7 @@ mod tests {
                 anim: Thumb::Failed,
                 aspect: None,
                 created: None,
+                fp: None,
             });
         }
         app.scroll = 1e6;
@@ -7823,6 +8038,7 @@ mod tests {
                 readable: false, // no media jobs in this test
                 cloud: false,
                 created: Some(t0 + Duration::from_secs(secs)),
+                fp: None,
             })
             .unwrap();
         };
@@ -8518,7 +8734,7 @@ mod tests {
             rotation: None,
             pix_fmt: Some("yuv420p".into()),
         };
-        app.meta_cache.insert(path.clone(), portrait.clone());
+        app.meta_cache.insert(path.clone(), Some(portrait.clone()));
 
         // Without the fallback this returned the 16:9 default; now it
         // reads the meta's true portrait shape.
@@ -9217,6 +9433,7 @@ mod tests {
                 anim: Thumb::Failed,
                 aspect: Some([16.0 / 9.0, 9.0 / 16.0, 1.0, 2.35, 4.0 / 3.0][i % 5]),
                 created: None,
+                fp: None,
             });
         }
         app.grid_rev = app.grid_rev.wrapping_add(1);
