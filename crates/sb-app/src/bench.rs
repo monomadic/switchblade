@@ -662,13 +662,30 @@ impl Rig {
                 .live_sel
                 .as_ref()
                 .is_some_and(|l| l.first_frame.is_some()),
-            // The grid/filmstrip hover lane's first frame (its FrameServed
-            // event carries the served pts — the handoff diagnostic).
+            // The hover LANE's first frame. Since the attention model
+            // became the only model (DESIGN.md §15), that lane exists only
+            // for the quickview filmstrip's chips — the grid has none, so
+            // this never fires for grid hover. Use `attention_served`
+            // there. (Its FrameServed event carries the served pts, which
+            // is the handoff diagnostic.)
             "hover_served" => self
                 .app
                 .live_hover
                 .as_ref()
                 .is_some_and(|l| l.first_frame.is_some()),
+            // The attention lane is serving the tile under the POINTER:
+            // the hover half of the attention model, where one hires lane
+            // follows attention instead of a second tile-size lane
+            // spawning. `selected_served` cannot stand in for it — it
+            // stays true across a retarget, so it can't see the lane
+            // follow the mouse to a new clip.
+            "attention_served" => {
+                let hovered = self.app.hovered;
+                self.app
+                    .live_sel
+                    .as_ref()
+                    .is_some_and(|l| l.first_frame.is_some() && Some(l.clip) == hovered)
+            }
             "grid_settled" => !self.animating,
             "cache_thumbs" => self.probe.snapshot().thumbs_cached >= n as u64,
             // Background-sweep progress, in the app's own ledger terms —

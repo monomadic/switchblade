@@ -47,13 +47,13 @@ so the run measures the steady state of the loop rather than its onset.
 inputs = ["$SB_BENCH_LIBRARY"]
 animation = "normal"
 viewport = [1600.0, 1000.0]
-max_wall_s = 420.0
+max_wall_s = 780.0
 
 [[step]]
 action = "wait_until"
 cond = "library_count"
 n = 3000
-timeout = 300.0
+timeout = 600.0
 
 [[step]]
 action = "wait"

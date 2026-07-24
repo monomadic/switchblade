@@ -1,19 +1,26 @@
 name = "hover_then_select_handoff"
 
 intent = """
-The hover→select continuity handoff. Hover an unselected tile: its
-preview cold-spawns at the thumb anchor and plays FORWARD in real time.
-Hold the hover for several seconds, then click the tile to select it —
-the selected-lane stream opens (warm promotion or fresh spawn).
+The hover→select continuity guarantee. Hover an unselected tile: under
+the attention model (DESIGN.md §15, the only model since 2026-07-24) the
+ONE hires lane retargets to that clip and plays FORWARD in real time —
+there is no second tile-size hover lane in the grid any more, which is
+why this waits on `attention_served` (the lane is serving the tile under
+the pointer) and not `hover_served` (the quickview filmstrip's chip lane,
+which never fires here).
 
-Watch the pts on the events (frame_served / promotion carry the content
-position): the hover lane's first frame lands on the thumb-anchor
-keyframe; after the click, the selected lane's first frame must land at
-a keyframe near where the PREVIEW had played to — hover first_pts +
-(t_click − t_hover_served) — not back at the anchor. The regression this
-guards: the warm stream spawned at the anchor and sat parked while the
-preview played ahead, so promotion visibly jumped playback backward by
-the whole preview duration (~6s measured on a 4s-GOP 4K clip).
+Hold the hover for several seconds, then click the tile. Watch the pts on
+the events (frame_served / promotion carry the content position): playback
+must simply CONTINUE. Hover and click resolve to the same
+`attention_target`, so the click promotes the running stream instead of
+opening a new one — the strongest form of the guarantee, and cheap to
+check in the event stream (no DecodeSpawn for that clip at the click).
+
+The regression this guards, from the two-lane era: the warm stream spawned
+at the anchor and sat parked while the preview played ahead, so promotion
+visibly jumped playback backward by the whole preview duration (~6s
+measured on a 4s-GOP 4K clip). `hover_resume` still carries that handoff
+for the filmstrip, where the two lanes are genuinely different.
 
 The 4K HEVC fixture's ~5s GOP makes any anchor-restart jump large and
 unambiguous in the event stream.
@@ -43,7 +50,7 @@ target = "index:1"
 
 [[step]]
 action = "wait_until"
-cond = "hover_served"
+cond = "attention_served"
 timeout = 30.0
 
 # Let the hover preview play ahead of the thumb anchor.
@@ -61,4 +68,4 @@ action = "wait"
 secs = 4.0
 
 [validity]
-require = ["library_count", "hover_served"]
+require = ["library_count", "selected_served", "attention_served"]
