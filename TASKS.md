@@ -21,41 +21,58 @@ the entry — this file should only ever contain open work.
 
 ## Now
 
-### 1. Zoomed-out grid cannot be filled — 428 visible tiles vs 144 atlas slots *(design call)*
+### 1. Confirm the zoomed-out fill over SMB, post-throttle *(measurement owed)*
 
-**The "app feels utterly broken when zoomed out" bug.** At `zoom_min` (0.35)
-a 1600×1000 viewport shows **428 tiles**; the atlas holds **144** slots of
-640×360 (used to draw ~84×47 tiles), and `request_visible_thumbs` budgets its
-walk against those same slots, so only **136** are ever requested at tier 1.
-The ~292-tile remainder is outside the foreground policy entirely and is served
-only by the gen sweep — which `gen_live_cap` pins at **one job wide** whenever
-any tile has a lane, against a backlog measured at 4,231 and *growing*. Over
-SMB (~1 s/job) that screen fills at ~1 tile/sec. Not thrash: utilisation 0.36,
-thumb queue empty, `atlas_full_drops` 0.
+The **"app feels utterly broken when zoomed out"** report, with its cause
+re-attributed. Review 05 §7 called it an atlas *capacity* ceiling (428 visible
+tiles vs 144 slots); that has been **withdrawn** — 144 was `sb-bench`'s own
+hermetic default, not any shipped config. Measured with
+`zoom_out_capacity.toml` (demo tiles, 4 s, no I/O — the ratio is layout+config
+only):
 
-Needs a **design decision**, not tuning: a small-slot mip tier for low zoom
-(far more tiles per byte of atlas), a bigger atlas, or a deliberate limit on
-zoom-out range. Pairs with #2 — at max zoom the sweep *is* foreground work.
-Full statement:
+| config | slots | visible at `zoom_min` | over? |
+|---|--:|--:|---|
+| harness default | 144 | 484 | **YES, 3.4×** |
+| repo-root `switchblade.toml` | 777 | 484 | no |
+| `~/.config/switchblade.toml` | 1000 | 392 | no |
+
+So in the app as it is actually run, every visible tile *is* requested at
+tier 1, and a slow zoomed-out fill is **throughput** — the parked pool of
+review 05 §6, plus the permanently-engaged gen throttle now narrowed (below).
+**What's owed is the confirming run**, which has not happened: the
+`zoom_out_max` re-run timed out in ingest (>300 s for 3,000 clips, slower than
+any run in review 05, cause unknown — the link, or something local). Re-run it
+with a longer `library_count` timeout and read fill rate + `queue_wait_thumb`.
+
+Two smaller things fall out of the correction:
+
+- **The internal DEFAULT atlas cannot fill a zoomed-out screen** (144 slots vs
+  484 tiles) — every `--no-config` run, every test, and every unconfigured
+  user. Bumping `atlas_width/height` defaults costs VRAM (484 slots of
+  640×360 ≈ 446 MB); a small-slot mip tier for low zoom is the cheaper answer.
+  Now a defaults question, not the DESIGN.md-level decision it was filed as.
+- **Any harness claim about a config-derived quantity must be re-run with
+  `--set` at shipped values** — otherwise it is a statement about
+  `Tuning::default()`. That is what went wrong here.
+
+Full statement + correction:
 [perf review 05 §7](docs/perf-reviews/05-zoom-storm-scheduler.md).
 
-### 2. Gen throttle engages permanently, costing ~40–45% of sweep throughput
+### 2. Re-measure the gen throttle's *value* on 4K *(the trigger is fixed)*
 
-`gen_live_concurrency` is meant to narrow the sweep "while the selected stream
-presents", but its trigger (`live_sel.is_some()`) is true whenever the grid has
-a selection — measured `gen_running` never exceeded 1 over a 177 s run, with
-two of three workers idle 91% of the time. Uncapping gave **1.6–1.8× the sweep
-throughput with indistinguishable playback** (frame-gap p95 33.6 ms either
-way) on a 1080p corpus. Needs a condition that means "the user is watching
-this", not "a tile has a lane" — and a 4K re-measurement before the cap's
-*value* is touched (the original justification was a 4K cold spawn). Full
-statement: [perf review 03 §2](docs/perf-reviews/03-slow-disk-scheduler.md).
+The trigger is **shipped** (2026-07-24): `gen_live_cap` now engages when the
+user is *watching* — a modal is open, or any lane is still in its cold spawn —
+instead of whenever `live_sel.is_some()`, which was true whenever the grid had
+a selection. A settled grid preview no longer throttles the sweep.
+`sweep_cap_engaged` + `the_sweep_throttle_tracks_watching_not_merely_having_a_lane`.
 
-**Second, worse consequence found in review 05 §7:** when the grid is zoomed
-out past atlas capacity (#1), the tiles beyond the tier-1 budget depend on the
-sweep — so the throttle is starving *visible* work, not just background
-throughput. `gen_running` pinned at 1 with a 4,231-job backlog while 292
-on-screen tiles wait on it.
+What remains is the **cap's value**. Review 03 measured uncapping as 1.6–1.8×
+sweep throughput with indistinguishable playback (frame-gap p95 33.6 ms either
+way) — but on a **1080p** corpus, while the cap's original justification was a
+**4K cold spawn**. Needs a 4K run before the value moves. Also unverified: that
+releasing the throttle for settled grid previews doesn't cost 4K preview
+smoothness (same measurement, other direction). Full statement:
+[perf review 03 §2](docs/perf-reviews/03-slow-disk-scheduler.md).
 
 ### 3. Tier B run of the slow-disk gesture + sweep scenarios
 

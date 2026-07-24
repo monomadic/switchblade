@@ -1,0 +1,95 @@
+name = "zoom_out_capacity"
+
+intent = """
+How many tiles does a full zoom-out put on screen, against how many the
+atlas can hold? That ratio is the whole of perf review 05 §7's "the
+zoomed-out grid can never fill" claim, and it is a property of LAYOUT and
+CONFIG only — no disk, no decoders, no network. So measure it that way.
+
+Demo tiles (`demo = true`, `SB_DEMO_TILES=<n>`): zoom to the floor
+(`zoom_min`, overshooting deliberately since it clamps), let the reflow
+settle, and read the summary's
+
+    atlas: visible_tiles_max=<V> vs <S> slots
+
+`V > S` is the capacity ceiling: `request_visible_thumbs` budgets its
+tier-1 walk against `slots() - 8`, so the surplus tiles are outside the
+foreground policy entirely and fall to the library-wide gen sweep — no
+amount of queue tuning fills that screen.
+
+**Run it at the atlas config you actually ship**, not the internal
+defaults, or the answer is about the harness rather than the app:
+
+    sb-bench run …/zoom_out_capacity.toml \\
+      --set atlas_width=19200 --set atlas_height=12800 \\
+      --set thumb_width=640  --set thumb_height=320
+
+Animation is `minimal`: layout and frame building are the subject, and
+decoders would only add noise. Demo tiles carry a fixed aspect spread
+(mostly 16:9, some portrait/square), so V is representative of a real
+library's packing rather than identical to it.
+"""
+
+[setup]
+demo = true
+animation = "minimal"
+viewport = [1600, 1000]
+max_wall_s = 60.0
+
+[[step]]
+action = "wait_until"
+cond = "grid_settled"
+timeout = 10.0
+
+# Zoom to the floor. Far more presses than the range needs — zoom clamps
+# at `zoom_min`, so overshooting is safe and guarantees we reach it.
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+[[step]]
+action = "key"
+key = "-"
+
+# Let the zoom reflow finish, so the tile count is the settled one and
+# not a mid-wrap frame.
+[[step]]
+action = "wait_until"
+cond = "grid_settled"
+timeout = 15.0
+
+[[step]]
+action = "wait"
+secs = 2.0
+
+[validity]
+require = ["grid_settled"]

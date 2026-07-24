@@ -295,6 +295,44 @@ this review adds that the same throttle also delays *foreground* work.
 
 ## 7. Finding: at full zoom-out the atlas cannot hold the screen — a capacity ceiling, not a delay
 
+> ### ⚠️ CORRECTION (2026-07-24, same day): this section measured the HARNESS, not the app
+>
+> **The 144 slots below are `sb-bench`'s internal defaults, not any
+> configuration switchblade actually runs under.** The runner is hermetic
+> (`no_config: true`, temp `HOME`), so it uses `Tuning::default()` —
+> `thumb 640×360`, `atlas 7680×4320` → 12×12 = **144 slots**. Both real
+> configs are far larger, and neither is over capacity:
+>
+> | config | `thumb` | `atlas` | slots | visible at `zoom_min` | over? |
+> |---|---|---|--:|--:|---|
+> | harness default (measured below) | 640×360 | 7680×4320 | **144** | 484 | **YES, 3.4×** |
+> | repo-root `switchblade.toml` | 768×432 | 16128×15984 | **777** | 484 | no |
+> | `~/.config/switchblade.toml` | 640×320 | 19200×12800 | **1000** | 392 | no |
+>
+> Measured with `benchmarks/scenarios/zoom_out_capacity.toml`, which
+> answers this question the way it should have been asked in the first
+> place: the ratio is a property of **layout and config only**, so demo
+> tiles settle it in 4 seconds with no disk, no decoders and no network.
+> (The last row uses the user's real layout tuning too — `tile_width` 150,
+> `gap` 2 — which is why its visible count differs.)
+>
+> **So there is no capacity ceiling in the app as it is actually run, and
+> the "needs a design decision (mip tier / bigger atlas / capped zoom-out)"
+> conclusion is withdrawn.** With 777–1000 slots the tier-1 walk budgets
+> `slots() - 8` and requests *every* visible tile, so a slow zoomed-out
+> fill is a **throughput** problem — §6's parked pool and the permanently
+> engaged gen throttle — not a capacity one. What survives unchanged: the
+> `atlas_full_drops = 0` result (§7's disproved runaway loop), and the fact
+> that the *default* atlas cannot fill a zoomed-out screen, which is a
+> defaults question and now the only open part.
+>
+> The lesson is the reusable one: **a hermetic harness measures the
+> harness's defaults.** Any claim about a config-derived quantity has to be
+> re-run with `--set` at the values that ship, or it is a statement about
+> `Tuning::default()`.
+>
+> The rest of this section is left as originally written.
+
 The first four runs zoomed out **four steps**. That was not what the user
 does, and it mattered: they recorded `evictions=0`, i.e. the atlas never
 even filled. Two further runs (`maxzoom1`, `maxzoom2`) zoom to the floor
@@ -365,11 +403,13 @@ next person reading `alloc_slot`, and the counter to settle it now exists.
    direction: the flood *is* nominally attention work, so it outranks
    everything, including the storyboard sheet the user is waiting on
    (`anim` sits *below* `thumb` in the ladder).
-5. **At full zoom-out the binding constraint is atlas capacity, not
-   scheduling** (§7). 428 visible tiles vs 144 slots vs 136 requests. No
-   amount of queue tuning fills that screen — the surplus tiles are outside
-   the foreground policy by construction, and what serves them is a sweep
-   pinned at one worker with a growing 4,231-job backlog.
+5. ~~**At full zoom-out the binding constraint is atlas capacity, not
+   scheduling**~~ — **WITHDRAWN, see §7's correction.** 144 slots was the
+   harness's own default, not a shipped configuration; at the real 777–1000
+   slots every visible tile *is* requested at tier 1. The binding constraint
+   at full zoom-out is throughput (conclusions 3 and 6), and what remains of
+   this finding is that the *default* atlas cannot fill a zoomed-out screen
+   — a defaults question, not a design one.
 6. **Throttling tier 1 is NOT the fix, and an earlier draft of this review
    was wrong to lead with it.** The pool is parked at 0.36 utilisation with
    an empty thumb queue; there is no concurrency to take away. The two real
@@ -399,17 +439,21 @@ Indexed in [TASKS.md](../../TASKS.md); carries forward from
   past the env-var and first-frame gates. The drag ghost's own
   `cached_thumb_path` moved to mouse-down at the same time (P1.7), so the
   `path` class is down to at most one call per press.
-- **Make the zoomed-out grid fillable** (§7) — the headline product bug.
-  428 visible tiles against 144 atlas slots of 640×360, used to draw ~84×47
-  tiles. Needs a **design decision**, not tuning: a small-slot mip tier for
-  low zoom (many more tiles per byte of atlas), a larger atlas, or a
-  deliberate cap on how far zoom-out may go. DESIGN.md-level; see also
-  DESIGN.md §8's atlas sizing.
-- **Widen the sweep when it is what the visible screen depends on** (§7.2)
-  — at max zoom the sweep IS foreground work, but `gen_live_cap` pins it at
-  1 because a tile has a lane. This is [03 §2](03-slow-disk-scheduler.md)'s
-  permanently-engaged throttle, now with a second and more damaging
-  consequence than the sweep-throughput one it was filed for.
+- ~~**Make the zoomed-out grid fillable**~~ — **mostly withdrawn** (§7's
+  correction): at the real 777–1000 slots there is no capacity ceiling.
+  What is left is narrow — **the internal DEFAULT atlas (144 slots) cannot
+  fill a zoomed-out screen (484 tiles)**, which every `--no-config` run,
+  every test and every unconfigured user gets. A defaults question, not the
+  DESIGN.md-level mip-tier decision this was filed as.
+- ~~**Widen the sweep when it is what the visible screen depends on**~~ —
+  **shipped 2026-07-24.** `gen_live_cap`'s trigger now means "the user is
+  watching this" (a modal is open, or any lane is still in its cold spawn)
+  instead of "a tile has a lane", which was true whenever the grid had a
+  selection. A settled grid preview no longer throttles the sweep. The
+  cap's *value* is untouched, still pending [03 §2](03-slow-disk-scheduler.md)'s
+  4K re-measurement. **Not yet measured end-to-end over SMB** — the
+  confirming `zoom_out_max` re-run timed out in ingest (>300 s for 3,000
+  clips, slower than any run in this review) and is still owed.
 - ~~Throttle the tier-1 flood~~ — **dropped.** An earlier draft proposed
   this as a grid-fill-vs-playback tradeoff needing a product call. The
   measurements do not support it: utilisation 0.36, thumb queue empty,

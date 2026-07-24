@@ -3843,18 +3843,18 @@ impl Switchblade {
     /// the atlas slot budget. Without the budget, a big viewport demands
     /// more slots than exist and eviction churns everything forever.
     fn request_visible_thumbs(&mut self, lay: &Layout) {
-        if self.demo {
-            return;
-        }
-        let rows = self.zone_rows(lay);
-        let mut budget = self.atlas_cfg.slots() as i64 - 8; // headroom incl. live slot
-
         // Strictly-visible tile count vs the atlas capacity that bounds
         // `budget` below. When this exceeds `slots()`, most of the screen
         // cannot hold a thumb AT ALL — the walk stops at `budget`, so the
         // remainder is never requested at tier 1 and falls to the (live-
         // throttled) gen sweep. That is a capacity ceiling, not a
-        // scheduling delay; see perf review 05 §9.
+        // scheduling delay; see perf review 05 §7.
+        //
+        // Recorded BEFORE the demo bail: the ratio is a property of layout
+        // and config alone, so demo tiles can answer it with no disk, no
+        // decoders and no network (`zoom_out_capacity.toml`). Measuring it
+        // only on real libraries is how review 05 ended up quoting the
+        // harness's own 144-slot default as if it were the app's.
         {
             let (vf, vl) = self.visible_rows(lay, 0);
             let n: usize = (vf..=vl).map(|r| self.row_range(lay, r).len()).sum();
@@ -3863,6 +3863,11 @@ impl Switchblade {
                 .visible_tiles_max
                 .fetch_max(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        if self.demo {
+            return;
+        }
+        let rows = self.zone_rows(lay);
+        let mut budget = self.atlas_cfg.slots() as i64 - 8; // headroom incl. live slot
 
         // The selected tile is the one the user is looking at (and the
         // one live playback will hand off from): its thumb never waits
