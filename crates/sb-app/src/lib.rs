@@ -37,6 +37,54 @@ const LIVE_RETRY_COOLDOWN_S: f32 = 30.0;
 /// catches up over the next frames (the waker schedules them).
 const INGEST_DRAIN_BUDGET: usize = 256;
 /// Texture uploads accepted from media results per frame (P0.3): a
+/// Hardware ceiling on a texture's side (wgpu's `max_texture_dimension_2d`
+/// is requested to match — don't assume the 8192 default). The atlas is
+/// one texture, so this caps how far a slot grid can grow in either
+/// direction regardless of the memory budget.
+const ATLAS_MAX_SIDE: u32 = 16384;
+
+/// MB an atlas of `cols × rows` slots occupies (RGBA8, one texture).
+fn atlas_mb(slot_w: u32, slot_h: u32, cols: u32, rows: u32) -> u32 {
+    let bytes = cols as u64 * slot_w as u64 * rows as u64 * slot_h as u64 * 4;
+    (bytes / (1024 * 1024)) as u32
+}
+
+/// Lay out the atlas: the most slots that fit `budget_mb`, within the
+/// hardware's per-side cap, preferring a squarish texture.
+///
+/// This is the whole reason `atlas_memory_mb` replaced pixel dimensions.
+/// Given a budget it is impossible to ask for a texture that gets clamped,
+/// or to buy pixels that can't hold a slot — cols and rows are integers by
+/// construction, so every byte allocated is a usable slot. The search is a
+/// loop over at most `16384 / slot_w` candidates (≤ 25 in practice).
+fn pack_atlas(slot_w: u32, slot_h: u32, budget_mb: u32) -> (u32, u32) {
+    let (max_cols, max_rows) = (
+        (ATLAS_MAX_SIDE / slot_w.max(1)).max(1),
+        (ATLAS_MAX_SIDE / slot_h.max(1)).max(1),
+    );
+    let per_slot = slot_w as u64 * slot_h as u64 * 4;
+    let target = ((budget_mb as u64 * 1024 * 1024) / per_slot.max(1)).max(1);
+    let mut best = (1u32, 1u32);
+    for cols in 1..=max_cols {
+        let rows = ((target / cols as u64) as u32).min(max_rows);
+        if rows == 0 {
+            break; // more columns than the budget can give a single row
+        }
+        let (bn, bc, br) = (best.0 as u64 * best.1 as u64, best.0, best.1);
+        let n = cols as u64 * rows as u64;
+        // More slots wins; on a tie prefer the squarer texture, which
+        // leaves the most headroom before either side hits the cap.
+        let squarer = {
+            let d = |c: u32, r: u32| (c as i64 * slot_w as i64 - r as i64 * slot_h as i64).abs();
+            d(cols, rows) < d(bc, br)
+        };
+        if n > bn || (n == bn && squarer) {
+            best = (cols, rows);
+        }
+    }
+    best
+}
+
 /// warm-cache burst must not issue hundreds of texture writes in one
 /// frame. Results without pixels (Failed/GenDone) don't count.
 const MEDIA_UPLOAD_BUDGET: usize = 64;
@@ -555,6 +603,10 @@ pub struct Switchblade {
     /// queued: the dedupe set, and the deadline clock for a spawn that is
     /// waiting on one (`Tuning::meta_wait_ms`).
     meta_pending: HashMap<PathBuf, Instant>,
+    /// One-shot latch for the "atlas too small for this zoom level"
+    /// warning: it is a config problem, so it is worth saying clearly
+    /// once and never worth repeating per frame.
+    atlas_undersized_warned: bool,
     /// The off-thread cached-meta reader (see `sb_media::MetaService`).
     meta_svc: sb_media::MetaService,
     sel_changed_at: Instant,
@@ -908,20 +960,73 @@ impl Switchblade {
         let demo = rx.is_none();
         let recipe = recipe_from(&tuning);
         let (slot_w, slot_h) = (recipe.thumb_w, recipe.thumb_h);
+        // Legacy pixel dims still win when present, so an existing config
+        // keeps the exact layout it had — but say what it costs and what
+        // replaces it, because these are the two mistakes the pixel
+        // interface made silent (see `Tuning::atlas_memory_mb`).
+        let (cols, rows) = match (tuning.atlas_width, tuning.atlas_height) {
+            (None, None) => pack_atlas(slot_w, slot_h, tuning.atlas_memory_mb),
+            (w, h) => {
+                let (w, h) = (w.unwrap_or(7680), h.unwrap_or(4320));
+                let (cols, rows) = ((w.min(ATLAS_MAX_SIDE) / slot_w).max(1),
+                                    (h.min(ATLAS_MAX_SIDE) / slot_h).max(1));
+                let mb = atlas_mb(slot_w, slot_h, cols, rows);
+                log::warn!(
+                    "config: atlas_width/atlas_height are deprecated — replace both with \
+                     `atlas_memory_mb = {mb}` for the same {} slots. \
+                     (Requested {w}x{h}; using {}x{} = {}x{} px{}.)",
+                    cols * rows,
+                    cols * slot_w,
+                    rows * slot_h,
+                    cols,
+                    rows,
+                    if w > ATLAS_MAX_SIDE || h > ATLAS_MAX_SIDE {
+                        " — CLAMPED to the 16384 hardware cap"
+                    } else if w % slot_w != 0 || h % slot_h != 0 {
+                        " — the remainder is too small to hold a slot"
+                    } else {
+                        ""
+                    },
+                );
+                (cols, rows)
+            }
+        };
         let atlas_cfg = AtlasCfg {
             slot_w,
             slot_h,
-            cols: (tuning.atlas_width.min(16384) / slot_w).max(1),
-            rows: (tuning.atlas_height.min(16384) / slot_h).max(1),
+            cols,
+            rows,
             hires_w: tuning.quickview_max_width.clamp(320, 4096),
             hires_h: tuning.quickview_max_height.clamp(180, 4096),
         };
+        let used_mb = atlas_mb(slot_w, slot_h, cols, rows);
         log::info!(
-            "atlas: {}x{} slots of {slot_w}x{slot_h} ({} MB)",
-            atlas_cfg.cols,
-            atlas_cfg.rows,
-            atlas_cfg.tex_w() as u64 * atlas_cfg.tex_h() as u64 * 4 / (1024 * 1024)
+            "atlas: {cols}x{rows} = {} thumbs resident, slots of {slot_w}x{slot_h} ({used_mb} MB of {}x{} texture)",
+            atlas_cfg.slots(),
+            atlas_cfg.tex_w(),
+            atlas_cfg.tex_h(),
         );
+        // A budget that can't be spent is worth saying out loud: at this
+        // slot size the 16384-per-side cap, not the budget, is what limits
+        // residency, and the only lever left is a smaller thumb. Without
+        // this, raising atlas_memory_mb looks like it silently did nothing.
+        let capped_out =
+            cols == ATLAS_MAX_SIDE / slot_w.max(1) && rows == ATLAS_MAX_SIDE / slot_h.max(1);
+        if tuning.atlas_width.is_none()
+            && tuning.atlas_height.is_none()
+            && capped_out
+            && tuning.atlas_memory_mb > used_mb
+        {
+            log::info!(
+                "atlas: {slot_w}x{slot_h} slots cap out at {} thumbs ({used_mb} MB) — the \
+                 {}x{} texture limit is reached, so the remaining {} MB of atlas_memory_mb \
+                 cannot be used. Smaller thumb_width/thumb_height would buy more slots.",
+                atlas_cfg.slots(),
+                ATLAS_MAX_SIDE,
+                ATLAS_MAX_SIDE,
+                tuning.atlas_memory_mb - used_mb,
+            );
+        }
         let mut app = Self {
             clips: Vec::new(),
             index: HashMap::new(),
@@ -951,6 +1056,7 @@ impl Switchblade {
             meta_cache: HashMap::new(),
             meta_pending: HashMap::new(),
             meta_svc: sb_media::MetaService::new(notify.clone()),
+            atlas_undersized_warned: false,
             sel_changed_at: Instant::now(),
             hover_changed_at: Instant::now(),
             demo,
@@ -3862,6 +3968,30 @@ impl Switchblade {
                 .counters
                 .visible_tiles_max
                 .fetch_max(n as u64, std::sync::atomic::Ordering::Relaxed);
+            // Say it out loud, once, the first time the screen asks for
+            // more thumbs than the atlas can hold. This is the only
+            // symptom the user ever sees — a zoomed-out grid that fills at
+            // the sweep's pace and never finishes — and until now nothing
+            // connected it to a setting. Once per session, at warn level,
+            // with the number to change and what to change it to.
+            let slots = self.atlas_cfg.slots();
+            if n > slots && !self.atlas_undersized_warned {
+                self.atlas_undersized_warned = true;
+                let want = atlas_mb(
+                    self.atlas_cfg.slot_w,
+                    self.atlas_cfg.slot_h,
+                    n as u32 + 8,
+                    1,
+                )
+                .max(1);
+                log::warn!(
+                    "atlas too small for this zoom level: {n} tiles on screen, {slots} slots. \
+                     Only {} are requested at full priority; the rest wait on the background \
+                     sweep, so the grid fills slowly and may never finish. \
+                     Raise atlas_memory_mb to ~{want} MB, or zoom in.",
+                    slots.saturating_sub(8),
+                );
+            }
         }
         if self.demo {
             return;
@@ -7015,6 +7145,40 @@ mod tests {
         drop(tx);
         let _ = app.frame(0.016, vp);
         assert!(app.rx.is_none(), "disconnect noticed without a hot loop");
+    }
+
+    /// `pack_atlas` is the reason the atlas is a memory budget and not
+    /// pixel dimensions: every byte it allocates is a usable slot, and it
+    /// is structurally incapable of the two mistakes the pixel interface
+    /// made silent — a clamped side, and a remainder too small to hold a
+    /// slot (the user's own config asked for 19200 px and got 16384).
+    #[test]
+    fn pack_atlas_spends_the_whole_budget_on_usable_slots() {
+        for &(sw, sh) in &[(640u32, 360u32), (768, 432), (640, 320), (480, 270)] {
+            for &mb in &[64u32, 132, 256, 512, 1024, 4096] {
+                let (cols, rows) = pack_atlas(sw, sh, mb);
+                assert!(cols >= 1 && rows >= 1, "always at least one slot");
+                assert!(
+                    cols * sw <= ATLAS_MAX_SIDE && rows * sh <= ATLAS_MAX_SIDE,
+                    "{cols}x{rows} of {sw}x{sh} exceeds the hardware cap"
+                );
+                assert!(
+                    atlas_mb(sw, sh, cols, rows) <= mb.max(atlas_mb(sw, sh, 1, 1)),
+                    "{cols}x{rows} of {sw}x{sh} overspends {mb} MB"
+                );
+            }
+        }
+        // The bumped default: ~4x the 144 slots it replaced, and enough
+        // for the ~484 tiles a 1600x1000 viewport shows at zoom_min.
+        let (cols, rows) = pack_atlas(640, 360, 512);
+        assert!(
+            (cols * rows) >= 484,
+            "the default budget must cover a zoomed-out screen, got {}",
+            cols * rows
+        );
+        // A budget too large for the cap saturates instead of overflowing.
+        let (cols, rows) = pack_atlas(640, 360, 100_000);
+        assert_eq!((cols, rows), (ATLAS_MAX_SIDE / 640, ATLAS_MAX_SIDE / 360));
     }
 
     /// The gen-sweep throttle means "the user is WATCHING this", not

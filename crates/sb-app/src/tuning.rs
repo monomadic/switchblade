@@ -291,9 +291,24 @@ pub struct Tuning {
     /// "size_mtime" adopts existing path-keyed entries in place — no
     /// library-wide regeneration.
     pub cache_key: CacheKey,
-    /// Atlas texture dimensions (VRAM ≈ w×h×4 bytes). Clamped to 8192.
-    pub atlas_width: u32,
-    pub atlas_height: u32,
+    /// **How much GPU memory thumbnails may occupy, in MB** — the one
+    /// atlas knob. The slot grid is derived from it (`pack_atlas`):
+    /// slots = budget / (thumb_width × thumb_height × 4), laid out as the
+    /// squarest cols×rows that fits the hardware's 16384-per-side cap.
+    ///
+    /// This replaced raw `atlas_width`/`atlas_height` because those made
+    /// three silent mistakes easy and none of them visible: a dimension
+    /// over 16384 was clamped (so the requested layout was not what you
+    /// got), a dimension not divisible by the thumb size bought texture
+    /// that could never hold a slot, and neither told you the number that
+    /// actually matters — how many thumbs stay resident. Budget in, slots
+    /// out, layout optimal by construction.
+    pub atlas_memory_mb: u32,
+    /// **Deprecated** pixel dimensions. When either is set they win, so an
+    /// existing config keeps its exact layout, and startup logs the
+    /// `atlas_memory_mb` that replaces it. Remove once configs have moved.
+    pub atlas_width: Option<u32>,
+    pub atlas_height: Option<u32>,
     /// Quickview decodes at up to this size (capped at the source's own
     /// resolution). Startup-only; higher = sharper modal, more decode CPU.
     pub quickview_max_width: u32,
@@ -431,8 +446,14 @@ impl Default for Tuning {
             anim_grid: 3,
             gen_live_concurrency: 1,
             cache_key: CacheKey::SizeMtime,
-            atlas_width: 7680,
-            atlas_height: 4320,
+            // 512 MB ≈ 575 slots at the default 640×360 thumb — chosen
+            // against a measurement, not a vibe: a 1600×1000 viewport at
+            // `zoom_min` shows ~484 tiles, and the old 132 MB / 144-slot
+            // default could hold under a third of them, so a zoomed-out
+            // grid physically could not fill (perf review 05 §7).
+            atlas_memory_mb: 512,
+            atlas_width: None,
+            atlas_height: None,
             quickview_max_width: 1920,
             quickview_max_height: 1080,
             strip_height: 92.0,
