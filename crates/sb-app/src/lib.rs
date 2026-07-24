@@ -3942,6 +3942,22 @@ impl Switchblade {
         }
     }
 
+    /// Does the gen sweep narrow to `gen_live_concurrency` right now?
+    /// Pure, and separate from `drain_media`, because the rule is subtle
+    /// and silently regressed once already (perf review 03 §2) — see the
+    /// call site for the full argument. `lane` is `Some(has_first_frame)`.
+    fn sweep_cap_engaged(
+        lane: Option<bool>,
+        parked: bool,
+        paused: bool,
+        modal: bool,
+    ) -> bool {
+        let Some(served) = lane else {
+            return false; // no lane at all: the sweep owns the machine
+        };
+        !parked && !paused && (modal || !served)
+    }
+
     /// Collect finished thumbnails into atlas uploads for this frame.
     fn drain_media(&mut self, lay: &Layout) -> Vec<ThumbUpload> {
         let mut uploads = Vec::new();
@@ -3956,17 +3972,34 @@ impl Switchblade {
             .is_some_and(|l| l.first_frame.is_some())
             && !self.sel_parked
             && !self.paused();
-        // The gen-sweep throttle engages the moment we're TRYING to watch —
-        // including the watched stream's cold spawn, BEFORE its first frame.
-        // Gating it on `first_frame` (like the upload budget below) created a
-        // feedback loop: the watched 4K stream stalls under the full-width
-        // sweep, never reaches its first frame, so the cap never engages, so
-        // the sweep keeps running 3-wide and stalls it (and the storyboard)
-        // harder — chapter chips took ~a minute to appear
-        // (benchmarks/reports/chapter_sheet_latency.md). Keying the throttle
-        // on "a selected stream exists and we're not parked/paused" holds the
-        // cap across the whole spawn, so the stream reaches first frame fast.
-        let watching = self.live_sel.is_some() && !self.sel_parked && !self.paused();
+        // The gen-sweep throttle must mean "the user is WATCHING this", not
+        // "some tile has a lane" — the latter is true whenever the grid has a
+        // selection, i.e. permanently, which measured as a 40–45% standing
+        // loss of sweep throughput with two of three workers idle 91% of the
+        // time (perf review 03 §2), and as *visible* tiles starving at low
+        // zoom, where the surplus beyond the tier-1 budget depends on the
+        // sweep (review 05 §7). Two cases really are watching:
+        //
+        // - **A modal is open.** The user opened this clip; playback and the
+        //   storyboard behind it outrank everything. Held for the WHOLE time,
+        //   spawn included: gating a modal's cap on `first_frame` created a
+        //   feedback loop where the watched 4K stream stalled under the
+        //   full-width sweep, never reached its first frame, so the cap never
+        //   engaged and the sweep stalled it harder — chapter chips took ~a
+        //   minute to appear (benchmarks/reports/chapter_sheet_latency.md).
+        // - **Any lane still in its cold spawn.** Same loop, and under the
+        //   attention model hover spawns are the common case, so
+        //   hover-to-first-frame is exactly what must not race the sweep.
+        //
+        // What is NOT watching: a settled grid preview. That is a skim, and
+        // the grid cannot fill itself if the sweep stays one job wide while
+        // the user skims. Release it there.
+        let watching = Self::sweep_cap_engaged(
+            self.live_sel.as_ref().map(|l| l.first_frame.is_some()),
+            self.sel_parked,
+            self.paused(),
+            self.quickview || self.fullview,
+        );
         self.media.set_live(watching);
         // The upload-budget squeeze, unlike the throttle, only matters once
         // frames are actually arriving to upload — keep it on `presenting`.
@@ -6977,6 +7010,31 @@ mod tests {
         drop(tx);
         let _ = app.frame(0.016, vp);
         assert!(app.rx.is_none(), "disconnect noticed without a hot loop");
+    }
+
+    /// The gen-sweep throttle means "the user is WATCHING this", not
+    /// "some tile has a lane" — the latter is true whenever the grid has a
+    /// selection, which cost a standing 40–45% of sweep throughput and
+    /// starved visible tiles at low zoom (perf reviews 03 §2, 05 §7).
+    #[test]
+    fn the_sweep_throttle_tracks_watching_not_merely_having_a_lane() {
+        let cap = Switchblade::sweep_cap_engaged;
+        // No lane: the sweep owns the machine.
+        assert!(!cap(None, false, false, false));
+        assert!(!cap(None, false, false, true));
+        // Grid skim, lane settled and presenting: the sweep runs full
+        // width — this is the case that used to throttle forever.
+        assert!(!cap(Some(true), false, false, false));
+        // Cold spawn (no first frame yet), grid or modal: held, so
+        // hover-to-first-frame never races the sweep. Gating a modal on
+        // first_frame was the chapter-chips feedback loop.
+        assert!(cap(Some(false), false, false, false));
+        assert!(cap(Some(false), false, false, true));
+        // A modal is watching in earnest, presenting or not.
+        assert!(cap(Some(true), false, false, true));
+        // Parked or focus-paused is never watching, whatever else is true.
+        assert!(!cap(Some(false), true, false, true));
+        assert!(!cap(Some(true), false, true, true));
     }
 
     /// The continuity guarantee, grid half: hover a tile, let the
