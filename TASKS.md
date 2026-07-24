@@ -21,42 +21,49 @@ the entry — this file should only ever contain open work.
 
 ## Now
 
-### 1. Confirm the zoomed-out fill over SMB, post-throttle *(measurement owed)*
+### 1. The internal DEFAULT atlas cannot fill a zoomed-out screen *(defaults call)*
 
-The **"app feels utterly broken when zoomed out"** report, with its cause
-re-attributed. Review 05 §7 called it an atlas *capacity* ceiling (428 visible
-tiles vs 144 slots); that has been **withdrawn** — 144 was `sb-bench`'s own
-hermetic default, not any shipped config. Measured with
-`zoom_out_capacity.toml` (demo tiles, 4 s, no I/O — the ratio is layout+config
-only):
+All that is left of review 05 §7's "zoomed-out grid can never fill". The
+capacity-ceiling framing was **withdrawn** (144 slots was `sb-bench`'s own
+hermetic default, not a shipped config) and the fill itself is **fixed and
+verified over SMB** — see §9: utilisation 0.36 → 0.92, tier-1 requests
+136 → 392, worst frame 546 ms → 4.0 ms, render-thread stalls 17 → 0.
+
+What remains is narrow. Measured with `zoom_out_capacity.toml` (demo tiles,
+4 s, no I/O — the ratio is layout+config only):
 
 | config | slots | visible at `zoom_min` | over? |
 |---|--:|--:|---|
-| harness default | 144 | 484 | **YES, 3.4×** |
+| **harness / internal default** | **144** | **484** | **YES, 3.4×** |
 | repo-root `switchblade.toml` | 777 | 484 | no |
 | `~/.config/switchblade.toml` | 1000 | 392 | no |
 
-So in the app as it is actually run, every visible tile *is* requested at
-tier 1, and a slow zoomed-out fill is **throughput** — the parked pool of
-review 05 §6, plus the permanently-engaged gen throttle now narrowed (below).
-**What's owed is the confirming run**, which has not happened: the
-`zoom_out_max` re-run timed out in ingest (>300 s for 3,000 clips, slower than
-any run in review 05, cause unknown — the link, or something local). Re-run it
-with a longer `library_count` timeout and read fill rate + `queue_wait_thumb`.
+So every `--no-config` run, every test, and every user without a config file
+gets a grid that physically cannot fill when zoomed out. Options: bump the
+`atlas_width/height` defaults (484 slots of 640×360 ≈ 446 MB of VRAM — a lot
+to make default), add a small-slot mip tier for low zoom (many more tiles per
+byte, and the better answer if zoom-out is meant to scale), or accept it and
+say so in the config template. Product call, and low urgency — nobody running
+a real config hits it.
 
-Two smaller things fall out of the correction:
-
-- **The internal DEFAULT atlas cannot fill a zoomed-out screen** (144 slots vs
-  484 tiles) — every `--no-config` run, every test, and every unconfigured
-  user. Bumping `atlas_width/height` defaults costs VRAM (484 slots of
-  640×360 ≈ 446 MB); a small-slot mip tier for low zoom is the cheaper answer.
-  Now a defaults question, not the DESIGN.md-level decision it was filed as.
-- **Any harness claim about a config-derived quantity must be re-run with
-  `--set` at shipped values** — otherwise it is a statement about
-  `Tuning::default()`. That is what went wrong here.
-
+**The reusable lesson, worth more than the task:** a hermetic harness measures
+`Tuning::default()`, so any claim about a config-derived quantity must be
+re-run with `--set` at shipped values before it says anything about the app.
 Full statement + correction:
 [perf review 05 §7](docs/perf-reviews/05-zoom-storm-scheduler.md).
+
+### 1b. The warm pool warms the selection's neighbours while the lane follows the mouse
+
+Found while checking the attention model (2026-07-24), not yet measured. The
+warm pool pre-warms movement destinations of `self.selected` (right, right+1,
+down, left), but under the attention model the hires lane may be playing the
+**hovered** clip — so during mouse browsing the pool is warming moves from a
+tile the user isn't on, and hover-to-first-frame is always a cold spawn. The
+pool genuinely cannot predict a pointer, so the question is whether it should
+instead warm the *attention target's* neighbours (a mouse resting on a tile is
+about as predictive as a selection sitting on one), or stay keyboard-shaped and
+accept it. Measure `attention_served` latency with and against it before
+changing anything.
 
 ### 2. Re-measure the gen throttle's *value* on 4K *(the trigger is fixed)*
 

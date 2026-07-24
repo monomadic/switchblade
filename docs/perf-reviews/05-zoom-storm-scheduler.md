@@ -419,7 +419,46 @@ next person reading `alloc_slot`, and the counter to settle it now exists.
    fixing (a) directly makes moot.
 7. **The crash still has no measured explanation** after three reviews.
 
-## 9. Open work
+## 9. Follow-up: the same scenario after the fixes (2026-07-24, same day)
+
+`zoom_out_max.toml` re-run on the same library and link, at the **real**
+atlas + layout config (`--set atlas_width=19200 --set atlas_height=12800
+--set thumb_width=640 --set thumb_height=320 --set tile_width=150 --set
+tile_height=150 --set gap=2`), against `2baf275`:
+
+| | maxzoom1 | maxzoom2 | **after** |
+|---|--:|--:|--:|
+| worker utilisation | 0.35 | 0.36 | **0.92** |
+| artifacts *made* (excl. hits) | 364 | 384 | **776** |
+| made/s over full wall | 0.88 | 1.08 | **1.58** |
+| tier-1 requests | 136 | 136 | **392** |
+| visible tiles vs atlas slots | 428 vs 144 | 428 vs 144 | 358 vs **1000** |
+| **worst frame (`tick_ms` max)** | 299 ms | **546 ms** | **4.0 ms** |
+| **render-thread fs stalls** | 17 (max 298 ms) | 17 (max 544 ms) | **0** |
+| `decode_read` max / >1s | 681 ms / 0 | 513 ms / 0 | 616 ms / 0 |
+
+**Three changes are in flight at once here** (the config, the throttle
+narrowing, the async meta read) and the link was slower this time
+(`library_count` at 302 s vs 105–207 s), so read the rows by what could
+possibly have moved them, not as one result:
+
+- **`render_stalls` 17 → 0, worst frame 546 ms → 4.0 ms.** Only the meta /
+  thumb-path work touches render-thread fs, so this is attributable and
+  clean. §3's UI freeze — the headline of this review — **does not
+  reproduce**, under the conditions that produced it reliably.
+- **Utilisation 0.36 → 0.92.** Only the throttle change touches worker
+  parking. §6's "the pool is idle while the user waits" is fixed: the pool
+  now works instead of parking.
+- **Tier-1 requests 136 → 392** is arithmetic from the slot count
+  (`budget = slots() - 8`), per §7's correction.
+- **Throughput 1.08 → 1.58 made/s is confounded** — more tier-1 work was
+  admissible *and* the sweep ran wider *and* the link differed. Directionally
+  right, not a clean 1.5× claim. (It is also a floor: 302 s of this run's
+  490 s went to ingest.)
+- **`decode_read` still shows a 616 ms block** with none over 1 s. §4's
+  video-thread finding is neither reproduced at full severity nor closed.
+
+## 10. Open work
 
 Indexed in [TASKS.md](../../TASKS.md); carries forward from
 [04 §7](04-network-storage-scheduler.md#7-open-work).
@@ -432,7 +471,9 @@ Indexed in [TASKS.md](../../TASKS.md); carries forward from
   in ~1 s jobs here. A spawn without its meta defers one frame instead of
   guessing an anchor, capped by `Tuning::meta_wait_ms` and counted by
   `meta_wait_expired`. Measured on `hover_then_select_handoff`: 20
-  render-thread fs calls → 1, `render_stall meta 0×`. See
+  render-thread fs calls → 1, `render_stall meta 0×`. **Confirmed on this
+  review's own scenario in §9**: 17 stalls and a 546 ms worst frame → 0
+  stalls and a 4.0 ms worst frame. See
   [live-playback.md](../architecture/live-playback.md).
 - ~~**Gate the handoff-dump `cached_thumb_path` behind `SB_HANDOFF_DUMP`**~~
   — **shipped 2026-07-24**: the argument is a closure now, evaluated only
@@ -451,9 +492,7 @@ Indexed in [TASKS.md](../../TASKS.md); carries forward from
   instead of "a tile has a lane", which was true whenever the grid had a
   selection. A settled grid preview no longer throttles the sweep. The
   cap's *value* is untouched, still pending [03 §2](03-slow-disk-scheduler.md)'s
-  4K re-measurement. **Not yet measured end-to-end over SMB** — the
-  confirming `zoom_out_max` re-run timed out in ingest (>300 s for 3,000
-  clips, slower than any run in this review) and is still owed.
+  4K re-measurement. **Confirmed over SMB in §9**: utilisation 0.36 → 0.92.
 - ~~Throttle the tier-1 flood~~ — **dropped.** An earlier draft proposed
   this as a grid-fill-vs-playback tradeoff needing a product call. The
   measurements do not support it: utilisation 0.36, thumb queue empty,
